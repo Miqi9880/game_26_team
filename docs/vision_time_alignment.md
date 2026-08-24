@@ -37,9 +37,12 @@ vision_history_capacity = 32
 vision_time_alignment_tolerance_ns = -1   # 未配置
 vision_time_alignment_allow_future = false
 vision_time_alignment_assume_shared_ros_clock = false
+vision_time_alignment_csv_path = ""      # 可选的独立诊断 CSV
 ```
 
-ROS 适配层只把状态插入历史并记录配对诊断。Vision 的 yaw/pitch/roll、四元数和时间差不会改变现有控制命令；dry-run 仍强制 `serial_enabled=false`、`allow_fire=false` 和 `fire_command=0`。既有 offline CSV schema 不增加字段，配对信息通过日志输出。
+ROS 适配层只把状态插入历史并记录配对诊断。Vision 的 yaw/pitch/roll、四元数和时间差不会改变现有控制命令；dry-run 仍强制 `serial_enabled=false`、`allow_fire=false` 和 `fire_command=0`。既有 offline CSV schema 不增加字段。默认通过日志输出；如需可捕获的独立记录，可设置 `vision_time_alignment_csv_path`，写入单独的对齐 CSV，不与既有 offline CSV 混用。
+
+每条对齐记录区分三个 Vision Header 时间：`matched_stamp_ns` 是 `PairResult` 实际选择的历史候选（只有 `matched` 才暴露样本），`latest_history_vision_header_ns` 是当前缓存中最近一个已接受样本，`latest_received_vision_header_ns` 是最近一次回调收到的原始 Header（即使该样本因非法、回退或重复而被拒绝；非法 ROS 时间以 `0` 记录）。因此 `delta_ns` 始终对应 `matched_stamp_ns`，不会被最新回调时间戳误读；对于默认拒绝的未来候选，诊断 delta 可以为负，但不会暴露样本或进入控制。
 
 只有在联调证据已经确认两条 Header 使用同一时钟域时，才可以显式设置
 `vision_time_alignment_assume_shared_ros_clock=true` 并提供非负

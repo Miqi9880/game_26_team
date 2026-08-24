@@ -31,6 +31,8 @@ PairResult make_pair_result(
   result.status = status;
   result.image_stamp_ns = image_stamp_ns;
   if (sample != nullptr) {
+    // Keep the candidate timestamp available for diagnostics even when the
+    // candidate is stale or future and therefore is not exposed as sample.
     result.matched_stamp_ns = sample->state.stamp_ns;
     result.delta_ns = image_stamp_ns - sample->state.stamp_ns;
     // A non-matched result is diagnostic only.  Do not expose a stale or

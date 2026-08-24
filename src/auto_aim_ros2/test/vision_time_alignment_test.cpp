@@ -68,6 +68,10 @@ TEST(VisionStateHistoryTest, StaleAndFutureAreFailClosed)
   EXPECT_EQ(
     history.pair(50, TimestampDomain::VisionHeader, tolerance(100)).status,
     PairStatus::Future);
+  const auto future = history.pair(50, TimestampDomain::VisionHeader, tolerance(100));
+  EXPECT_EQ(future.matched_stamp_ns, 100);
+  EXPECT_EQ(future.delta_ns, -50);
+  EXPECT_FALSE(future.sample.has_value());
 }
 
 TEST(VisionStateHistoryTest, FutureCanOnlyBeUsedWhenExplicitlyEnabled)

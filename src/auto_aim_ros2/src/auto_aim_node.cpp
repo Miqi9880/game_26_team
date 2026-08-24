@@ -92,6 +92,8 @@ public:
     output_hz_ = declare_parameter<double>("output_hz", 100.0);
     input_timeout_ms_ = declare_parameter<int>("input_timeout_ms", 100);
     csv_path_ = declare_parameter<std::string>("csv_path", "");
+    vision_time_alignment_csv_path_ = declare_parameter<std::string>(
+      "vision_time_alignment_csv_path", "");
     offline_model_path_ = declare_parameter<std::string>("offline_model_path", "");
     offline_model_profile_ = declare_parameter<std::string>("offline_model_profile", "");
     offline_pnp_config_ = declare_parameter<std::string>("offline_pnp_config", "");
@@ -142,6 +144,12 @@ public:
       throw std::invalid_argument(
               "AutoAimNode never opens serial; serial_enabled must remain false");
     }
+    if (!csv_path_.empty() && !vision_time_alignment_csv_path_.empty() &&
+      csv_path_ == vision_time_alignment_csv_path_)
+    {
+      throw std::invalid_argument(
+              "csv_path and vision_time_alignment_csv_path must be different files");
+    }
 
     const auto backend_kind = ros_backend::parse_backend_kind(backend_name_);
     ros_backend::Config backend_config{};
@@ -186,6 +194,21 @@ public:
         throw std::runtime_error("cannot open csv_path: " + csv_path_);
       }
       csv_ << ros_backend::csv_header();
+    }
+    if (!vision_time_alignment_csv_path_.empty()) {
+      vision_alignment_csv_.open(
+        vision_time_alignment_csv_path_, std::ios::out | std::ios::trunc);
+      if (!vision_alignment_csv_) {
+        throw std::runtime_error(
+                "cannot open vision_time_alignment_csv_path: " +
+                vision_time_alignment_csv_path_);
+      }
+      vision_alignment_csv_
+        << "image_header_stamp_ns,latest_received_vision_header_ns,"
+        << "latest_history_vision_header_ns,matched_stamp_ns,delta_ns,status,"
+        << "image_timestamp_domain,vision_timestamp_domain,"
+        << "image_receive_steady_ns,vision_receive_steady_ns\n";
+      vision_alignment_csv_.flush();
     }
 
     image_subscription_ = create_subscription<sensor_msgs::msg::Image>(
@@ -247,7 +270,8 @@ private:
   void report_alignment(
     const vision_time_alignment::PairResult & result,
     std::int64_t image_receive_steady_ns,
-    std::int64_t vision_header_stamp_ns,
+    std::int64_t latest_received_vision_header_ns,
+    std::int64_t latest_history_vision_header_ns,
     std::int64_t vision_receive_steady_ns)
   {
     // Header stamps are deliberately kept separate from steady-clock receive
@@ -256,15 +280,34 @@ private:
     RCLCPP_DEBUG_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "Vision/image time alignment status=%s image_header_ns=%lld "
-      "vision_header_ns=%lld image_receive_steady_ns=%lld "
+      "matched_stamp_ns=%lld latest_history_vision_header_ns=%lld "
+      "latest_received_vision_header_ns=%lld image_receive_steady_ns=%lld "
       "vision_receive_steady_ns=%lld delta_ns=%lld tolerance_ns=%lld",
       vision_time_alignment::pair_status_name(result.status),
       static_cast<long long>(result.image_stamp_ns),
-      static_cast<long long>(vision_header_stamp_ns),
+      static_cast<long long>(result.matched_stamp_ns),
+      static_cast<long long>(latest_history_vision_header_ns),
+      static_cast<long long>(latest_received_vision_header_ns),
       static_cast<long long>(image_receive_steady_ns),
       static_cast<long long>(vision_receive_steady_ns),
       static_cast<long long>(result.delta_ns),
       static_cast<long long>(vision_time_alignment_tolerance_ns_));
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (vision_alignment_csv_) {
+      vision_alignment_csv_
+        << result.image_stamp_ns << ','
+        << latest_received_vision_header_ns << ','
+        << latest_history_vision_header_ns << ','
+        << result.matched_stamp_ns << ','
+        << result.delta_ns << ','
+        << vision_time_alignment::pair_status_name(result.status) << ','
+        << vision_time_alignment::timestamp_domain_name(image_timestamp_domain_) << ','
+        << vision_time_alignment::timestamp_domain_name(vision_timestamp_domain_) << ','
+        << image_receive_steady_ns << ','
+        << vision_receive_steady_ns << '\n';
+      vision_alignment_csv_.flush();
+    }
   }
 
   void on_image(const sensor_msgs::msg::Image::ConstSharedPtr & message)
@@ -306,7 +349,8 @@ private:
     }
 
     vision_time_alignment::PairResult alignment;
-    std::int64_t vision_header_stamp_ns = 0;
+    std::int64_t latest_received_vision_header_ns = 0;
+    std::int64_t latest_history_vision_header_ns = 0;
     std::int64_t vision_receive_steady_ns = 0;
     const auto image_receive_steady_ns = steady_stamp_ns(image_receive_time);
     {
@@ -315,13 +359,17 @@ private:
         frame->stamp_ns,
         image_timestamp_domain_,
         vision_pair_config());
-      vision_header_stamp_ns = last_vision_header_stamp_ns_;
+      latest_received_vision_header_ns = last_vision_header_stamp_ns_;
+      if (const auto * latest_sample = vision_history_.latest(); latest_sample != nullptr) {
+        latest_history_vision_header_ns = latest_sample->state.stamp_ns;
+      }
       vision_receive_steady_ns = last_vision_receive_steady_ns_;
       last_image_header_stamp_ns_ = frame->stamp_ns;
       last_image_receive_steady_ns_ = image_receive_steady_ns;
     }
     report_alignment(
-      alignment, image_receive_steady_ns, vision_header_stamp_ns, vision_receive_steady_ns);
+      alignment, image_receive_steady_ns, latest_received_vision_header_ns,
+      latest_history_vision_header_ns, vision_receive_steady_ns);
 
     if (require_camera_info_ &&
       (!camera_ready || camera_width != frame->width || camera_height != frame->height))
@@ -366,6 +414,20 @@ private:
   void on_vision(const auto_aim_interfaces::msg::Vision::ConstSharedPtr & message)
   {
     const auto vision_receive_time = Clock::now();
+    const auto & raw_stamp = message->header.stamp;
+    const auto raw_stamp_is_canonical = raw_stamp.sec >= 0 &&
+      raw_stamp.nanosec < 1'000'000'000U;
+    const auto raw_vision_header_stamp_ns = raw_stamp_is_canonical ?
+      static_cast<std::int64_t>(raw_stamp.sec) * 1'000'000'000LL +
+      static_cast<std::int64_t>(raw_stamp.nanosec) : 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Keep the most recently received raw Header timestamp for diagnostics,
+      // including samples rejected by the adapter.  Invalid ROS time is
+      // represented as zero and is never inserted into the history.
+      last_vision_header_stamp_ns_ = raw_vision_header_stamp_ns;
+      last_vision_receive_steady_ns_ = steady_stamp_ns(vision_receive_time);
+    }
     const auto adapted = ros_adapters::to_algorithm_vision(*message);
     if (!adapted.has_value()) {
       RCLCPP_WARN_THROTTLE(
@@ -389,10 +451,6 @@ private:
         latest_game_progress_ = adapted->game_progress;
         have_vision_bookkeeping_ = true;
       }
-      // Record rejected header samples too, but keep their receive time
-      // separate so diagnostics can distinguish sensor and callback clocks.
-      last_vision_header_stamp_ns_ = adapted->stamp_ns;
-      last_vision_receive_steady_ns_ = steady_stamp_ns(vision_receive_time);
     }
     if (!insert_result.accepted()) {
       RCLCPP_WARN_THROTTLE(
@@ -476,6 +534,7 @@ private:
   std::uint8_t latest_game_progress_{0};
   std::string backend_name_;
   std::string csv_path_;
+  std::string vision_time_alignment_csv_path_;
   std::string offline_model_path_;
   std::string offline_model_profile_;
   std::string offline_pnp_config_;
@@ -491,6 +550,7 @@ private:
     vision_time_alignment::TimestampDomain::ImageHeader};
   vision_time_alignment::VisionStateHistory vision_history_{};
   std::ofstream csv_;
+  std::ofstream vision_alignment_csv_;
   std::mutex mutex_;
   Clock::time_point last_image_time_{};
   pipeline::AimCommand latest_command_{};

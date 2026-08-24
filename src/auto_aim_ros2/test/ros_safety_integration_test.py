@@ -9,9 +9,11 @@ probe for the larger offline_reference cases; this CTest covers the minimal
 null/mock/timestamp path automatically.
 """
 
+import csv
 import os
 import signal
 import subprocess
+import tempfile
 import time
 
 import rclpy
@@ -76,6 +78,7 @@ def start_node(
     mock_yaw_rad=0.0,
     assume_shared_ros_clock=False,
     alignment_tolerance_ns=-1,
+    alignment_csv_path="",
 ):
     command = [
         "ros2",
@@ -106,6 +109,8 @@ def start_node(
         "-p",
         f"input_timeout_ms:={input_timeout_ms}",
     ]
+    if alignment_csv_path:
+        command.extend(["-p", f"vision_time_alignment_csv_path:={alignment_csv_path}"])
     return subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,
@@ -138,9 +143,37 @@ def wait_for_graph(probe, timeout_seconds=5.0):
     return spin_until(
         probe,
         lambda: probe.publisher.get_subscription_count() > 0 and
+        probe.vision_publisher.get_subscription_count() > 0 and
         probe.count_publishers("/Robot_ctrl_data") > 0,
         timeout_seconds,
     )
+
+
+def new_alignment_csv_path():
+    descriptor, path = tempfile.mkstemp(prefix="vision_time_alignment_", suffix=".csv")
+    os.close(descriptor)
+    os.unlink(path)
+    return path
+
+
+def assert_alignment_status(path, expected_status, expected_matched_ns=None,
+                            expected_delta_ns=None, expected_latest_ns=None,
+                            expected_latest_received_ns=None):
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows, f"alignment diagnostic CSV is empty: {path}"
+    matching_rows = [row for row in rows if row["status"] == expected_status]
+    assert matching_rows, (expected_status, [row["status"] for row in rows])
+    row = matching_rows[-1]
+    if expected_matched_ns is not None:
+        assert int(row["matched_stamp_ns"]) == expected_matched_ns, row
+    if expected_delta_ns is not None:
+        assert int(row["delta_ns"]) == expected_delta_ns, row
+    if expected_latest_ns is not None:
+        assert int(row["latest_history_vision_header_ns"]) == expected_latest_ns, row
+    if expected_latest_received_ns is not None:
+        assert int(row["latest_received_vision_header_ns"]) == expected_latest_received_ns, row
+    return row
 
 
 def assert_all_safe(probe):
@@ -149,6 +182,7 @@ def assert_all_safe(probe):
 
 
 def run_mock_case():
+    alignment_csv_path = new_alignment_csv_path()
     process = start_node(
         "mock",
         mock_target=True,
@@ -156,6 +190,7 @@ def run_mock_case():
         mock_yaw_rad=0.25,
         assume_shared_ros_clock=True,
         alignment_tolerance_ns=100_000_000,
+        alignment_csv_path=alignment_csv_path,
     )
     try:
         assert wait_for_graph(probe), "ROS graph discovery did not complete"
@@ -165,6 +200,9 @@ def run_mock_case():
         # the 90-degree Vision yaw and shoot speed must not alter the mock
         # command or fire output.
         probe.publish_vision(1)
+        time.sleep(0.1)
+        probe.publish_vision(2)
+        time.sleep(0.1)
         probe.publish_image(1)
         assert spin_until(
             probe,
@@ -188,6 +226,18 @@ def run_mock_case():
         assert_all_safe(probe)
     finally:
         stop_node(process)
+    try:
+        assert_alignment_status(
+            alignment_csv_path,
+            "matched",
+            expected_matched_ns=1_000_000_001,
+            expected_delta_ns=0,
+            expected_latest_ns=2_000_000_001,
+            expected_latest_received_ns=2_000_000_001,
+        )
+    finally:
+        if os.path.exists(alignment_csv_path):
+            os.unlink(alignment_csv_path)
 
 
 def run_null_case():
@@ -206,6 +256,7 @@ def run_null_case():
 
 
 def run_incomparable_alignment_case():
+    alignment_csv_path = new_alignment_csv_path()
     process = start_node(
         "mock",
         mock_target=True,
@@ -216,11 +267,13 @@ def run_incomparable_alignment_case():
         # diagnostic path while the mock target remains independent of it.
         assume_shared_ros_clock=False,
         alignment_tolerance_ns=100_000_000,
+        alignment_csv_path=alignment_csv_path,
     )
     try:
         assert wait_for_graph(probe), "ROS graph discovery did not complete"
         assert spin_until(probe, lambda: bool(probe.controls), 5.0)
         probe.publish_vision(3)
+        time.sleep(0.1)
         probe.publish_image(3)
         assert spin_until(
             probe,
@@ -235,6 +288,11 @@ def run_incomparable_alignment_case():
                    for message in locked)
     finally:
         stop_node(process)
+    try:
+        assert_alignment_status(alignment_csv_path, "incomparable")
+    finally:
+        if os.path.exists(alignment_csv_path):
+            os.unlink(alignment_csv_path)
 
 
 def main():
@@ -253,7 +311,10 @@ def main():
         run_incomparable_alignment_case()
         probe.controls.clear()
         run_null_case()
-        print("ros_safety_integration_test: mock lock, timeout, invalid timestamp, fire=0 OK")
+        print(
+            "ros_safety_integration_test: matched/incomparable diagnostics, "
+            "mock lock, timeout, invalid timestamp, fire=0 OK"
+        )
     finally:
         probe.destroy_node()
         rclpy.shutdown()

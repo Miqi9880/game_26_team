@@ -101,9 +101,13 @@ struct PairResult
   PairStatus status{PairStatus::Invalid};
   std::optional<VisionStateSample> sample{};
   std::int64_t image_stamp_ns{0};
+  // Timestamp of the selected history candidate.  It is populated for
+  // matched, stale, and future diagnostics; callers must inspect status
+  // before treating it as an accepted sample.
   std::int64_t matched_stamp_ns{0};
-  // image_stamp_ns - matched_stamp_ns.  Positive means a past sample; a
-  // negative value is only possible when PairConfig::allow_future is true.
+  // image_stamp_ns - matched_stamp_ns.  Positive means a past candidate.
+  // When a future candidate is rejected by the default allow_future=false
+  // policy, this diagnostic delta is negative and sample remains empty.
   std::int64_t delta_ns{0};
 
   bool matched() const noexcept

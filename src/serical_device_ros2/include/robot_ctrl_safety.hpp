@@ -5,9 +5,12 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <utility>
 
+#include "control_interface_constraints.hpp"
 #include "protocol_new.hpp"
 
 namespace rm_auto_aim::safety
@@ -25,20 +28,62 @@ struct Config
   bool allow_fire{false};
   std::int8_t burst_command{1};
   std::int8_t single_command{2};
+  auto_aim_interfaces::control::VehicleProfile vehicle_profile{
+    auto_aim_interfaces::control::VehicleProfile::Unselected};
+  std::int64_t input_timeout_ns{kTimeoutNs};
 };
 
 struct Output
 {
   io::RobotCtrlData control{};
   bool fresh{false};
+  bool yaw_wrapped{false};
+  bool pitch_clamped{false};
 };
+
+struct ControlConstraintResult
+{
+  io::RobotCtrlData control{};
+  auto_aim_interfaces::control::PositionConstraint position{};
+  bool valid_input{false};
+
+  bool accepted() const noexcept
+  {
+    return valid_input && position.accepted();
+  }
+};
+
+// Convert a parameterized output frequency to a precise timer period.  The
+// default is 100 Hz, while measured rates in the hundreds remain representable
+// without truncating the period to whole milliseconds.
+inline std::optional<std::chrono::nanoseconds> control_period_from_hz(
+  double output_hz) noexcept
+{
+  if (!std::isfinite(output_hz) || output_hz <= 0.0) {
+    return std::nullopt;
+  }
+  const double period_ns = 1'000'000'000.0 / output_hz;
+  if (!std::isfinite(period_ns) || period_ns < 1.0 ||
+    period_ns > static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+  {
+    return std::nullopt;
+  }
+  const auto count = static_cast<std::int64_t>(std::llround(period_ns));
+  if (count <= 0) {
+    return std::nullopt;
+  }
+  return std::chrono::nanoseconds(count);
+}
 
 /**
  * Small, ROS-independent state machine for the RobotCtrl timeout policy.
  *
- * A message is accepted only when every field is finite and the protocol
- * enumerations are known.  The clock is injected so the exact timeout
- * boundary can be tested without a ROS clock or a serial device.
+ * A message is accepted only when every field is finite, the protocol
+ * enumerations are known, and a vehicle profile is explicitly selected.  The
+ * final serial-side safety boundary canonicalizes yaw to [-180, 180], applies
+ * the selected pitch pre-limit, and always zeroes motion feedforward.  The
+ * clock is injected so the exact timeout boundary can be tested without a
+ * ROS clock or a serial device.
  */
 class RobotCtrlSafety
 {
@@ -58,7 +103,8 @@ public:
   bool Accept(const io::RobotCtrlData & input)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
-    if (!IsValid(input, config_)) {
+    const auto constrained = Constrain(input, config_);
+    if (!constrained.accepted()) {
       // An invalid message must not leave a previously valid firing command
       // active for the timeout window. Keep the last finite position as a
       // hold point, but immediately replace motion/lock/fire with safe values.
@@ -73,7 +119,9 @@ public:
       return false;
     }
 
-    last_valid_ = input;
+    last_valid_ = constrained.control;
+    last_yaw_wrapped_ = constrained.position.yaw_wrapped();
+    last_pitch_clamped_ = constrained.position.pitch_clamped();
     last_valid_ns_ = clock_();
     have_valid_ = true;
     force_stale_ = false;
@@ -88,14 +136,17 @@ public:
     const std::int64_t now_ns = clock_();
 
     const bool fresh = have_valid_ && !force_stale_ && now_ns >= last_valid_ns_ &&
-      (now_ns - last_valid_ns_) < kTimeoutNs;
+      (now_ns - last_valid_ns_) < config_.input_timeout_ns;
     output.fresh = fresh;
 
     if (fresh) {
       output.control = last_valid_;
-      if (!config_.allow_fire || output.control.target_lock != kTargetLocked) {
-        output.control.fire_command = kFireNone;
-      }
+      output.yaw_wrapped = last_yaw_wrapped_;
+      output.pitch_clamped = last_pitch_clamped_;
+      // Fire semantics remain unconfirmed; this branch never emits a fire
+      // command, including when a direct ROS publisher bypasses AutoAimNode.
+      output.control.fire_command = kFireNone;
+      zero_motion_fields(&output.control);
       return output;
     }
 
@@ -105,28 +156,59 @@ public:
       output.control.yaw = last_valid_.yaw;
       output.control.pitch = last_valid_.pitch;
     }
-    output.control.yaw_vel = 0.0f;
-    output.control.yaw_acc = 0.0f;
-    output.control.pitch_vel = 0.0f;
-    output.control.pitch_acc = 0.0f;
+    zero_motion_fields(&output.control);
     output.control.target_lock = kTargetUnlocked;
     output.control.fire_command = kFireNone;
     return output;
   }
 
+  static ControlConstraintResult Constrain(
+    const io::RobotCtrlData & input, const Config & config) noexcept
+  {
+    ControlConstraintResult result{};
+    if (!std::isfinite(input.yaw) || !std::isfinite(input.yaw_vel) ||
+      !std::isfinite(input.yaw_acc) || !std::isfinite(input.pitch) ||
+      !std::isfinite(input.pitch_vel) || !std::isfinite(input.pitch_acc) ||
+      config.input_timeout_ns <= 0 ||
+      (input.target_lock != kTargetLocked && input.target_lock != kTargetUnlocked) ||
+      (input.fire_command != kFireNone && input.fire_command != config.burst_command &&
+      input.fire_command != config.single_command) ||
+      (input.target_lock != kTargetLocked && input.fire_command != kFireNone))
+    {
+      result.position.status = auto_aim_interfaces::control::ConstraintStatus::NonFiniteInput;
+      return result;
+    }
+
+    result.valid_input = true;
+    result.position = auto_aim_interfaces::control::constrain_position_degrees(
+      input.yaw, input.pitch, config.vehicle_profile);
+    if (!result.position.accepted()) {
+      return result;
+    }
+
+    result.control = input;
+    result.control.yaw = result.position.yaw_degree;
+    result.control.pitch = result.position.pitch_degree;
+    zero_motion_fields(&result.control);
+    // Fire is disabled in this control-interface phase regardless of input.
+    result.control.fire_command = kFireNone;
+    return result;
+  }
+
   static bool IsValid(const io::RobotCtrlData & input, const Config & config) noexcept
   {
-    return std::isfinite(input.yaw) && std::isfinite(input.yaw_vel) &&
-           std::isfinite(input.yaw_acc) && std::isfinite(input.pitch) &&
-           std::isfinite(input.pitch_vel) && std::isfinite(input.pitch_acc) &&
-           (input.target_lock == kTargetLocked || input.target_lock == kTargetUnlocked) &&
-           (input.fire_command == kFireNone ||
-            input.fire_command == config.burst_command ||
-            input.fire_command == config.single_command) &&
-           (input.target_lock == kTargetLocked || input.fire_command == kFireNone);
+    return Constrain(input, config).accepted();
   }
 
 private:
+  static void zero_motion_fields(io::RobotCtrlData * control) noexcept
+  {
+    control->yaw_vel = 0.0F;
+    control->yaw_acc = 0.0F;
+    control->pitch_vel = 0.0F;
+    control->pitch_acc = 0.0F;
+  }
+
   mutable std::mutex mutex_;
   Config config_;
   ClockFn clock_;
@@ -134,6 +216,8 @@ private:
   std::int64_t last_valid_ns_{0};
   bool have_valid_{false};
   bool force_stale_{false};
+  bool last_yaw_wrapped_{false};
+  bool last_pitch_clamped_{false};
 };
 
 }  // namespace rm_auto_aim::safety

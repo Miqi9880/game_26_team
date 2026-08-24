@@ -142,7 +142,8 @@ bool VisionStateHistory::valid_state(const pipeline::VisionState & state) noexce
     return false;
   }
 
-  if (!std::isfinite(state.yaw_rad) || !std::isfinite(state.pitch_rad) ||
+  if (!std::isfinite(state.yaw_rad) || !std::isfinite(state.yaw_vel_rad_s) ||
+    !std::isfinite(state.pitch_rad) || !std::isfinite(state.pitch_vel_rad_s) ||
     !std::isfinite(state.roll_rad) || !std::isfinite(state.shoot_speed_mps))
   {
     return false;

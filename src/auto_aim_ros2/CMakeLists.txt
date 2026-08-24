@@ -27,6 +27,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/raw_armor_detector.cpp
   src/ros_image_adapter.cpp
   src/ros_backend.cpp
+  src/vision_time_alignment.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC include)
@@ -103,6 +104,10 @@ if(BUILD_TESTING)
   ament_auto_add_gtest(
     ros_backend_test
     test/ros_backend_test.cpp
+  )
+  ament_auto_add_gtest(
+    vision_time_alignment_test
+    test/vision_time_alignment_test.cpp
   )
   target_compile_definitions(
     pnp_stage_test PRIVATE

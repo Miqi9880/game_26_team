@@ -3,6 +3,7 @@
 #include "auto_aim_ros2/ros_adapters.hpp"
 #include "auto_aim_ros2/ros_backend.hpp"
 #include "auto_aim_ros2/ros_image_adapter.hpp"
+#include "auto_aim_ros2/vision_time_alignment.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -96,6 +97,29 @@ public:
     offline_pnp_config_ = declare_parameter<std::string>("offline_pnp_config", "");
     offline_device_ = declare_parameter<std::string>("offline_device", "CPU");
     allow_test_only_ = declare_parameter<bool>("allow_test_only", false);
+    const auto vision_history_capacity = declare_parameter<int>(
+      "vision_history_capacity", 32);
+    vision_time_alignment_tolerance_ns_ = declare_parameter<std::int64_t>(
+      "vision_time_alignment_tolerance_ns", -1);
+    vision_time_alignment_allow_future_ = declare_parameter<bool>(
+      "vision_time_alignment_allow_future", false);
+    vision_time_alignment_assume_shared_ros_clock_ = declare_parameter<bool>(
+      "vision_time_alignment_assume_shared_ros_clock", false);
+    if (vision_history_capacity <= 0) {
+      throw std::invalid_argument("vision_history_capacity must be positive");
+    }
+    if (vision_time_alignment_tolerance_ns_ < -1) {
+      throw std::invalid_argument(
+              "vision_time_alignment_tolerance_ns must be -1 (unconfigured) or non-negative");
+    }
+    vision_timestamp_domain_ = vision_time_alignment_assume_shared_ros_clock_ ?
+      vision_time_alignment::TimestampDomain::SharedRosHeader :
+      vision_time_alignment::TimestampDomain::VisionHeader;
+    image_timestamp_domain_ = vision_time_alignment_assume_shared_ros_clock_ ?
+      vision_time_alignment::TimestampDomain::SharedRosHeader :
+      vision_time_alignment::TimestampDomain::ImageHeader;
+    vision_history_ = vision_time_alignment::VisionStateHistory(
+      static_cast<std::size_t>(vision_history_capacity), vision_timestamp_domain_);
     const auto aimer_mode = parse_aimer_mode(
       declare_parameter<std::string>("aimer_mode", "relative_debug"));
     const auto absolute_zero_configured = declare_parameter<bool>(
@@ -204,8 +228,48 @@ private:
     return command;
   }
 
+  static std::int64_t steady_stamp_ns(const Clock::time_point time) noexcept
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      time.time_since_epoch()).count();
+  }
+
+  vision_time_alignment::PairConfig vision_pair_config() const noexcept
+  {
+    vision_time_alignment::PairConfig config{};
+    if (vision_time_alignment_tolerance_ns_ >= 0) {
+      config.tolerance_ns = vision_time_alignment_tolerance_ns_;
+    }
+    config.allow_future = vision_time_alignment_allow_future_;
+    return config;
+  }
+
+  void report_alignment(
+    const vision_time_alignment::PairResult & result,
+    std::int64_t image_receive_steady_ns,
+    std::int64_t vision_header_stamp_ns,
+    std::int64_t vision_receive_steady_ns)
+  {
+    // Header stamps are deliberately kept separate from steady-clock receive
+    // stamps.  The ROS headers currently have no proven common clock domain,
+    // so this is a diagnostic boundary and never a control input.
+    RCLCPP_DEBUG_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Vision/image time alignment status=%s image_header_ns=%lld "
+      "vision_header_ns=%lld image_receive_steady_ns=%lld "
+      "vision_receive_steady_ns=%lld delta_ns=%lld tolerance_ns=%lld",
+      vision_time_alignment::pair_status_name(result.status),
+      static_cast<long long>(result.image_stamp_ns),
+      static_cast<long long>(vision_header_stamp_ns),
+      static_cast<long long>(image_receive_steady_ns),
+      static_cast<long long>(vision_receive_steady_ns),
+      static_cast<long long>(result.delta_ns),
+      static_cast<long long>(vision_time_alignment_tolerance_ns_));
+  }
+
   void on_image(const sensor_msgs::msg::Image::ConstSharedPtr & message)
   {
+    const auto image_receive_time = Clock::now();
     std::string image_error;
     bool camera_ready = false;
     std::uint32_t camera_width = 0;
@@ -218,13 +282,21 @@ private:
       camera_ready = have_camera_info_;
       camera_width = camera_info_width_;
       camera_height = camera_info_height_;
-      if (have_vision_) {
-        shoot_speed_mps = latest_vision_.shoot_speed_mps;
-        bullet_count = latest_vision_.bullet_count;
-        game_progress = latest_vision_.game_progress;
+      // Preserve the pre-existing bookkeeping path for shoot speed and
+      // replay fields.  Position angles, quaternion, and timestamp pairing
+      // remain diagnostic-only and are never copied into the control chain.
+      if (have_vision_bookkeeping_) {
+        shoot_speed_mps = latest_shoot_speed_mps_;
+        bullet_count = latest_bullet_count_;
+        game_progress = latest_game_progress_;
       }
     }
 
+    // Vision pose/time state is intentionally not copied into ImageFrame.
+    // Until the image and Vision header clock domains are proven equivalent,
+    // that state is diagnostic-only and cannot influence detector, tracker,
+    // aimer, or RobotCtrl output.  The existing shoot-speed/replay bookkeeping
+    // fields above are kept for offline compatibility and are not pose data.
     const auto frame = ros_adapters::to_image_frame(
       *message, shoot_speed_mps, bullet_count, game_progress, &image_error);
     if (!frame.has_value()) {
@@ -232,6 +304,25 @@ private:
         get_logger(), *get_clock(), 1000, "Ignoring invalid image frame: %s", image_error.c_str());
       return;
     }
+
+    vision_time_alignment::PairResult alignment;
+    std::int64_t vision_header_stamp_ns = 0;
+    std::int64_t vision_receive_steady_ns = 0;
+    const auto image_receive_steady_ns = steady_stamp_ns(image_receive_time);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      alignment = vision_history_.pair(
+        frame->stamp_ns,
+        image_timestamp_domain_,
+        vision_pair_config());
+      vision_header_stamp_ns = last_vision_header_stamp_ns_;
+      vision_receive_steady_ns = last_vision_receive_steady_ns_;
+      last_image_header_stamp_ns_ = frame->stamp_ns;
+      last_image_receive_steady_ns_ = image_receive_steady_ns;
+    }
+    report_alignment(
+      alignment, image_receive_steady_ns, vision_header_stamp_ns, vision_receive_steady_ns);
+
     if (require_camera_info_ &&
       (!camera_ready || camera_width != frame->width || camera_height != frame->height))
     {
@@ -274,6 +365,7 @@ private:
 
   void on_vision(const auto_aim_interfaces::msg::Vision::ConstSharedPtr & message)
   {
+    const auto vision_receive_time = Clock::now();
     const auto adapted = ros_adapters::to_algorithm_vision(*message);
     if (!adapted.has_value()) {
       RCLCPP_WARN_THROTTLE(
@@ -281,9 +373,35 @@ private:
         "Ignoring Vision_data with non-finite angle, velocity, speed, or quaternion field");
       return;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_vision_ = *adapted;
-    have_vision_ = true;
+    vision_time_alignment::InsertResult insert_result;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Keep the ROS Header timestamp as VisionHeader.  The receive time is
+      // recorded independently on the local steady clock and is never mixed
+      // into header-stamp pairing.
+      insert_result = vision_history_.insert(
+        *adapted, vision_timestamp_domain_);
+      if (insert_result.accepted()) {
+        // Only accepted samples may update the existing replay bookkeeping.
+        // Pose/quaternion/timestamp data never cross into ImageFrame.
+        latest_shoot_speed_mps_ = adapted->shoot_speed_mps;
+        latest_bullet_count_ = adapted->bullet_count;
+        latest_game_progress_ = adapted->game_progress;
+        have_vision_bookkeeping_ = true;
+      }
+      // Record rejected header samples too, but keep their receive time
+      // separate so diagnostics can distinguish sensor and callback clocks.
+      last_vision_header_stamp_ns_ = adapted->stamp_ns;
+      last_vision_receive_steady_ns_ = steady_stamp_ns(vision_receive_time);
+    }
+    if (!insert_result.accepted()) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Ignoring Vision_data history sample: status=%s reason=%s size=%zu",
+        vision_time_alignment::insert_status_name(insert_result.status),
+        vision_time_alignment::insert_reason_name(insert_result.reason),
+        insert_result.size);
+    }
   }
 
   void publish_control()
@@ -343,7 +461,7 @@ private:
   bool mock_fire_request_{false};
   bool have_image_{false};
   bool have_camera_info_{false};
-  bool have_vision_{false};
+  bool have_vision_bookkeeping_{false};
   std::uint32_t camera_info_width_{0};
   std::uint32_t camera_info_height_{0};
   double mock_yaw_rad_{0.0};
@@ -351,13 +469,27 @@ private:
   double output_hz_{100.0};
   int input_timeout_ms_{100};
   bool allow_test_only_{false};
+  bool vision_time_alignment_allow_future_{false};
+  bool vision_time_alignment_assume_shared_ros_clock_{false};
+  float latest_shoot_speed_mps_{0.0F};
+  std::uint16_t latest_bullet_count_{0};
+  std::uint8_t latest_game_progress_{0};
   std::string backend_name_;
   std::string csv_path_;
   std::string offline_model_path_;
   std::string offline_model_profile_;
   std::string offline_pnp_config_;
   std::string offline_device_;
-  pipeline::VisionState latest_vision_{};
+  std::int64_t vision_time_alignment_tolerance_ns_{-1};
+  std::int64_t last_vision_header_stamp_ns_{0};
+  std::int64_t last_vision_receive_steady_ns_{0};
+  std::int64_t last_image_header_stamp_ns_{0};
+  std::int64_t last_image_receive_steady_ns_{0};
+  vision_time_alignment::TimestampDomain vision_timestamp_domain_{
+    vision_time_alignment::TimestampDomain::VisionHeader};
+  vision_time_alignment::TimestampDomain image_timestamp_domain_{
+    vision_time_alignment::TimestampDomain::ImageHeader};
+  vision_time_alignment::VisionStateHistory vision_history_{};
   std::ofstream csv_;
   std::mutex mutex_;
   Clock::time_point last_image_time_{};

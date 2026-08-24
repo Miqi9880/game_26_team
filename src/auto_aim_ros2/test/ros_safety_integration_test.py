@@ -16,6 +16,7 @@ import time
 
 import rclpy
 from auto_aim_interfaces.msg import RobotCtrl
+from auto_aim_interfaces.msg import Vision
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
@@ -24,6 +25,7 @@ class SafetyProbe(Node):
     def __init__(self):
         super().__init__("auto_aim_ros_safety_ctest_probe")
         self.publisher = self.create_publisher(Image, "/image_raw", 10)
+        self.vision_publisher = self.create_publisher(Vision, "/Vision_data", 10)
         self.subscription = self.create_subscription(
             RobotCtrl, "/Robot_ctrl_data", self.on_control, 10
         )
@@ -43,6 +45,20 @@ class SafetyProbe(Node):
         message.data = bytes([0, 0, 0] * 4)
         self.publisher.publish(message)
 
+    def publish_vision(self, sec, nanosec=1, yaw=90.0):
+        message = Vision()
+        message.header.stamp.sec = sec
+        message.header.stamp.nanosec = nanosec
+        message.header.frame_id = "vision_header_clock"
+        message.yaw = yaw
+        message.pitch = -45.0
+        message.roll = 5.0
+        message.quaternion = [1.0, 0.0, 0.0, 0.0]
+        message.shoot_speed = 35.0
+        message.bullet_count = 2
+        message.game_progress = 1
+        self.vision_publisher.publish(message)
+
 
 def spin_until(probe, predicate, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
@@ -53,7 +69,14 @@ def spin_until(probe, predicate, timeout_seconds):
     return False
 
 
-def start_node(backend, mock_target=False, input_timeout_ms=100):
+def start_node(
+    backend,
+    mock_target=False,
+    input_timeout_ms=100,
+    mock_yaw_rad=0.0,
+    assume_shared_ros_clock=False,
+    alignment_tolerance_ns=-1,
+):
     command = [
         "ros2",
         "run",
@@ -70,6 +93,12 @@ def start_node(backend, mock_target=False, input_timeout_ms=100):
         "allow_fire:=false",
         "-p",
         f"mock_target:={'true' if mock_target else 'false'}",
+        "-p",
+        f"mock_yaw_rad:={mock_yaw_rad}",
+        "-p",
+        f"vision_time_alignment_assume_shared_ros_clock:={'true' if assume_shared_ros_clock else 'false'}",
+        "-p",
+        f"vision_time_alignment_tolerance_ns:={alignment_tolerance_ns}",
         "-p",
         "mock_fire_request:=true",
         "-p",
@@ -120,10 +149,22 @@ def assert_all_safe(probe):
 
 
 def run_mock_case():
-    process = start_node("mock", mock_target=True, input_timeout_ms=80)
+    process = start_node(
+        "mock",
+        mock_target=True,
+        input_timeout_ms=80,
+        mock_yaw_rad=0.25,
+        assume_shared_ros_clock=True,
+        alignment_tolerance_ns=100_000_000,
+    )
     try:
         assert wait_for_graph(probe), "ROS graph discovery did not complete"
         assert spin_until(probe, lambda: bool(probe.controls), 5.0)
+        # This test explicitly asserts a shared ROS header domain only to
+        # exercise the matched diagnostic path.  It is still diagnostic-only;
+        # the 90-degree Vision yaw and shoot speed must not alter the mock
+        # command or fire output.
+        probe.publish_vision(1)
         probe.publish_image(1)
         assert spin_until(
             probe,
@@ -131,6 +172,10 @@ def run_mock_case():
             5.0,
         ), [int(message.target_lock) for message in probe.controls]
         assert_all_safe(probe)
+        locked = [message for message in probe.controls if int(message.target_lock) == 49]
+        assert locked, "mock target did not produce a locked command"
+        assert all(abs(float(message.yaw) - 0.25 * 180.0 / 3.141592653589793) < 1e-3
+                   for message in locked)
 
         # A malformed timestamp must not refresh the image watchdog.  After
         # the timeout, the node must return to the safe unlocked output.

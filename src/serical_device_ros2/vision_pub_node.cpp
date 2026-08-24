@@ -1,8 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include "serial_main.h"
-// #include "robot_status.h"
-// #include "robot_struct.h"
-#include "auto_aim_interfaces/msg/robot_ctrl.hpp"
+#include "serial_ros_mapping.hpp"
 #include "auto_aim_interfaces/msg/vision.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 
@@ -12,9 +10,23 @@ class VisionPub : public rclcpp::Node
 {
 public:
   explicit VisionPub(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
-  : Node("vision_pub", options)
+  : Node("vision_pub", options), serial()
   {
     setvbuf(stdout, NULL, _IONBF, BUFSIZ);
+
+    const auto serial_device = this->declare_parameter<std::string>(
+      "serial_device", "/dev/robomaster");
+    const auto serial_enabled = this->declare_parameter<bool>("serial_enabled", false);
+    serial.SetDevicePath(serial_device);
+    if (serial_enabled && !serial.Enable())
+    {
+      RCLCPP_ERROR(this->get_logger(), "Unable to open serial device '%s'", serial_device.c_str());
+    }
+    else if (!serial_enabled)
+    {
+      RCLCPP_INFO(this->get_logger(), "Serial disabled; VisionPub is running in dry-run mode");
+    }
+
     publisher_ = this->create_publisher<auto_aim_interfaces::msg::Vision>("/Vision_data", 10);
 
     RCLCPP_INFO(this->get_logger(), "--- VisionPub Node Started ---");
@@ -25,35 +37,31 @@ public:
   }
 
 private:
-  bool Get_data;
+  bool Get_data{false};
   SerialMain serial;
   rclcpp::Publisher<auto_aim_interfaces::msg::Vision>::SharedPtr publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   void timer_callback()
   {
+    if (!serial.IsEnabled())
+    {
+      return;
+    }
+
     Get_data = serial.ReceiverMain();
     if (Get_data)
     {
-      auto vision_t = std::make_shared<auto_aim_interfaces::msg::Vision>();
+      auto vision_msg = std::make_shared<auto_aim_interfaces::msg::Vision>(
+        serial_ros::to_ros_vision(serial.vision_msg_));
 
-      vision_t->header.frame_id = "vision";
-      vision_t->header.stamp = this->now();
-      vision_t->id = serial.vision_msg_.id;
-      vision_t->mode = serial.vision_msg_.mode;
-      vision_t->pitch = serial.vision_msg_.pitch;
-      vision_t->yaw = serial.vision_msg_.yaw;
-      vision_t->roll = serial.vision_msg_.roll;
+      vision_msg->header.frame_id = "vision";
+      vision_msg->header.stamp = this->now();
+      // VisionData and Vision.msg both carry position angles in degree.  The
+      // serial bridge deliberately performs no unit conversion; the
+      // auto_aim_ros2 adapter converts degree to internal radians once.
 
-      vision_t->quaternion.resize(4);
-      for (int i = 0; i < 4; i++)
-      {
-        vision_t->quaternion[i] = serial.vision_msg_.quaternion[i];
-      }
-
-      vision_t->shoot = serial.vision_msg_.shoot;
-
-      publisher_->publish(*vision_t);
+      publisher_->publish(*vision_msg);
     }
   }
 };

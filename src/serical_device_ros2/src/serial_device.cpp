@@ -16,7 +16,9 @@
  ***************************************************************************/
 
 #include "serial_device.h"
+#include <cerrno>
 #include <iostream>
+#include <poll.h>
 
 //namespace robomaster {
 SerialDevice::SerialDevice(std::string port_name,
@@ -36,7 +38,7 @@ bool SerialDevice::Init() {
 	
 	std::cout << "Attempting to open device " << port_name_
 			  << " with baudrate " << baudrate_ << std::endl;
-	if (port_name_.c_str() == nullptr) {
+	if (port_name_.empty()) {
 		port_name_ = "/dev/ttyUSB0";
 	}
 	if (OpenDevice() && ConfigDevice()) {
@@ -73,7 +75,9 @@ bool SerialDevice::OpenDevice() {
 
 // 关闭通讯协议接口
 bool SerialDevice::CloseDevice() {
-	close(serial_fd_);
+	if (serial_fd_ >= 0) {
+		close(serial_fd_);
+	}
 	serial_fd_ = -1;
 	return true;
 }
@@ -149,9 +153,9 @@ bool SerialDevice::ConfigDevice() {
 	else
 		new_termios_.c_cflag &= ~CSTOPB; //8N1 default config
 
-/* config waiting time & min number of char */
-	new_termios_.c_cc[VTIME] = 1;
-	new_termios_.c_cc[VMIN] = 18;
+	/* ReadSome() uses poll() for readiness; read must return the available chunk. */
+	new_termios_.c_cc[VTIME] = 0;
+	new_termios_.c_cc[VMIN] = 0;
 	
 	/* using the raw data mode */
 	new_termios_.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
@@ -170,73 +174,81 @@ bool SerialDevice::ConfigDevice() {
 }
 
 int SerialDevice::Read(uint8_t *buf, int len) {
-	int ret = -1;
-	
-	if (NULL == buf) {
-		return -1;
-	} else {
-		ret = read(serial_fd_, buf, len);
-		// std::cout<<"Read once length: "<<ret<<std::endl;
-		
-		while (ret == 0) {
-			std::cerr << "Connection closed, try to reconnect." << std::endl;
-			while (!Init()) {
-				usleep(500000);//check every 500 ms
-			}
-			std::cout << "Reconnect Success." << std::endl;
-			ret = read(serial_fd_, buf, len);
-		}
-		return ret;
+	if (len <= 0) {
+		return 0;
 	}
+	return ReadSome(buf, static_cast<std::size_t>(len));
+}
+
+int SerialDevice::ReadSome(uint8_t *buf, std::size_t len) {
+	if (serial_fd_ < 0 || buf == nullptr || len == 0) {
+		return -1;
+	}
+
+	pollfd descriptor{serial_fd_, POLLIN, 0};
+	int ready = poll(&descriptor, 1, 0);
+	if (ready == 0) {
+		return 0;
+	}
+	if (ready < 0) {
+		return errno == EINTR ? 0 : -1;
+	}
+	if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+		return -1;
+	}
+
+	ssize_t ret = read(serial_fd_, buf, len);
+	if (ret > 0) {
+		return static_cast<int>(ret);
+	}
+	if (ret < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+		return 0;
+	}
+	return ret == 0 ? 0 : -1;
 }
 
 int SerialDevice::ReadUntil2(uint8_t *buf, uint8_t end1, uint8_t end2, uint8_t max_len) {
-	int ret = -1;
-	int flag = 0;
-	uint8_t *p = buf;
-	uint8_t i = 0;
-	if (NULL == buf) {
+	if (buf == nullptr || max_len == 0) {
 		return -1;
-	} else {
-		while (flag == 0) {
-			ret = read(serial_fd_, p, 1);
-			
-			while (ret == 0) {
-				std::cerr << "Connection closed, try to reconnect." << std::endl;
-				while (!Init()) {
-					usleep(500000);//check every 500 ms
-				}
-				std::cout << "Reconnect Success." << std::endl;
-				ret = read(serial_fd_, p, 1);
-			}
-			
-			if (*p == end1) {
-//			printf("data:%x\n",*p);
-				p++;
-//			printf("data:%x\n",*p);
-				read(serial_fd_, p, 1);
-				if (*p == end2) {
-					flag = 0;
-//           std::cout<<"Read a msg:" <<std::endl;
-					tcflush(serial_fd_, TCIFLUSH);
-					return 1;
-				}
-			}
-			p++;
-			i++;
-			if (i >= max_len) {
-				flag = 0;
-				tcflush(serial_fd_, TCIFLUSH);
-				return 0;
-			}
-		}
-		
 	}
-	
+
+	const int ret = ReadSome(buf, max_len);
+	if (ret <= 0) {
+		return ret;
+	}
+	for (int i = 1; i < ret; ++i) {
+		if (buf[i - 1] == end1 && buf[i] == end2) {
+			return 1;
+		}
+	}
+	return 0;
 }
 
 // 发送数据函数
 int SerialDevice::Write(const uint8_t *buf, int len) {
-	return write(serial_fd_, buf, len);
+	if (serial_fd_ < 0 || buf == nullptr || len <= 0) {
+		return -1;
+	}
+
+	std::size_t written = 0;
+	while (written < static_cast<std::size_t>(len)) {
+		const ssize_t ret = write(serial_fd_, buf + written, static_cast<std::size_t>(len) - written);
+		if (ret > 0) {
+			written += static_cast<std::size_t>(ret);
+			continue;
+		}
+		if (ret < 0 && errno == EINTR) {
+			continue;
+		}
+		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			pollfd descriptor{serial_fd_, POLLOUT, 0};
+			const int ready = poll(&descriptor, 1, 100);
+			if (ready > 0 && (descriptor.revents & POLLOUT) != 0) {
+				continue;
+			}
+		}
+		break;
+	}
+	return written == 0 ? -1 : static_cast<int>(written);
 }
 //}

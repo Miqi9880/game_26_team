@@ -20,7 +20,10 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
-include_directories(include)
+include_directories(
+  include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+)
 
 #########################################
 # ✅ 构建组件库
@@ -28,6 +31,7 @@ include_directories(include)
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/serial_main.cpp
   src/serial_device.cpp
+  src/serial_frame_parser.cpp
   src/crc.cpp
   vision_pub_node.cpp
   robot_ctrl_node.cpp
@@ -52,6 +56,23 @@ rclcpp_components_register_node(${PROJECT_NAME}
 install(DIRECTORY include/
   DESTINATION include/
 )
+
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../protocol_new.hpp
+  DESTINATION include
+)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_auto_add_gtest(
+    serial_protocol_loopback_test
+    test/serial_protocol_loopback_test.cpp
+  )
+  ament_auto_add_gtest(
+    robot_ctrl_safety_test
+    test/robot_ctrl_safety_test.cpp
+  )
+endif()
 
 #########################################
 # ✅ 打包

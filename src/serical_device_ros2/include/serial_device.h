@@ -17,6 +17,7 @@
 
 #ifndef ROBOMASTER_SERIAL_DEVICE_H
 #define ROBOMASTER_SERIAL_DEVICE_H
+#include <cstddef>
 #include <string>
 #include <cstring>
 
@@ -53,12 +54,19 @@ class SerialDevice{
    */
   int Read(uint8_t *buf, int len);
   /**
+   * @brief Read currently available bytes without framing or flushing.
+   * @return positive byte count, 0 for timeout/no data, or -1 on fatal error.
+   */
+  int ReadSome(uint8_t *buf, std::size_t len);
+  /**
    * @brief Write the buffer data into device to send the data
    * @param buf Given buffer to be sent
    * @param len Send data length
    * @return < 0 if failed, else the send length
    */
-  int ReadUntil2(uint8_t *buf, uint8_t end1 , uint8_t end2,uint8_t max_len)  ;
+  // Legacy helper; the production path uses ReadSome plus SerialFrameParser.
+  [[deprecated("use ReadSome and SerialFrameParser")]]
+  int ReadUntil2(uint8_t *buf, uint8_t end1, uint8_t end2, uint8_t max_len);
 
   int Write(const uint8_t *buf, int len);               // 发送数据函数
 
@@ -94,7 +102,7 @@ class SerialDevice{
   //! parity bits of the serial device, as default
   char parity_bits_;
   //! serial handler
-  int serial_fd_;
+  int serial_fd_{-1};
   //! set flag of serial handler
   fd_set serial_fd_set_;
   //! termios config for serial handler

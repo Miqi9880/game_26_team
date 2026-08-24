@@ -28,11 +28,11 @@ struct __attribute__((packed)) VisionData
 {
   uint16_t id = 0;
   uint16_t mode = 0;  // 33: auto aim
-  float yaw = 0.0f;
-  float yaw_vel = 0.0f;
-  float pitch = 0.0f;
-  float pitch_vel = 0.0f;
-  float roll = 0.0f;
+  float yaw = 0.0f;       // degree; serial field is forwarded unchanged
+  float yaw_vel = 0.0f;   // external unit pending confirmation
+  float pitch = 0.0f;     // degree; serial field is forwarded unchanged
+  float pitch_vel = 0.0f; // external unit pending confirmation
+  float roll = 0.0f;      // degree; serial field is forwarded unchanged
   float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};  // w, x, y, z
   float shoot_speed = 0.0f;
   uint16_t bullet_count = 0;
@@ -41,12 +41,12 @@ struct __attribute__((packed)) VisionData
 
 struct __attribute__((packed)) RobotCtrlData
 {
-  float yaw = 0.0f;
-  float yaw_vel = 0.0f;
-  float yaw_acc = 0.0f;
-  float pitch = 0.0f;
-  float pitch_vel = 0.0f;
-  float pitch_acc = 0.0f;
+  float yaw = 0.0f;       // degree absolute target angle
+  float yaw_vel = 0.0f;   // external unit pending confirmation; currently 0
+  float yaw_acc = 0.0f;   // external unit pending confirmation; currently 0
+  float pitch = 0.0f;     // degree absolute target angle
+  float pitch_vel = 0.0f; // external unit pending confirmation; currently 0
+  float pitch_acc = 0.0f; // external unit pending confirmation; currently 0
   int8_t target_lock = 50;  // 49: lock, 50: unlock
   int8_t fire_command = 0;
 };

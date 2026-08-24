@@ -205,6 +205,38 @@ def run_null_case():
         stop_node(process)
 
 
+def run_incomparable_alignment_case():
+    process = start_node(
+        "mock",
+        mock_target=True,
+        input_timeout_ms=200,
+        mock_yaw_rad=0.25,
+        # The default keeps Image and Vision headers in separate, unproven
+        # clock domains.  This deliberately exercises the fail-closed
+        # diagnostic path while the mock target remains independent of it.
+        assume_shared_ros_clock=False,
+        alignment_tolerance_ns=100_000_000,
+    )
+    try:
+        assert wait_for_graph(probe), "ROS graph discovery did not complete"
+        assert spin_until(probe, lambda: bool(probe.controls), 5.0)
+        probe.publish_vision(3)
+        probe.publish_image(3)
+        assert spin_until(
+            probe,
+            lambda: any(int(message.target_lock) == 49 for message in probe.controls),
+            5.0,
+        ), [int(message.target_lock) for message in probe.controls]
+        # A cross-domain pairing failure is diagnostic-only and must not
+        # introduce a fire request or alter the independent mock command.
+        assert_all_safe(probe)
+        locked = [message for message in probe.controls if int(message.target_lock) == 49]
+        assert all(abs(float(message.yaw) - 0.25 * 180.0 / 3.141592653589793) < 1e-3
+                   for message in locked)
+    finally:
+        stop_node(process)
+
+
 def main():
     global probe
     # Keep this CTest independent of unrelated ROS nodes in the developer's
@@ -217,6 +249,8 @@ def main():
     probe = SafetyProbe()
     try:
         run_mock_case()
+        probe.controls.clear()
+        run_incomparable_alignment_case()
         probe.controls.clear()
         run_null_case()
         print("ros_safety_integration_test: mock lock, timeout, invalid timestamp, fire=0 OK")

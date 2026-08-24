@@ -38,6 +38,18 @@ ROS encodings to BGR before OpenCV/OpenVINO. A production `camera_info.yaml`
 must be generated for the exact serial number, lens, resolution and raw-image
 pipeline; the checked-in values are a format example only.
 
+### Timestamp provenance
+
+`/image_raw.header.stamp` is assigned from `this->now()` after SDK pixel
+conversion and immediately before publication. It therefore represents the
+camera node's ROS clock at the local publish-preparation time. It is not an
+SDK exposure timestamp, hardware timestamp, IMU timestamp, or MCU timestamp.
+
+The SDK frame timestamp is not used because this checkout does not establish a
+verified mapping for it. `camera_info.header.stamp` is copied from the same
+image message timestamp. This node does not read or use IMU quaternion data for
+camera rotation, extrinsics, coordinate transforms, or control.
+
 ## Params
 
 - exposure_time

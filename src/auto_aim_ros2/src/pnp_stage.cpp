@@ -496,6 +496,9 @@ std::optional<std::string> PnpConfiguration::validate() const
   if (schema_version != 1) {
     return "unsupported schema_version; expected 1";
   }
+  if (!test_only && !camera_to_gimbal.configured) {
+    return "production PnP configuration requires a verified camera_to_gimbal extrinsic";
+  }
   if (const auto error = camera.validate(); error.has_value()) {
     return "camera: " + *error;
   }
@@ -661,6 +664,8 @@ const char * pose_failure_name(PoseFailure failure) noexcept
       return "invalid_raw_detection";
     case PoseFailure::GeometryNotConfigured:
       return "geometry_not_configured";
+    case PoseFailure::GeometrySemanticConflict:
+      return "geometry_semantic_conflict";
     case PoseFailure::InvalidConfiguration:
       return "invalid_configuration";
     case PoseFailure::ImageDimensionsMismatch:
@@ -706,6 +711,20 @@ PoseObservation PnpStage::solve(
     const auto * geometry = config_.geometry_for(detection);
     if (geometry == nullptr) {
       return invalid_observation(detection, PoseFailure::GeometryNotConfigured);
+    }
+    // A reviewed model profile may carry an armor-size hint while the PnP
+    // profile may also map class_id to a physical geometry.  If both are
+    // present they must agree; silently preferring one would allow a stale or
+    // mismatched model/calibration pair to solve with the wrong dimensions.
+    const auto class_mapping = config_.class_to_armor_size.find(detection.class_id);
+    if (class_mapping != config_.class_to_armor_size.end() &&
+      detection.armor_type != detector::RawArmorDetection::ArmorTypeHint::Unknown)
+    {
+      const auto hinted_size = detection.armor_type ==
+        detector::RawArmorDetection::ArmorTypeHint::Small ? ArmorSize::Small : ArmorSize::Large;
+      if (class_mapping->second != hinted_size) {
+        return invalid_observation(detection, PoseFailure::GeometrySemanticConflict);
+      }
     }
     if (!bbox_within_image(detection.bbox, config_.camera) ||
       !is_ordered_convex_quad(detection.keypoints) ||

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +49,18 @@ struct DetectorConfig
   std::string model_path;
   std::string device{"CPU"};
 
+  // Optional semantic mapping from the reviewed model profile.  An empty map
+  // preserves the legacy smoke path; a non-empty map is applied to every
+  // emitted RawArmorDetection and unknown class ids fail closed.
+  std::map<int, RawArmorDetection::ArmorTypeHint> class_to_armor_type;
+
+  // When non-empty, the model's declared element types are checked against
+  // the versioned model profile.  Empty input type keeps the legacy smoke
+  // path compatible; output remains FP32 by default because the parser below
+  // consumes float logits.
+  std::string expected_input_element_type;
+  std::string expected_output_element_type{"f32"};
+
   // The first adapter targets the supplied YOLOv5 IR model.  These values are
   // explicit configuration, not a claim that a future competition model has
   // the same contract.
@@ -57,6 +70,13 @@ struct DetectorConfig
   std::size_t expected_output_columns{22};
   std::size_t color_class_count{4};
   std::size_t armor_class_count{9};
+
+  // Fixed row contract for the reference YOLO export.  These offsets are
+  // explicit configuration so a future model cannot silently reuse a
+  // different output layout.
+  std::size_t objectness_index{8};
+  std::size_t color_logits_offset{9};
+  std::size_t armor_logits_offset{13};
 
   float objectness_threshold{0.7F};
   float nms_threshold{0.3F};
@@ -69,6 +89,70 @@ struct DetectorConfig
   // postprocess order is [0, 3, 2, 1].
   std::array<int, 4> keypoint_order{{0, 3, 2, 1}};
 };
+
+// A model profile is a versioned, reviewable description of a detector
+// artifact's tensor and semantic contract.  It is intentionally separate
+// from the physical PnP/calibration YAML.  No production profile is shipped
+// until the competition model has been measured and its class semantics have
+// been confirmed.
+struct ModelProfile
+{
+  int schema_version{0};
+  bool test_only{false};
+  std::string model_id;
+  // Artifact path or an explicit external-artifact identifier.  The loader
+  // records it but never searches old repositories or loads model weights.
+  std::string model_path;
+  std::string source;
+  std::string version;
+
+  std::array<std::size_t, 4> input_shape{};  // N,C,H,W
+  std::string input_layout;
+  std::string input_element_type;
+  std::string source_color_order;
+  std::string model_color_order;
+  std::string normalization;
+  std::string resize_mode;
+
+  std::array<std::size_t, 3> output_shape{};  // N,rows,columns
+  std::string output_layout;
+  std::string output_element_type;
+  std::size_t keypoint_count{0};
+  std::size_t objectness_index{0};
+  std::size_t color_logits_offset{0};
+  std::size_t color_class_count{0};
+  std::size_t armor_logits_offset{0};
+  std::size_t armor_class_count{0};
+
+  float objectness_threshold{0.0F};
+  float nms_threshold{0.0F};
+  std::array<int, 4> keypoint_order{};
+  std::vector<std::string> color_names;
+  std::vector<std::string> armor_names;
+  std::map<int, RawArmorDetection::ArmorTypeHint> class_to_armor_type;
+
+  std::optional<std::string> validate() const;
+};
+
+struct ModelProfileLoadOptions
+{
+  // A test-only profile is rejected by default.  Only offline tools/tests may
+  // opt in explicitly; runtime/control paths should leave this false.
+  bool allow_test_only{false};
+};
+
+// Parse and validate a model profile without loading or connecting to a model
+// device.  The path is never inferred from old repositories or local caches.
+ModelProfile load_model_profile(
+  const std::string & yaml_path,
+  ModelProfileLoadOptions options = {});
+
+// Convert a validated profile into the detector's runtime contract.  The
+// caller still supplies the actual model artifact path and OpenVINO device.
+DetectorConfig detector_config_from_model_profile(
+  const ModelProfile & profile,
+  std::string model_path,
+  std::string device = "CPU");
 
 struct ModelInfo
 {

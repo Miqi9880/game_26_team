@@ -64,7 +64,11 @@ candidate_pitch_rad = test_zero_pitch_rad + relative_pitch_rad
 
 ## 离线工具输出
 
-`auto_aim_offline` 输出逐帧 CSV 和标注 PNG。CSV 记录检测数量、有效 PnP 数量、相机坐标、relative rad、track 状态、track id、lock、可选 test absolute rad/degree、fire 和 test-only 标志。标注图叠加四点、PnP 状态、selected track、tracking 状态、相对角和 `fire=0`。
+`auto_aim_offline` 要求显式提供版本化 `--model-profile`；读取 test-only 模型时还必须传入
+`--allow-test-profile`，读取 test-only PnP 时传入 `--allow-test-config`。它输出逐帧 CSV 和标注 PNG。
+CSV 记录检测数量、有效 PnP 数量、相机坐标、relative rad、track 状态、track id、lock、可选
+test absolute rad/degree、fire 和 test-only 标志。标注图叠加四点、PnP 状态、selected track、
+tracking 状态、相对角和 `fire=0`。
 
 录像没有有效 FPS 时必须通过 `--fps` 或 `--frame-period-ms` 提供可复现时间；不会把所有帧时间戳写成 0。
 

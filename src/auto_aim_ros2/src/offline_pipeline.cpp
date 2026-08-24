@@ -266,6 +266,19 @@ TrackerUpdate OfflineTracker::update(
         track.state = TrackingState::TempLost;
       }
     }
+    // make_update() computes the diagnostic primary track/state before the
+    // safety transition above. Recompute them so a rejected timestamp cannot
+    // report a stale "tracking" state to CSV/ROS diagnostics.
+    result.primary_track.reset();
+    for (const auto & track : result.tracks) {
+      if (!result.primary_track.has_value() ||
+        better_primary_track(track, *result.primary_track))
+      {
+        result.primary_track = track;
+      }
+    }
+    result.state = result.primary_track.has_value() ?
+      result.primary_track->state : TrackingState::Lost;
     return result;
   }
   if (last_update_timestamp_ns_ >= 0 && timestamp_ns <= last_update_timestamp_ns_) {
@@ -277,6 +290,19 @@ TrackerUpdate OfflineTracker::update(
         track.state = TrackingState::TempLost;
       }
     }
+    // Keep the diagnostic snapshot consistent with the safety transition;
+    // the persistent tracker state is intentionally not changed by a bad
+    // timestamp, but the returned update must not claim an active lock.
+    result.primary_track.reset();
+    for (const auto & track : result.tracks) {
+      if (!result.primary_track.has_value() ||
+        better_primary_track(track, *result.primary_track))
+      {
+        result.primary_track = track;
+      }
+    }
+    result.state = result.primary_track.has_value() ?
+      result.primary_track->state : TrackingState::Lost;
     return result;
   }
 
@@ -690,6 +716,14 @@ AimerOutput SafeOfflineAimer::aim(
   result.fire_command = pipeline::kFireNone;
   result.shoot_speed_mps = finite(shoot_speed_mps) && shoot_speed_mps >= 0.0 ? shoot_speed_mps : 0.0;
   if (!selected.has_value() || !selected->target_lock()) {
+    return result;
+  }
+
+  // Tracker-generated motion diagnostics are normally finite, but keep the
+  // aimer boundary fail-closed for synthetic or future callers that construct
+  // a TrackedTarget directly.  Do not expose NaN/Inf in diagnostic CSV or let
+  // such evidence appear lockable.
+  if (!finite(selected->yaw_vel_rad_s) || !finite(selected->pitch_vel_rad_s)) {
     return result;
   }
 

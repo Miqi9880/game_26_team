@@ -83,6 +83,10 @@ if(BUILD_TESTING)
     raw_armor_detector_test
     test/raw_armor_detector_test.cpp
   )
+  target_compile_definitions(
+    raw_armor_detector_test PRIVATE
+    MODEL_PROFILE_TEST_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/data/model_profile_test.yaml"
+  )
   ament_auto_add_gtest(
     ros_image_adapter_test
     test/ros_image_adapter_test.cpp

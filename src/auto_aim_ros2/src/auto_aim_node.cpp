@@ -92,6 +92,7 @@ public:
     input_timeout_ms_ = declare_parameter<int>("input_timeout_ms", 100);
     csv_path_ = declare_parameter<std::string>("csv_path", "");
     offline_model_path_ = declare_parameter<std::string>("offline_model_path", "");
+    offline_model_profile_ = declare_parameter<std::string>("offline_model_profile", "");
     offline_pnp_config_ = declare_parameter<std::string>("offline_pnp_config", "");
     offline_device_ = declare_parameter<std::string>("offline_device", "CPU");
     allow_test_only_ = declare_parameter<bool>("allow_test_only", false);
@@ -129,6 +130,7 @@ public:
     backend_config.mock_pitch_rad = static_cast<float>(mock_pitch_rad_);
     backend_config.mock_fire_request = mock_fire_request_;
     backend_config.model_path = offline_model_path_;
+    backend_config.model_profile_path = offline_model_profile_;
     backend_config.pnp_config_path = offline_pnp_config_;
     backend_config.device = offline_device_;
     backend_config.allow_test_only = allow_test_only_;
@@ -179,9 +181,10 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "AutoAimNode started: backend=%s calibration=%s test_only=%s dry_run=%s "
-      "serial_enabled=false output_hz=%.1f fire=disabled",
+      "model_profile=%s serial_enabled=false output_hz=%.1f fire=disabled",
       backend_name_.c_str(), backend_->calibration_profile().c_str(),
-      backend_->test_only() ? "true" : "false", dry_run_ ? "true" : "false", output_hz_);
+      backend_->test_only() ? "true" : "false", dry_run_ ? "true" : "false",
+      backend_->model_profile().c_str(), output_hz_);
   }
 
 private:
@@ -351,6 +354,7 @@ private:
   std::string backend_name_;
   std::string csv_path_;
   std::string offline_model_path_;
+  std::string offline_model_profile_;
   std::string offline_pnp_config_;
   std::string offline_device_;
   pipeline::VisionState latest_vision_{};

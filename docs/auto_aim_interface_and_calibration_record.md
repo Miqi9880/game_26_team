@@ -142,6 +142,7 @@ PnP 只能在获得真实配置后进行 production 验证；在此之前只能�
 ```bash
 ros2 run auto_aim_ros2 auto_aim_pnp_smoke -- \
   --model /path/to/verified_model.xml \
+  --model-profile /path/to/reviewed_model_profile.yaml \
   --video /path/to/raw_image_video.avi \
   --pnp-config /path/to/production_pnp.yaml \
   --frames 10 \

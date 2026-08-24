@@ -90,6 +90,9 @@ TEST(RosBackend, OfflineReferenceRequiresExplicitSafeConfiguration)
   config.model_path = "/does/not/exist.xml";
   config.pnp_config_path = "/does/not/exist.yaml";
   EXPECT_THROW(Backend backend(config), std::exception);
+
+  config.model_profile_path = "/does/not/exist-profile.yaml";
+  EXPECT_THROW(Backend backend(config), std::exception);
 }
 
 TEST(RosBackend, CsvDeclaresDiagnosticAndPublishedSafetyFields)
@@ -97,6 +100,7 @@ TEST(RosBackend, CsvDeclaresDiagnosticAndPublishedSafetyFields)
   const auto header = rm_auto_aim::ros_backend::csv_header();
   EXPECT_NE(header.find("backend"), std::string::npos);
   EXPECT_NE(header.find("calibration_profile"), std::string::npos);
+  EXPECT_NE(header.find("model_profile"), std::string::npos);
   EXPECT_NE(header.find("aimer_mode"), std::string::npos);
   EXPECT_NE(header.find("diagnostic_target_lock"), std::string::npos);
   EXPECT_NE(header.find("published_target_lock"), std::string::npos);

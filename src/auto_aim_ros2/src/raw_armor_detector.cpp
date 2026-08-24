@@ -5,12 +5,14 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 
 #include <opencv2/dnn/dnn.hpp>
 #include <opencv2/imgproc.hpp>
+#include <yaml-cpp/yaml.h>
 
 #ifdef AUTO_AIM_HAS_OPENVINO
 #include <openvino/openvino.hpp>
@@ -47,7 +49,13 @@ int argmax(const float * values, std::size_t count)
     return -1;
   }
   std::size_t best = 0;
+  if (!std::isfinite(values[best])) {
+    return -1;
+  }
   for (std::size_t index = 1; index < count; ++index) {
+    if (!std::isfinite(values[index])) {
+      return -1;
+    }
     if (values[index] > values[best]) {
       best = index;
     }
@@ -67,6 +75,123 @@ std::string shape_string(const std::vector<std::size_t> & shape)
   }
   stream << ']';
   return stream.str();
+}
+
+std::string profile_context(const std::string & path, const std::string & field)
+{
+  return path + ": missing or invalid required field '" + field + "'";
+}
+
+YAML::Node required_profile_node(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  const auto node = parent[key];
+  if (!node || node.IsNull()) {
+    throw std::runtime_error(profile_context(path, key));
+  }
+  return node;
+}
+
+std::string required_profile_string(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  try {
+    const auto value = required_profile_node(parent, key, path).as<std::string>();
+    if (value.empty()) {
+      throw std::runtime_error(profile_context(path, key));
+    }
+    return value;
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(profile_context(path, key));
+  }
+}
+
+std::int64_t required_profile_integer(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  try {
+    return required_profile_node(parent, key, path).as<std::int64_t>();
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(profile_context(path, key));
+  }
+}
+
+double required_profile_double(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  try {
+    const auto value = required_profile_node(parent, key, path).as<double>();
+    if (!std::isfinite(value)) {
+      throw std::runtime_error(profile_context(path, key));
+    }
+    return value;
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(profile_context(path, key));
+  }
+}
+
+std::vector<std::int64_t> required_profile_integer_sequence(
+  const YAML::Node & parent,
+  const std::string & key,
+  std::size_t expected_count,
+  const std::string & path)
+{
+  const auto node = required_profile_node(parent, key, path);
+  if (!node.IsSequence() || node.size() != expected_count) {
+    throw std::runtime_error(
+      path + ": field '" + key + "' must contain exactly " +
+      std::to_string(expected_count) + " integers");
+  }
+  std::vector<std::int64_t> values;
+  values.reserve(expected_count);
+  try {
+    for (const auto & item : node) {
+      values.push_back(item.as<std::int64_t>());
+    }
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(path + ": field '" + key + "' must contain integers");
+  }
+  return values;
+}
+
+std::vector<std::string> required_profile_strings(
+  const YAML::Node & parent,
+  const std::string & key,
+  std::size_t expected_count,
+  const std::string & path)
+{
+  const auto node = required_profile_node(parent, key, path);
+  if (!node.IsSequence() || node.size() != expected_count) {
+    throw std::runtime_error(
+      path + ": field '" + key + "' must contain exactly " +
+      std::to_string(expected_count) + " names");
+  }
+  std::vector<std::string> values;
+  values.reserve(expected_count);
+  try {
+    for (const auto & item : node) {
+      const auto value = item.as<std::string>();
+      if (value.empty()) {
+        throw std::runtime_error(path + ": field '" + key + "' contains an empty name");
+      }
+      values.push_back(value);
+    }
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(path + ": field '" + key + "' must contain strings");
+  }
+  return values;
+}
+
+RawArmorDetection::ArmorTypeHint parse_profile_armor_type(
+  const std::string & value, const std::string & context)
+{
+  if (value == "small") {
+    return RawArmorDetection::ArmorTypeHint::Small;
+  }
+  if (value == "large") {
+    return RawArmorDetection::ArmorTypeHint::Large;
+  }
+  throw std::runtime_error(context + ": armor type must be 'small' or 'large'");
 }
 
 cv::Rect to_nms_rect(const cv::Rect2f & rect)
@@ -130,6 +255,285 @@ std::optional<RawArmorDetection> make_raw_armor_detection(
   return result;
 }
 
+std::optional<std::string> ModelProfile::validate() const
+{
+  if (schema_version != 1) {
+    return "unsupported schema_version; expected 1";
+  }
+  if (model_id.empty() || model_path.empty() || source.empty() || version.empty()) {
+    return "model_id, model_path, source, and version are required";
+  }
+  if (input_shape[0] != 1 || input_shape[1] != 3 || input_shape[2] == 0 || input_shape[3] == 0 ||
+    input_shape[2] > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+    input_shape[3] > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+  {
+    return "input_shape must be [1,3,height,width] with positive height/width";
+  }
+  if (input_layout != "NCHW") {
+    return "input_layout must be NCHW";
+  }
+  if (input_element_type.empty() || source_color_order != "BGR" || model_color_order != "RGB") {
+    return "input element/color contract must declare model type and BGR source to RGB model order";
+  }
+  if (normalization != "divide_255") {
+    return "normalization must be divide_255";
+  }
+  if (resize_mode != "top_left" && resize_mode != "center") {
+    return "resize_mode must be top_left or center";
+  }
+  if (output_shape[0] != 1 || output_shape[1] == 0 || output_shape[2] == 0) {
+    return "output_shape must be [1,rows,columns] with positive rows/columns";
+  }
+  if (output_layout != "NRC") {
+    return "output_layout must be NRC";
+  }
+  if (output_element_type != "f32") {
+    return "output_element_type must be f32 for the current decoder";
+  }
+  if (keypoint_count != 4) {
+    return "keypoint_count must be exactly 4";
+  }
+  if (objectness_index != 8 || color_logits_offset != 9 || armor_logits_offset != 13) {
+    return "current decoder requires objectness_index=8, color_logits_offset=9, "
+           "armor_logits_offset=13";
+  }
+  const auto range_fits = [](std::size_t offset, std::size_t count, std::size_t limit) {
+      return offset <= limit && count <= limit - offset;
+    };
+  if (color_class_count == 0 || armor_class_count == 0 ||
+    !range_fits(color_logits_offset, color_class_count, output_shape[2]) ||
+    !range_fits(armor_logits_offset, armor_class_count, output_shape[2]))
+  {
+    return "class logit ranges must be non-empty and fit inside output_shape columns";
+  }
+  if (!std::isfinite(objectness_threshold) || objectness_threshold < 0.0F ||
+    objectness_threshold > 1.0F || !std::isfinite(nms_threshold) || nms_threshold < 0.0F ||
+    nms_threshold > 1.0F)
+  {
+    return "objectness_threshold and nms_threshold must be finite values in [0,1]";
+  }
+  std::set<int> keypoint_indices;
+  for (const int index : keypoint_order) {
+    if (index < 0 || index >= static_cast<int>(keypoint_count) ||
+      !keypoint_indices.insert(index).second)
+    {
+      return "keypoint_order must be a permutation of [0,1,2,3]";
+    }
+  }
+  if (color_names.size() != color_class_count || armor_names.size() != armor_class_count) {
+    return "color_names/armor_names length must match class counts";
+  }
+  std::set<std::string> names;
+  for (const auto & name : color_names) {
+    if (name.empty() || !names.insert(name).second) {
+      return "color_names must be non-empty and unique";
+    }
+  }
+  names.clear();
+  for (const auto & name : armor_names) {
+    if (name.empty() || !names.insert(name).second) {
+      return "armor_names must be non-empty and unique";
+    }
+  }
+  if (class_to_armor_type.size() != armor_class_count) {
+    return "class_to_armor_type must explicitly map every supported class exactly once";
+  }
+  for (const auto & [class_id, type] : class_to_armor_type) {
+    if (class_id < 0 || class_id >= static_cast<int>(armor_class_count) ||
+      (type != RawArmorDetection::ArmorTypeHint::Small &&
+      type != RawArmorDetection::ArmorTypeHint::Large))
+    {
+      return "class_to_armor_type contains an invalid class id or armor type";
+    }
+  }
+  for (std::size_t class_id = 0; class_id < armor_class_count; ++class_id) {
+    if (class_to_armor_type.find(static_cast<int>(class_id)) == class_to_armor_type.end()) {
+      return "class_to_armor_type must contain every class id from zero to armor_class_count-1";
+    }
+  }
+  return std::nullopt;
+}
+
+ModelProfile load_model_profile(const std::string & yaml_path, ModelProfileLoadOptions options)
+{
+  if (yaml_path.empty() || !std::filesystem::is_regular_file(yaml_path)) {
+    throw std::runtime_error("model profile does not exist: " + yaml_path);
+  }
+
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(yaml_path);
+  } catch (const YAML::Exception & error) {
+    throw std::runtime_error("cannot parse model profile " + yaml_path + ": " + error.what());
+  }
+  if (!root.IsMap()) {
+    throw std::runtime_error("model profile root must be a map: " + yaml_path);
+  }
+
+  ModelProfile result{};
+  const auto schema_version = required_profile_integer(root, "schema_version", "root");
+  if (schema_version < 0 || schema_version > std::numeric_limits<int>::max()) {
+    throw std::runtime_error("root.schema_version must be a non-negative integer");
+  }
+  result.schema_version = static_cast<int>(schema_version);
+  const auto profile = required_profile_string(root, "profile", "root");
+  if (profile == "test_only") {
+    result.test_only = true;
+  } else if (profile == "production") {
+    result.test_only = false;
+  } else {
+    throw std::runtime_error("root.profile must be 'test_only' or 'production'");
+  }
+  if (result.test_only && !options.allow_test_only) {
+    throw std::runtime_error(
+      "refusing test_only model profile without explicit allow_test_only=true: " + yaml_path);
+  }
+
+  const auto model_node = required_profile_node(root, "model", "root");
+  if (!model_node.IsMap()) {
+    throw std::runtime_error("model must be a map");
+  }
+  result.model_id = required_profile_string(model_node, "id", "model");
+  result.model_path = required_profile_string(model_node, "path", "model");
+  result.source = required_profile_string(model_node, "source", "model");
+  result.version = required_profile_string(model_node, "version", "model");
+
+  const auto input_node = required_profile_node(root, "input", "root");
+  if (!input_node.IsMap()) {
+    throw std::runtime_error("input must be a map");
+  }
+  const auto input_shape = required_profile_integer_sequence(input_node, "shape", 4, "input");
+  for (std::size_t index = 0; index < result.input_shape.size(); ++index) {
+    if (input_shape[index] < 0) {
+      throw std::runtime_error("input.shape must contain non-negative integers");
+    }
+    result.input_shape[index] = static_cast<std::size_t>(input_shape[index]);
+  }
+  result.input_layout = required_profile_string(input_node, "layout", "input");
+  result.input_element_type = required_profile_string(input_node, "element_type", "input");
+  result.source_color_order = required_profile_string(input_node, "source_color_order", "input");
+  result.model_color_order = required_profile_string(input_node, "model_color_order", "input");
+  result.normalization = required_profile_string(input_node, "normalization", "input");
+  result.resize_mode = required_profile_string(input_node, "resize_mode", "input");
+
+  const auto output_node = required_profile_node(root, "output", "root");
+  if (!output_node.IsMap()) {
+    throw std::runtime_error("output must be a map");
+  }
+  const auto output_shape = required_profile_integer_sequence(output_node, "shape", 3, "output");
+  for (std::size_t index = 0; index < result.output_shape.size(); ++index) {
+    if (output_shape[index] < 0) {
+      throw std::runtime_error("output.shape must contain non-negative integers");
+    }
+    result.output_shape[index] = static_cast<std::size_t>(output_shape[index]);
+  }
+  result.output_layout = required_profile_string(output_node, "layout", "output");
+  result.output_element_type = required_profile_string(output_node, "element_type", "output");
+  const auto keypoint_count = required_profile_integer(output_node, "keypoint_count", "output");
+  if (keypoint_count < 0) {
+    throw std::runtime_error("output.keypoint_count must be non-negative");
+  }
+  result.keypoint_count = static_cast<std::size_t>(keypoint_count);
+  const auto objectness_index = required_profile_integer(output_node, "objectness_index", "output");
+  const auto color_logits_offset = required_profile_integer(
+    output_node, "color_logits_offset", "output");
+  const auto color_class_count = required_profile_integer(
+    output_node, "color_class_count", "output");
+  const auto armor_logits_offset = required_profile_integer(
+    output_node, "armor_logits_offset", "output");
+  const auto armor_class_count = required_profile_integer(
+    output_node, "armor_class_count", "output");
+  if (objectness_index < 0 || color_logits_offset < 0 || color_class_count < 0 ||
+    armor_logits_offset < 0 || armor_class_count < 0)
+  {
+    throw std::runtime_error("output offsets and class counts must be non-negative");
+  }
+  result.objectness_index = static_cast<std::size_t>(objectness_index);
+  result.color_logits_offset = static_cast<std::size_t>(color_logits_offset);
+  result.color_class_count = static_cast<std::size_t>(color_class_count);
+  result.armor_logits_offset = static_cast<std::size_t>(armor_logits_offset);
+  result.armor_class_count = static_cast<std::size_t>(armor_class_count);
+
+  const auto postprocess_node = required_profile_node(root, "postprocess", "root");
+  if (!postprocess_node.IsMap()) {
+    throw std::runtime_error("postprocess must be a map");
+  }
+  result.objectness_threshold = static_cast<float>(
+    required_profile_double(postprocess_node, "objectness_threshold", "postprocess"));
+  result.nms_threshold = static_cast<float>(
+    required_profile_double(postprocess_node, "nms_threshold", "postprocess"));
+  const auto keypoint_order = required_profile_integer_sequence(
+    postprocess_node, "keypoint_order", 4, "postprocess");
+  for (std::size_t index = 0; index < result.keypoint_order.size(); ++index) {
+    if (keypoint_order[index] < std::numeric_limits<int>::min() ||
+      keypoint_order[index] > std::numeric_limits<int>::max())
+    {
+      throw std::runtime_error("postprocess.keypoint_order contains an out-of-range integer");
+    }
+    result.keypoint_order[index] = static_cast<int>(keypoint_order[index]);
+  }
+
+  const auto semantics_node = required_profile_node(root, "semantics", "root");
+  if (!semantics_node.IsMap()) {
+    throw std::runtime_error("semantics must be a map");
+  }
+  result.color_names = required_profile_strings(
+    semantics_node, "color_id_to_name", result.color_class_count, "semantics");
+  result.armor_names = required_profile_strings(
+    semantics_node, "armor_class_names", result.armor_class_count, "semantics");
+  const auto mapping_node = required_profile_node(semantics_node, "class_to_armor_type", "semantics");
+  if (!mapping_node.IsMap()) {
+    throw std::runtime_error("semantics.class_to_armor_type must be a map");
+  }
+  for (const auto & item : mapping_node) {
+    try {
+      const auto class_id = item.first.as<int>();
+      const auto armor_type = parse_profile_armor_type(
+        item.second.as<std::string>(), "semantics.class_to_armor_type");
+      const auto [ignored, inserted] = result.class_to_armor_type.emplace(class_id, armor_type);
+      if (!inserted) {
+        throw std::runtime_error("semantics.class_to_armor_type contains a duplicate class id");
+      }
+    } catch (const YAML::Exception &) {
+      throw std::runtime_error(
+        "semantics.class_to_armor_type must map integer class ids to small/large");
+    }
+  }
+
+  if (const auto error = result.validate(); error.has_value()) {
+    throw std::runtime_error("invalid model profile " + yaml_path + ": " + *error);
+  }
+  return result;
+}
+
+DetectorConfig detector_config_from_model_profile(
+  const ModelProfile & profile, std::string model_path, std::string device)
+{
+  if (const auto error = profile.validate(); error.has_value()) {
+    throw std::invalid_argument("invalid model profile: " + *error);
+  }
+  DetectorConfig result{};
+  result.model_path = model_path.empty() ? profile.model_path : std::move(model_path);
+  result.device = std::move(device);
+  result.expected_input_element_type = profile.input_element_type;
+  result.expected_output_element_type = profile.output_element_type;
+  result.input_width = static_cast<int>(profile.input_shape[3]);
+  result.input_height = static_cast<int>(profile.input_shape[2]);
+  result.expected_output_rows = profile.output_shape[1];
+  result.expected_output_columns = profile.output_shape[2];
+  result.color_class_count = profile.color_class_count;
+  result.armor_class_count = profile.armor_class_count;
+  result.objectness_index = profile.objectness_index;
+  result.color_logits_offset = profile.color_logits_offset;
+  result.armor_logits_offset = profile.armor_logits_offset;
+  result.objectness_threshold = profile.objectness_threshold;
+  result.nms_threshold = profile.nms_threshold;
+  result.center_padding = profile.resize_mode == "center";
+  result.keypoint_order = profile.keypoint_order;
+  result.class_to_armor_type = profile.class_to_armor_type;
+  return result;
+}
+
 std::optional<std::string> validate_output_shape(
   const std::vector<std::size_t> & shape,
   const DetectorConfig & config)
@@ -145,7 +549,10 @@ std::optional<std::string> validate_output_shape(
     return "expected output columns " + std::to_string(config.expected_output_columns) + ", got " +
            std::to_string(shape[2]);
   }
-  const auto minimum_columns = 8 + 1 + config.color_class_count + config.armor_class_count;
+  const auto minimum_columns = std::max(
+    {config.objectness_index + 1,
+      config.color_logits_offset + config.color_class_count,
+      config.armor_logits_offset + config.armor_class_count});
   if (shape[2] < minimum_columns) {
     return "output columns are too few for the configured keypoint/color/class contract: " +
            std::to_string(shape[2]) + " < " + std::to_string(minimum_columns);
@@ -272,6 +679,22 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
       throw std::runtime_error(
         "expected FP32 model output, got " + model->output().get_element_type().to_string());
     }
+    if (!impl_->config.expected_input_element_type.empty() &&
+      model->input().get_element_type().to_string() != impl_->config.expected_input_element_type)
+    {
+      throw std::runtime_error(
+        "model input element type does not match profile: expected " +
+        impl_->config.expected_input_element_type + ", got " +
+        model->input().get_element_type().to_string());
+    }
+    if (!impl_->config.expected_output_element_type.empty() &&
+      model->output().get_element_type().to_string() != impl_->config.expected_output_element_type)
+    {
+      throw std::runtime_error(
+        "model output element type does not match profile: expected " +
+        impl_->config.expected_output_element_type + ", got " +
+        model->output().get_element_type().to_string());
+    }
 
     impl_->info.input_shape = input_shape;
     impl_->info.output_shape = output_shape;
@@ -343,8 +766,8 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
   const auto * values = output_tensor.data<const float>();
   const std::size_t rows = output_shape[1];
   const std::size_t columns = output_shape[2];
-  const std::size_t color_offset = 9;
-  const std::size_t class_offset = color_offset + impl_->config.color_class_count;
+  const std::size_t color_offset = impl_->config.color_logits_offset;
+  const std::size_t class_offset = impl_->config.armor_logits_offset;
   std::vector<RawArmorDetection> candidates;
   std::vector<cv::Rect> boxes;
   std::vector<float> confidences;
@@ -354,7 +777,7 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
 
   for (std::size_t row = 0; row < rows; ++row) {
     const float * current = values + row * columns;
-    const float confidence = sigmoid(current[8]);
+    const float confidence = sigmoid(current[impl_->config.objectness_index]);
     if (!std::isfinite(confidence) || confidence < impl_->config.objectness_threshold) {
       continue;
     }
@@ -403,7 +826,17 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
     if (!detection.has_value()) {
       continue;
     }
-    candidates.push_back(*detection);
+    auto typed_detection = *detection;
+    if (!impl_->config.class_to_armor_type.empty()) {
+      const auto type = impl_->config.class_to_armor_type.find(class_id);
+      if (type == impl_->config.class_to_armor_type.end()) {
+        // A reviewed profile must describe every supported class.  Do not
+        // guess a physical armor size for an unknown semantic id.
+        continue;
+      }
+      typed_detection.armor_type = type->second;
+    }
+    candidates.push_back(typed_detection);
     boxes.push_back(to_nms_rect(bbox));
     confidences.push_back(confidence);
   }

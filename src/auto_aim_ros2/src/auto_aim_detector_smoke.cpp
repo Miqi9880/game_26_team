@@ -20,11 +20,13 @@ namespace
 struct Options
 {
   std::string model_path;
+  std::string model_profile_path;
   std::string video_path;
   std::string csv_path;
   std::string annotated_dir;
   std::string device{"CPU"};
   int frames{5};
+  bool allow_test_profile{false};
 };
 
 void usage()
@@ -33,6 +35,8 @@ void usage()
     "Usage: auto_aim_detector_smoke --model MODEL.xml --video VIDEO.avi [options]\n"
     "Options:\n"
     "  --frames N             frames to process (default 5)\n"
+    "  --model-profile PATH   explicit versioned model profile YAML\n"
+    "  --allow-test-profile   allow profile: test_only\n"
     "  --csv PATH             write raw detections as CSV\n"
     "  --annotated-dir PATH  write annotated BGR frames\n"
     "  --device DEVICE       OpenVINO device (default CPU)\n";
@@ -51,6 +55,10 @@ Options parse_options(int argc, char ** argv)
     };
     if (argument == "--model") {
       result.model_path = require_value("--model");
+    } else if (argument == "--model-profile") {
+      result.model_profile_path = require_value("--model-profile");
+    } else if (argument == "--allow-test-profile") {
+      result.allow_test_profile = true;
     } else if (argument == "--video") {
       result.video_path = require_value("--video");
     } else if (argument == "--frames") {
@@ -106,13 +114,25 @@ int main(int argc, char ** argv)
   try {
     const auto options = parse_options(argc, argv);
     rm_auto_aim::detector::DetectorConfig config{};
-    config.model_path = options.model_path;
-    config.device = options.device;
+    std::string profile_label = "unprofiled_legacy_reference";
+    if (!options.model_profile_path.empty()) {
+      rm_auto_aim::detector::ModelProfileLoadOptions profile_options{};
+      profile_options.allow_test_only = options.allow_test_profile;
+      const auto profile = rm_auto_aim::detector::load_model_profile(
+        options.model_profile_path, profile_options);
+      profile_label = profile.model_id + "@" + profile.version;
+      config = rm_auto_aim::detector::detector_config_from_model_profile(
+        profile, options.model_path, options.device);
+    } else {
+      config.model_path = options.model_path;
+      config.device = options.device;
+    }
 
     rm_auto_aim::detector::OpenVinoYoloDetector detector(config);
     const auto & info = detector.model_info();
     std::cout << "dry_run=true allow_fire=false serial_enabled=false fire_command=0\n";
-    std::cout << "model=" << options.model_path << " device=" << options.device << '\n';
+    std::cout << "model=" << options.model_path << " profile=" << profile_label <<
+      " device=" << options.device << '\n';
     std::cout << "input_shape=";
     for (const auto value : info.input_shape) std::cout << value << ' ';
     std::cout << "type=" << info.input_element_type << " output_shape=";

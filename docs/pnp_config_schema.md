@@ -83,6 +83,10 @@ relative yaw/pitch 只用于日志和几何核验，不是 RobotCtrl.yaw/pitch�
 
 加载器会拒绝以下情况：缺失必填项、错误 schema/profile、非法尺寸、非有限数、错误角点顺序、非平面或非矩形装甲几何、无效 K/D、非正交或非 det=+1 的已配置外参、未显式支持的 PnP 方法，以及超过重投影阈值的观测。实际帧分辨率不等于 camera.image_width × image_height 时也会失败；不会缩放 K 或猜测图像是否被 resize。
 
+当检测器 profile 已为 detection 提供 `armor_type` hint、且 PnP 配置又为同一
+`class_id` 提供 `class_to_armor_type` 时，两者必须指向同一 `small`/`large` 几何；冲突会以
+`geometry_semantic_conflict` 失败关闭，不会静默选择其中一个。
+
 ## test-only 与 production
 
 仓库中唯一提供的 PnP YAML 是：
@@ -94,6 +98,12 @@ relative yaw/pitch 只用于日志和几何核验，不是 RobotCtrl.yaw/pitch�
 默认加载器会拒绝 test-only 配置。仅离线工具或测试显式设置 allow_test_only=true 或传入 --allow-test-config 后才能使用。这些数值不得复制到真实机器、正式 YAML 或控制路径。
 
 目前没有随包提供 profile: production PnP 配置：这是有意的 fail-closed 状态，不应将当前 ros2-hik-camera/config/camera_info.yaml、旧 sp_vision_25 的 demo.yaml、旧装甲尺寸或旧外参直接迁入正式配置。
+
+当 `profile: production` 时，加载器还要求显式配置并验证
+`camera_to_gimbal` 外参；缺少外参的 production 文件会被拒绝。这样可以保留
+test-only 阶段的 camera-frame 调试，同时避免把没有绝对角关系的相对 PnP 结果误当成
+正式 RobotCtrl 角度。production 文件仍必须由真实相机、装甲尺寸和外参报告导入，不能
+只把 test-only 数值改名。
 
 ## 如何替换为真实标定
 
@@ -113,6 +123,8 @@ relative yaw/pitch 只用于日志和几何核验，不是 RobotCtrl.yaw/pitch�
     source install/setup.bash
     ros2 run auto_aim_ros2 auto_aim_pnp_smoke -- \
       --model /home/ubuntu22/vision-study/sp_vision_25/assets/yolov5.xml \
+      --model-profile src/auto_aim_ros2/test/data/model_profile_test.yaml \
+      --allow-test-profile \
       --video /home/ubuntu22/vision-study/sp_vision_25/assets/demo/demo.avi \
       --pnp-config src/auto_aim_ros2/test/data/pnp_test_config.yaml \
       --allow-test-config \

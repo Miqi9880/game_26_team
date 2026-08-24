@@ -87,7 +87,7 @@ Vision 输入中的对应速度字段只做有限值检查，不进入算法核�
 但当前不解释 quaternion 的世界方向，不把 Vision 绝对角写入 PnP 相对角或
 RobotCtrl 绝对目标角。`id`、`mode`、`bullet_count`、`game_progress` 目前只记录；
 其中 `mode=33` 作为协议字段透传，不在算法中到处硬编码。
-ROS 适配层会拒绝负数或超出规范范围的时间戳，并只保存有限的四元数 wxyz；它不会自行归一化、
+ROS 适配层会拒绝负数、未设置或超出规范范围的时间戳，并只保存有限的四元数 wxyz；它不会自行归一化、
 猜测 IMU/world 方向或把 Vision 时间戳当作图像与云台的同步依据。真实 freshness、同步和四元数
 方向仍需场景 3 联调确认。
 
@@ -113,6 +113,16 @@ ROS 级安全探针位于 `src/auto_aim_ros2/test/ros_safety_integration_probe.p
 `/Robot_ctrl_data` 存在且 `fire_command=0`。`offline_reference` case 还要提供旧参考
 视频和显式 test-only PnP/model profile。短暂/长时间丢失用
 `--frames-before-stop` 改变停止发布后的等待时长；这类探针是 dry-run 证据，不替代实车验证。
+
+构建后的 CTest 会自动启动一个隔离的 `auto_aim_node`，执行最小 topic-level
+null/mock/非法图像时间戳检查：`ros_safety_integration_test`。它验证锁定、输入超时和
+非法时间戳都保持 `fire_command=0`，并不连接真实串口或硬件。上面的手工探针仍用于
+`missing_camera_info`、`invalid_camera_info` 和 `offline_reference` 等需要显式录像、模型或
+PnP 配置的场景；手工探针不能被未运行误写成已验证。
+
+图像消息进入 `to_image_frame()` 前必须具有已设置且 canonical 的 ROS 时间（`sec >= 0`、
+`nanosec < 1e9` 且不为 `(0,0)`）；backend 直接收到非正 `stamp_ns` 也会 fail-closed，
+不再把异常时间转换后继续产生锁定诊断。`/Vision_data` 适配层使用相同边界。
 
 在收到有效 `/camera_info` 前，图像回调只记录帧并产生安全命令；这避免在没有标定信息时误把图像送入真实算法。
 
@@ -159,9 +169,9 @@ input  = FP32 [1, 3, 640, 640]
 output = FP32 [1, 25200, 22]
 ```
 
-该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。
+该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。生产 profile 还要求 runtime `offline_model_path` 与 profile 的绝对 `model.path` 一致；不同路径的同 shape/type artifact 会在 OpenVINO 初始化前拒绝。非有限 objectness logit 也会被丢弃，不会通过 `sigmoid(+Inf)=1` 进入检测链路。
 
-本阶段 smoke 命令（执行目录为 `game_26_dev`）为：
+历史运行 B 的 smoke 命令（执行目录为 `game_26_dev`）为：
 
 ```bash
 source /opt/ros/humble/setup.bash

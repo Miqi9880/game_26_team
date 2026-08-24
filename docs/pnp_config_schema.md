@@ -81,7 +81,12 @@ relative yaw/pitch 只用于日志和几何核验，不是 RobotCtrl.yaw/pitch�
     p_gimbal = R_gimbal_from_camera * p_camera + t_gimbal_from_camera_m
     R_gimbal_from_armor = R_gimbal_from_camera * R_camera_from_armor
 
-加载器会拒绝以下情况：缺失必填项、错误 schema/profile、非法尺寸、非有限数、错误角点顺序、非平面或非矩形装甲几何、无效 K/D、非正交或非 det=+1 的已配置外参、未显式支持的 PnP 方法，以及超过重投影阈值的观测。实际帧分辨率不等于 camera.image_width × image_height 时也会失败；不会缩放 K 或猜测图像是否被 resize。
+配置加载器会拒绝以下配置级错误：缺失必填项、错误 schema/profile、非法尺寸、非有限数、错误角点顺序、非平面或非矩形装甲几何、无效 K/D、非正交或非 det=+1 的已配置外参，以及未显式支持的 PnP 方法。实际帧分辨率不等于 camera.image_width × image_height、检测点序非法、solvePnP 失败、深度非正或观测重投影误差超过阈值时，由 `PnpStage::solve()` 在运行时拒绝该观测；加载器不会预先判断这些帧级结果，也不会缩放 K 或猜测图像是否被 resize。
+
+顶层 `profile` 派生的 `test_only` 标志必须与 `camera`、small/large
+`armor_geometry` 和 `camera_to_gimbal` 内部标志一致。YAML loader 会同步设置这些标志，
+而公开的 `PnpConfiguration` C++ 构造入口也会再次校验；不一致配置不能通过
+`PnpStage` 构造。
 
 当检测器 profile 已为 detection 提供 `armor_type` hint、且 PnP 配置又为同一
 `class_id` 提供 `class_to_armor_type` 时，两者必须指向同一 `small`/`large` 几何；冲突会以

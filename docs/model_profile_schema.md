@@ -58,7 +58,7 @@ profile: test_only            # production only after team/model review
 
 model:
   id: unique_model_identifier
-  path: /absolute/path/to/model.xml  # or an explicit external-artifact identifier
+  path: /absolute/path/to/model.xml  # production; external://... is test_only only
   source: model_provenance
   version: model_contract_version
 
@@ -120,7 +120,13 @@ been confirmed.  Do not copy the legacy profile or its class mapping into a
 robot configuration.
 
 The profile does not contain model weights.  The IR/XML and BIN remain external
-test inputs and are not repository artifacts.
+test inputs and are not repository artifacts.  For `profile: production`,
+`model.path` must be an absolute local path to the reviewed artifact and the
+runtime model path must resolve to exactly the same path; supplying a
+same-shape or same-type model under another path is rejected before OpenVINO
+initialization.  The current schema does not claim a content hash, so replacing
+the file at that path still requires a new review/profile version and provenance
+record before production use.
 
 ## Verification and bring-up order
 
@@ -148,10 +154,12 @@ ros2 run auto_aim_ros2 auto_aim_node --ros-args \
   -p dry_run:=true -p serial_enabled:=false -p allow_fire:=false
 ```
 
-`offline_model_path` remains an explicit runtime argument.  The profile's
-`model.path` is provenance metadata and is not used to search the filesystem;
-the operator must verify that the artifact and profile refer to the same
-version before starting a replay.
+`offline_model_path` remains an explicit runtime argument.  In a `test_only`
+profile it may point to an external fixture even when `model.path` is an
+`external://` identifier.  In a `production` profile it must resolve to the
+same absolute path as `model.path`; the detector rejects a mismatch rather than
+letting an operator pair an unreviewed artifact with a reviewed semantic
+contract.
 
 The model profile is not calibration, does not define an absolute yaw/pitch
 zero, and does not authorize serial, gimbal, or firing control.

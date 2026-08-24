@@ -60,6 +60,7 @@ production 配置。
 
 来源：
 
+- <https://github.com/Miqi9880/game_26_team>
 - <https://github.com/Miqi9880/game_26>
 - <https://github.com/HJ-vision/game_26>
 
@@ -67,7 +68,10 @@ production 配置。
 
 本地开发约定：
 
-- `origin` 指向 `https://github.com/Miqi9880/game_26.git`；`upstream` 指向 `https://github.com/HJ-vision/game_26.git`。
+- `origin` 指向队伍私有正式仓库 `https://github.com/Miqi9880/game_26_team.git`，是唯一允许提交和推送的远程。
+- `public-origin` 指向旧公开 fork `https://github.com/Miqi9880/game_26.git`，仅作历史备份和只读参考；不得向其推送、从其分支覆盖当前工作区或把它当作正式同步目标。
+- `upstream` 指向官方仓库 `https://github.com/HJ-vision/game_26.git`，只读参考；不得向其推送。
+- 每次开发或推送前都要执行 `git remote -v`，确认没有把私有 `origin`、公开 `public-origin` 和只读 `upstream` 配反。
 - 不从网页分支或旧副本直接覆盖本地未提交成果；需要同步时先检查差异、协议和测试。
 - 上游/队伍页面中的旧 `protocol.h`、旧消息定义或旧单位不能替换当前 `protocol_new.hpp` 和 ROS 接口。
 

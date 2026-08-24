@@ -23,7 +23,7 @@ OpenVinoYoloDetector
 - `PoseObservation`：PnP 测量结果。相机坐标单位为 m，OpenCV 相机系为 x 右、y 下、z 前。
 - `TargetObservation`：补充帧时间戳和 detection index；相机坐标用于 track 关联。gimbal 坐标和 relative angle 只有经过验证的外参存在时才有。
 - `relative_yaw_rad`：+yaw 向左；`relative_pitch_rad`：+pitch 向上。二者只是相对几何量，不能直接写入 `RobotCtrl.yaw/pitch`。
-- 算法内部角度为 rad；诊断 CSV 可额外输出 degree。正式 ROS/串口输出仍由唯一适配层处理，速度/加速度外部单位未确认时保持 0。
+- 算法内部角度为 rad、速度为 rad/s、加速度为 rad/s²；诊断 CSV 可额外输出 degree。正式 ROS/串口输出由唯一适配层处理，外部速度/加速度单位虽已确认，因 MCU 前馈语义未确认仍保持 0。
 
 ## Tracker
 

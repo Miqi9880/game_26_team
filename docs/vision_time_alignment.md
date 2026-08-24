@@ -10,7 +10,7 @@
 2. Vision Header 时间：`auto_aim_interfaces/msg/Vision.header.stamp`，由 `VisionPub` 在串口接收后使用 `this->now()` 写入；它不是 `VisionData` 串口结构体中的 MCU 原始时间字段。
 3. 本机 steady-clock 接收时间：节点收到图像或 Vision 回调时调用 `std::chrono::steady_clock::now()` 记录，仅表示本机回调观测时间。
 
-当前没有证据证明图像 Header 和 Vision Header 使用同一时钟域，也没有证据证明任一 Header 与本机 steady clock 或 MCU 时钟具有可比的零点、漂移和延迟关系。因此：
+姿态已确认相对上电原点，但这不提供 Header 的来源或同步证据。当前没有证据证明图像 Header 和 Vision Header 使用同一时钟域，也没有证据证明任一 Header 与本机 steady clock 或 MCU 时钟具有可比的零点、漂移和延迟关系。因此：
 
 - Header 时间不被假定为 MCU/IMU 原始时间；
 - steady-clock 接收时间不能与 ROS Header 纳秒值直接相减；
@@ -58,7 +58,7 @@ ROS 适配层只把状态插入历史并记录配对诊断。Vision 的 yaw/pitc
 
 在任何生产接入前，队内需要用实测记录确认：
 
-- IMU 四元数的方向（IMU→world 还是 world→IMU）、轴定义、零点和右手系；
+- IMU 四元数的方向（IMU→world 还是 world→IMU）、轴定义、乘法约定和右手系；上电原点本身已确认；
 - 图像 Header、Vision Header、MCU/IMU 时间戳之间的时钟关系、同步方式、漂移和回绕；
 - 串口发送、接收和 ROS 调度延迟，以及是否需要硬件序号或 golden frame；
 - 相机曝光开始/结束时间与发布 Header 的定义；

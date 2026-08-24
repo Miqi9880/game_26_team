@@ -139,13 +139,15 @@ PR 合并前检查：
 - /Vision_data 是下位机状态输入；/Robot_ctrl_data 是视觉控制输出。
 - 串口映射层只做字段映射，不做角度单位转换。
 - 外部位置角 yaw/pitch/roll 使用 degree。
-- 算法内部角度使用 rad；内部速度/加速度使用 rad/s、rad/s²。
-- 速度和加速度外部单位未确认前，ROS/串口输出保持 0。
-- 单位链路固定为：VisionData degree → Vision.msg degree → 输入适配 degree→rad → 算法/PnP/Aimer rad → 输出适配 rad→degree → RobotCtrl.msg degree → RobotCtrlData degree。
+- 外部角速度使用 degree/s，外部角加速度使用 degree/s²；算法内部分别使用 rad、rad/s、rad/s²。
+- 单位链路固定为：VisionData degree/degree/s/degree/s² → Vision.msg 同单位 → 输入适配 degree→rad、degree/s→rad/s、degree/s²→rad/s² → 算法/PnP/Aimer 内部单位 → 输出适配位置 rad→degree → RobotCtrl.msg/RobotCtrlData 外部单位。
+- 单位已经确认，但 MCU 前馈控制语义尚未确认；真实 RobotCtrl 的四个速度/加速度字段当前必须保持 0。
+- VisionData 与 RobotCtrlData 的位置角使用同一个上电姿态原点参考；这不等于已经完成 camera→control 外参标定。
+- yaw 输出归一化到 [-180°, 180°]；新龟 pitch 预限幅 [-20°, 19°]，狗腿 pitch 预限幅 [-10°, 31°]；未选车型 profile 必须 fail-closed，下位机仍是最终 pitch 限幅层。
 - PnP 的 relative_yaw_rad、relative_pitch_rad 是相对几何量，不能直接当作 RobotCtrl 绝对目标角。
 - 没有绝对零点或正式外参时，不得把相对角伪装成正式控制角；test_absolute_zero 必须带 test_only 标记。
 - fire_command 在 dry-run 和离线测试中必须为 0。
-- 未确认的零点、坐标系、四元数方向、端序、float/packed ABI、golden frame、watchdog、ACK、断线行为和开火时序不得自行猜测。
+- 未确认的 PnP 外参、四元数旋转方向、端序、float/packed ABI、golden frame、精确 watchdog、ACK、断线行为和开火时序不得自行猜测；MCU watchdog 约 500 ms 且可能因车型不同，不能与本机 100 ms 输入超时混淆。
 
 修改协议时必须同时更新结构体、收发解析、ROS 映射、静态布局检查、loopback/坏帧测试和接口文档；只改头文件而不验证实际收发不合格。
 

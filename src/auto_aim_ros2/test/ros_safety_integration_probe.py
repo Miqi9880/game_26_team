@@ -9,6 +9,11 @@ Cases cover the dry-run gates that are easy to regress at the ROS boundary:
 ``no_target``, ``mock_target``, ``missing_camera_info``, ``invalid_camera_info``,
 ``input_timeout`` and ``offline_reference``.  For short/long target loss, use
 ``input_timeout`` with ``--frames-before-stop`` set to a small or large value.
+
+The minimal null/mock/invalid-timestamp path is also registered as the
+automatic ``ros_safety_integration_test`` CTest.  This script remains an
+operator-side probe for camera-info and offline_reference cases that require
+explicit runtime artifacts and a separately launched node.
 """
 
 import argparse

@@ -18,9 +18,12 @@ inline std::optional<pipeline::VisionState> to_algorithm_vision(
   // Vision.msg and VisionData carry position angles in degree.  Convert only
   // at this ROS/algorithm boundary; do not repeat this in the serial bridge.
   // A Vision message is a stamped sensor sample, not a duration.  Reject
-  // negative or non-canonical ROS time values rather than allowing an invalid
-  // timestamp to participate in freshness or replay decisions later.
-  if (message.header.stamp.sec < 0 || message.header.stamp.nanosec >= 1'000'000'000U) {
+  // negative, unset, or non-canonical ROS time values rather than allowing an
+  // invalid timestamp to participate in freshness or replay decisions later.
+  if (message.header.stamp.sec < 0 ||
+    message.header.stamp.nanosec >= 1'000'000'000U ||
+    (message.header.stamp.sec == 0 && message.header.stamp.nanosec == 0))
+  {
     return std::nullopt;
   }
   if (!units::finite(message.yaw) || !units::finite(message.pitch) ||

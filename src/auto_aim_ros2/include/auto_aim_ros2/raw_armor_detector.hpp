@@ -47,6 +47,12 @@ std::optional<RawArmorDetection> make_raw_armor_detection(
 struct DetectorConfig
 {
   std::string model_path;
+
+  // A production profile binds the runtime artifact to the exact path that
+  // was reviewed.  Test-only profiles may use an external:// identifier and
+  // explicitly override it for offline fixtures; production profiles may not.
+  bool require_model_path_match{false};
+  std::string reviewed_model_path;
   std::string device{"CPU"};
 
   // Optional semantic mapping from the reviewed model profile.  An empty map
@@ -100,8 +106,9 @@ struct ModelProfile
   int schema_version{0};
   bool test_only{false};
   std::string model_id;
-  // Artifact path or an explicit external-artifact identifier.  The loader
-  // records it but never searches old repositories or loads model weights.
+  // For production this must be an absolute local artifact path and is bound
+  // to the runtime path.  Test-only profiles may use an external:// identifier
+  // because their model is intentionally supplied outside the repository.
   std::string model_path;
   std::string source;
   std::string version;
@@ -167,6 +174,10 @@ struct ModelInfo
 std::optional<std::string> validate_output_shape(
   const std::vector<std::size_t> & shape,
   const DetectorConfig & config);
+
+// Numerically stable objectness conversion.  Non-finite model logits are
+// rejected instead of allowing +/-Inf to become a seemingly valid confidence.
+std::optional<float> sigmoid_probability(float value) noexcept;
 
 // Returns an error description when the model input is not the configured
 // static NCHW [1, 3, input_height, input_width] contract.

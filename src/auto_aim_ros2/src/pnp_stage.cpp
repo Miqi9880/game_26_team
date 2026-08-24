@@ -496,6 +496,11 @@ std::optional<std::string> PnpConfiguration::validate() const
   if (schema_version != 1) {
     return "unsupported schema_version; expected 1";
   }
+  if (camera.test_only != test_only || small_armor.test_only != test_only ||
+    large_armor.test_only != test_only || camera_to_gimbal.test_only != test_only)
+  {
+    return "top-level test_only must match camera, armor geometry, and camera_to_gimbal flags";
+  }
   if (!test_only && !camera_to_gimbal.configured) {
     return "production PnP configuration requires a verified camera_to_gimbal extrinsic";
   }

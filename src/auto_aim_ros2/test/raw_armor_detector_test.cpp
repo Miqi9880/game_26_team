@@ -17,6 +17,7 @@ using rm_auto_aim::detector::make_letterbox;
 using rm_auto_aim::detector::make_raw_armor_detection;
 using rm_auto_aim::detector::model_point_to_image;
 using rm_auto_aim::detector::load_model_profile;
+using rm_auto_aim::detector::sigmoid_probability;
 using rm_auto_aim::detector::validate_input_shape;
 using rm_auto_aim::detector::validate_output_shape;
 }
@@ -190,6 +191,38 @@ TEST(ModelProfile, ConvertsOnlyValidatedProfileToDetectorConfig)
     config.class_to_armor_type.at(0),
     rm_auto_aim::detector::RawArmorDetection::ArmorTypeHint::Small);
   EXPECT_FALSE(config.center_padding);
+}
+
+TEST(ModelProfile, ProductionProfileBindsRuntimePathToReviewedArtifact)
+{
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  profile.test_only = false;
+  profile.model_path = "/opt/game26/models/reviewed.xml";
+
+  EXPECT_FALSE(profile.validate().has_value());
+  EXPECT_THROW(
+    rm_auto_aim::detector::detector_config_from_model_profile(
+      profile, "/opt/game26/models/other.xml"),
+    std::invalid_argument);
+
+  const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
+    profile, "/opt/game26/models/reviewed.xml");
+  EXPECT_TRUE(config.require_model_path_match);
+  EXPECT_EQ(config.reviewed_model_path, profile.model_path);
+
+  profile.model_path = "relative/reviewed.xml";
+  EXPECT_TRUE(profile.validate().has_value());
+}
+
+TEST(ModelProfile, RejectsNonFiniteObjectnessLogits)
+{
+  EXPECT_FALSE(sigmoid_probability(std::numeric_limits<float>::infinity()).has_value());
+  EXPECT_FALSE(sigmoid_probability(-std::numeric_limits<float>::infinity()).has_value());
+  EXPECT_FALSE(sigmoid_probability(std::numeric_limits<float>::quiet_NaN()).has_value());
+  ASSERT_TRUE(sigmoid_probability(0.0F).has_value());
+  EXPECT_FLOAT_EQ(*sigmoid_probability(0.0F), 0.5F);
 }
 
 TEST(ModelProfile, RejectsInvalidTensorOrSemanticContract)

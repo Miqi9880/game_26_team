@@ -271,3 +271,9 @@ TEST(RosAdapter, RejectsNonCanonicalVisionTimestamp)
   message.header.stamp.nanosec = 1'000'000'000U;
   EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
 }
+
+TEST(RosAdapter, RejectsUnsetVisionTimestamp)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}

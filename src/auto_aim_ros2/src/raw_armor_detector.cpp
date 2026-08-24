@@ -33,14 +33,22 @@ bool finite_rect(const cv::Rect2f & rect)
          std::isfinite(rect.height);
 }
 
-float sigmoid(float value)
+bool same_model_path(const std::string & left, const std::string & right)
 {
-  if (value >= 0.0F) {
-    const float z = std::exp(-value);
-    return 1.0F / (1.0F + z);
+  if (left.empty() || right.empty()) {
+    return false;
   }
-  const float z = std::exp(value);
-  return z / (1.0F + z);
+  std::error_code left_error;
+  std::error_code right_error;
+  const auto left_path = std::filesystem::weakly_canonical(
+    std::filesystem::absolute(left), left_error);
+  const auto right_path = std::filesystem::weakly_canonical(
+    std::filesystem::absolute(right), right_error);
+  if (!left_error && !right_error) {
+    return left_path == right_path;
+  }
+  return std::filesystem::absolute(left).lexically_normal() ==
+    std::filesystem::absolute(right).lexically_normal();
 }
 
 int argmax(const float * values, std::size_t count)
@@ -216,6 +224,19 @@ std::vector<std::size_t> static_shape(const ov::Output<const ov::Node> & port, c
 #endif
 }  // namespace
 
+std::optional<float> sigmoid_probability(float value) noexcept
+{
+  if (!std::isfinite(value)) {
+    return std::nullopt;
+  }
+  if (value >= 0.0F) {
+    const float z = std::exp(-value);
+    return 1.0F / (1.0F + z);
+  }
+  const float z = std::exp(value);
+  return z / (1.0F + z);
+}
+
 std::optional<RawArmorDetection> make_raw_armor_detection(
   int class_id,
   int color_id,
@@ -262,6 +283,12 @@ std::optional<std::string> ModelProfile::validate() const
   }
   if (model_id.empty() || model_path.empty() || source.empty() || version.empty()) {
     return "model_id, model_path, source, and version are required";
+  }
+  if (!test_only) {
+    const std::filesystem::path artifact_path(model_path);
+    if (!artifact_path.is_absolute() || model_path.find("://") != std::string::npos) {
+      return "production model.path must be an absolute local artifact path";
+    }
   }
   if (input_shape[0] != 1 || input_shape[1] != 3 || input_shape[2] == 0 || input_shape[3] == 0 ||
     input_shape[2] > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -512,8 +539,18 @@ DetectorConfig detector_config_from_model_profile(
   if (const auto error = profile.validate(); error.has_value()) {
     throw std::invalid_argument("invalid model profile: " + *error);
   }
+  if (model_path.empty()) {
+    model_path = profile.model_path;
+  }
+  if (!profile.test_only && !same_model_path(model_path, profile.model_path)) {
+    throw std::invalid_argument(
+            "production model artifact path does not match model profile path: profile=" +
+            profile.model_path + " runtime=" + model_path);
+  }
   DetectorConfig result{};
-  result.model_path = model_path.empty() ? profile.model_path : std::move(model_path);
+  result.model_path = std::move(model_path);
+  result.require_model_path_match = !profile.test_only;
+  result.reviewed_model_path = profile.model_path;
   result.device = std::move(device);
   result.expected_input_element_type = profile.input_element_type;
   result.expected_output_element_type = profile.output_element_type;
@@ -649,6 +686,12 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
   if (impl_->config.model_path.empty()) {
     throw std::invalid_argument("OpenVINO model_path must not be empty");
   }
+  if (impl_->config.require_model_path_match &&
+    !same_model_path(impl_->config.model_path, impl_->config.reviewed_model_path))
+  {
+    throw std::invalid_argument(
+            "OpenVINO model artifact path does not match the reviewed model profile");
+  }
   if (!std::filesystem::exists(impl_->config.model_path)) {
     throw std::runtime_error("OpenVINO model file does not exist: " + impl_->config.model_path);
   }
@@ -777,8 +820,8 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
 
   for (std::size_t row = 0; row < rows; ++row) {
     const float * current = values + row * columns;
-    const float confidence = sigmoid(current[impl_->config.objectness_index]);
-    if (!std::isfinite(confidence) || confidence < impl_->config.objectness_threshold) {
+    const auto confidence = sigmoid_probability(current[impl_->config.objectness_index]);
+    if (!confidence.has_value() || *confidence < impl_->config.objectness_threshold) {
       continue;
     }
     const int color_id = argmax(current + color_offset, impl_->config.color_class_count);
@@ -820,7 +863,7 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
     }
     const cv::Rect2f bbox(min_x, min_y, max_x - min_x, max_y - min_y);
     const auto detection = make_raw_armor_detection(
-      class_id, color_id, confidence, bbox, keypoints,
+      class_id, color_id, *confidence, bbox, keypoints,
       static_cast<int>(impl_->config.armor_class_count),
       static_cast<int>(impl_->config.color_class_count));
     if (!detection.has_value()) {
@@ -838,7 +881,7 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
     }
     candidates.push_back(typed_detection);
     boxes.push_back(to_nms_rect(bbox));
-    confidences.push_back(confidence);
+    confidences.push_back(*confidence);
   }
 
   std::vector<int> kept;

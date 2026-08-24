@@ -105,6 +105,25 @@ TEST(PnpConfiguration, ProductionProfileCannotOmitCameraToGimbalExtrinsic)
   EXPECT_NO_THROW(PnpStage{config});
 }
 
+TEST(PnpConfiguration, TestOnlyFlagsMustMatchAcrossNestedConfiguration)
+{
+  auto config = load_test_configuration();
+  config.camera.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.small_armor.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.large_armor.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.camera_to_gimbal.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+}
+
 TEST(PnpStage, SyntheticProjectionRecoversCameraTranslationInMetres)
 {
   const auto config = load_test_configuration();

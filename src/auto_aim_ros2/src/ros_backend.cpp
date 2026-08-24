@@ -203,13 +203,22 @@ FrameResult Backend::process(const pipeline::ImageFrame & frame)
 {
   auto & state = *impl_;
   FrameResult result = safe_result(frame.stamp_ns);
+  if (frame.stamp_ns <= 0) {
+    result.error = "invalid_image_timestamp";
+    result.command = pipeline::AutoAimPipeline::safe_command();
+    result.command.fire_command = pipeline::kFireNone;
+    result.command.target_lock = pipeline::kTargetUnlocked;
+    result.diagnostic_target_lock = pipeline::kTargetUnlocked;
+    result.absolute_command_valid = false;
+    result.command_publishable = false;
+    return result;
+  }
   try {
     if (state.config.kind != BackendKind::OfflineReference) {
       // Use the frame stamp as the deterministic time source.  This avoids
       // sampling wall time during replay or inside a ROS image callback.
-      const auto safe_stamp_ns = std::max<std::int64_t>(frame.stamp_ns, 0);
       const auto timestamp = std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(safe_stamp_ns));
+        std::chrono::nanoseconds(frame.stamp_ns));
       result.command = state.core_pipeline->process(frame, timestamp);
       result.command.fire_command = pipeline::kFireNone;
       result.diagnostic_target_lock = result.command.target_lock;

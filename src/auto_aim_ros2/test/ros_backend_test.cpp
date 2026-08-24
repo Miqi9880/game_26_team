@@ -75,6 +75,38 @@ TEST(RosBackend, MockTargetIsObservableButFireRemainsInhibited)
   EXPECT_FALSE(result.command_publishable);
 }
 
+TEST(RosBackend, NegativeImageTimestampFailsClosedBeforeBackendProcessing)
+{
+  Config config{};
+  config.kind = BackendKind::Mock;
+  config.dry_run = true;
+  config.mock_target = true;
+  Backend backend(config);
+
+  const auto result = backend.process(frame(-1));
+  EXPECT_EQ(result.error, "invalid_image_timestamp");
+  EXPECT_EQ(result.diagnostic_target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(result.command.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(result.command.fire_command, rm_auto_aim::pipeline::kFireNone);
+  EXPECT_FALSE(result.command_publishable);
+}
+
+TEST(RosBackend, UnsetImageTimestampFailsClosedBeforeBackendProcessing)
+{
+  Config config{};
+  config.kind = BackendKind::Mock;
+  config.dry_run = true;
+  config.mock_target = true;
+  Backend backend(config);
+
+  const auto result = backend.process(frame(0));
+  EXPECT_EQ(result.error, "invalid_image_timestamp");
+  EXPECT_EQ(result.diagnostic_target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(result.command.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(result.command.fire_command, rm_auto_aim::pipeline::kFireNone);
+  EXPECT_FALSE(result.command_publishable);
+}
+
 TEST(RosBackend, OfflineReferenceRequiresExplicitSafeConfiguration)
 {
   Config config{};

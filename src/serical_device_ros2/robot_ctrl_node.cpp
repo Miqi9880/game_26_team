@@ -76,7 +76,7 @@ private:
     if (!safety_->Accept(control)) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 1000,
-        "Ignoring invalid RobotCtrl input; safe timeout state is unchanged");
+        "Rejected invalid RobotCtrl input; safe hold/unlock/fire=0 was applied");
     }
   }
 

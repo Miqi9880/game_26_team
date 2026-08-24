@@ -17,6 +17,12 @@ inline std::optional<pipeline::VisionState> to_algorithm_vision(
 {
   // Vision.msg and VisionData carry position angles in degree.  Convert only
   // at this ROS/algorithm boundary; do not repeat this in the serial bridge.
+  // A Vision message is a stamped sensor sample, not a duration.  Reject
+  // negative or non-canonical ROS time values rather than allowing an invalid
+  // timestamp to participate in freshness or replay decisions later.
+  if (message.header.stamp.sec < 0 || message.header.stamp.nanosec >= 1'000'000'000U) {
+    return std::nullopt;
+  }
   if (!units::finite(message.yaw) || !units::finite(message.pitch) ||
     !units::finite(message.roll) || !units::finite(message.yaw_vel) ||
     !units::finite(message.pitch_vel) || !units::finite(message.shoot_speed))
@@ -56,11 +62,36 @@ inline auto to_ros(const pipeline::AimCommand & command)
   -> auto_aim_interfaces::msg::RobotCtrl
 {
   auto message = auto_aim_interfaces::msg::RobotCtrl{};
+  const bool valid_target_lock = command.target_lock == pipeline::kTargetLocked ||
+    command.target_lock == pipeline::kTargetUnlocked;
+  const bool valid_fire_command = command.fire_command == pipeline::kFireNone ||
+    command.fire_command == pipeline::kFireBurst ||
+    command.fire_command == pipeline::kFireSingle;
+  const bool fire_requires_lock = command.fire_command != pipeline::kFireNone &&
+    command.target_lock != pipeline::kTargetLocked;
+  const bool finite_angles = units::finite(command.yaw_rad) && units::finite(command.pitch_rad);
+
+  // RobotCtrl is a hardware-facing boundary.  An invalid enum or non-finite
+  // angle is never allowed to leak through as a partially valid command:
+  // unlock, zero positions, and inhibit firing as one atomic safe result.
+  if (!valid_target_lock || !valid_fire_command || fire_requires_lock || !finite_angles) {
+    message.target_lock = pipeline::kTargetUnlocked;
+    message.fire_command = pipeline::kFireNone;
+    return message;
+  }
+
   // AimCommand is internal rad.  RobotCtrl.msg/RobotCtrlData are degree for
   // position angles, so convert exactly once at this output boundary.
   message.yaw = units::finite(command.yaw_rad) ? units::radians_to_degrees(command.yaw_rad) : 0.0F;
   message.pitch = units::finite(command.pitch_rad) ?
     units::radians_to_degrees(command.pitch_rad) : 0.0F;
+  if (!units::finite(message.yaw) || !units::finite(message.pitch)) {
+    message.yaw = 0.0F;
+    message.pitch = 0.0F;
+    message.target_lock = pipeline::kTargetUnlocked;
+    message.fire_command = pipeline::kFireNone;
+    return message;
+  }
   // External velocity/acceleration units are not confirmed.  Never send the
   // internal rad/s or rad/s^2 values over ROS/serial until the contract is
   // confirmed by the electrical-control team.

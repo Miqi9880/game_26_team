@@ -90,6 +90,40 @@ TEST(PnpConfiguration, TestOnlyRequiresExplicitOptIn)
   EXPECT_TRUE(config.camera_to_gimbal.configured);
 }
 
+TEST(PnpConfiguration, ProductionProfileCannotOmitCameraToGimbalExtrinsic)
+{
+  auto config = load_test_configuration();
+  config.test_only = false;
+  config.camera.test_only = false;
+  config.small_armor.test_only = false;
+  config.large_armor.test_only = false;
+  config.camera_to_gimbal.test_only = false;
+  config.camera_to_gimbal.configured = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config.camera_to_gimbal.configured = true;
+  EXPECT_NO_THROW(PnpStage{config});
+}
+
+TEST(PnpConfiguration, TestOnlyFlagsMustMatchAcrossNestedConfiguration)
+{
+  auto config = load_test_configuration();
+  config.camera.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.small_armor.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.large_armor.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+
+  config = load_test_configuration();
+  config.camera_to_gimbal.test_only = false;
+  EXPECT_THROW(PnpStage{config}, std::invalid_argument);
+}
+
 TEST(PnpStage, SyntheticProjectionRecoversCameraTranslationInMetres)
 {
   const auto config = load_test_configuration();
@@ -185,6 +219,19 @@ TEST(PnpStage, UnknownClassWithoutArmorHintDoesNotGuessGeometry)
   const auto observation = stage.solve(detection);
   EXPECT_FALSE(observation.valid);
   EXPECT_EQ(observation.failure, PoseFailure::GeometryNotConfigured);
+}
+
+TEST(PnpStage, ConflictingModelHintAndPnpClassMappingFailClosed)
+{
+  const auto config = load_test_configuration();
+  PnpStage stage(config);
+  auto detection = make_synthetic_detection(config);
+  // The synthetic PnP profile maps class 0 to small.  A reviewed detector
+  // profile hint that says large must not silently select the wrong geometry.
+  detection.armor_type = RawArmorDetection::ArmorTypeHint::Large;
+  const auto observation = stage.solve(detection);
+  EXPECT_FALSE(observation.valid);
+  EXPECT_EQ(observation.failure, PoseFailure::GeometrySemanticConflict);
 }
 
 TEST(PnpStage, ReprojectionThresholdFailsClosed)

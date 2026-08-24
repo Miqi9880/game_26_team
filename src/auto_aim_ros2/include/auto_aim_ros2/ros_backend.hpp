@@ -38,6 +38,10 @@ struct Config
   bool mock_fire_request{false};
 
   std::string model_path;
+  // Versioned detector profile.  OfflineReference requires this field;
+  // it is validated before OpenVINO initialization and cannot be inferred
+  // from a model filename.
+  std::string model_profile_path;
   std::string pnp_config_path;
   std::string device{"CPU"};
   bool allow_test_only{false};
@@ -49,6 +53,7 @@ struct FrameResult
 {
   std::string backend{"null"};
   std::string calibration_profile{"none"};
+  std::string model_profile{"none"};
   std::string aimer_mode{"relative_debug"};
   bool test_only{true};
   // This is the lock state measured by the diagnostic tracker/aimer.  It is
@@ -84,6 +89,7 @@ public:
 
   BackendKind kind() const noexcept;
   const std::string & calibration_profile() const noexcept;
+  const std::string & model_profile() const noexcept;
   bool test_only() const noexcept;
   const Config & config() const noexcept;
 

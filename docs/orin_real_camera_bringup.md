@@ -68,11 +68,25 @@ OpenVINO CMake 配置存在；仓库内海康 SDK 动态库为空。`camera_info
    sudo apt update
    sudo apt install \
      ros-humble-rclcpp ros-humble-rclcpp-components \
+     ros-humble-ament-cmake-auto ros-humble-message-filters \
+     ros-humble-rcl-interfaces ros-humble-rosidl-default-generators \
      ros-humble-sensor-msgs ros-humble-image-transport \
      ros-humble-image-transport-plugins \
      ros-humble-camera-info-manager ros-humble-cv-bridge \
      libopencv-dev libyaml-cpp-dev
    ```
+
+   在目标机也应优先用工作区依赖清单复核一次（`rosdep` 未初始化时先按团队
+   的系统管理流程初始化和更新索引）：
+
+   ```bash
+   rosdep update
+   rosdep install --from-paths src --ignore-src --rosdistro humble -r -y
+   ```
+
+   上面的显式列表补充了 `serical_device_ros2` 直接使用的
+   `message_filters`、相机参数回调使用的 `rcl_interfaces`，以及接口包和
+   `ament_cmake_auto` 的构建依赖；它不是对 SDK/OpenVINO 动态库的替代证明。
 
    `cv_bridge` 是可选的兼容工具；当前代码使用自定义适配器，但安装它有助于用标准工具
    检查图像 encoding。它不会自动改变当前节点的数据流。
@@ -244,8 +258,53 @@ RobotCtrl 绝对角控制能力。
 - 相机序列号、固件、曝光/增益、分辨率和帧率；
 - `/image_raw`、`/camera_info` 的 QoS、编码、时间戳和 `frame_id`；
 - 使用的 calibration profile、model version、PnP 重投影误差；
+- 使用的 detector model profile（若有）、model artifact hash 和版本；
 - dry-run 日志、CSV、异常帧和明确的 `fire_command=0` 证据。
 
 出现以下任一情况立即停止并回到离线验证：SDK 动态库 `not found` 或架构不符、CameraInfo
 缺失/尺寸不符、图像 encoding/step 不受支持、模型签名不符、标定来源不明、ROS topic QoS
 不兼容、输入超时保护未验证、串口/开火配置无法证明为关闭。
+
+## 7. 日志与故障排查最小流程
+
+每次尝试先建立独立的记录目录；日志、CSV 和异常帧只写入该目录或 `/tmp`，不要把
+设备序列号以外的隐私信息、口令、token、SDK 二进制或未审查模型加入 Git：
+
+```bash
+run_id=$(date +%Y%m%d_%H%M%S)
+record_dir=/tmp/game26-bringup/${run_id}
+mkdir -p "${record_dir}"
+
+ros2 launch hik_camera hik_camera.launch.py \
+  use_sensor_data_qos:=true \
+  camera_info_url:=file:///absolute/path/to/verified_camera_info.yaml \
+  2>&1 | tee "${record_dir}/hik_camera.log"
+```
+
+在另一终端保存节点、话题、参数和内核 USB 信息：
+
+```bash
+ros2 node info /hik_camera | tee "${record_dir}/node_info.txt"
+ros2 topic info /image_raw -v | tee "${record_dir}/image_qos.txt"
+ros2 topic info /camera_info -v | tee "${record_dir}/camera_info_qos.txt"
+ros2 topic hz /image_raw | tee "${record_dir}/image_hz.txt"
+ros2 topic echo --once /camera_info | tee "${record_dir}/camera_info_once.txt"
+ros2 param dump /hik_camera | tee "${record_dir}/params.yaml"
+uname -a | tee "${record_dir}/uname.txt"
+dmesg --ctime | tail -100 | tee "${record_dir}/dmesg_tail.txt"
+```
+
+按第一条可复现证据分类，不要用反复重启掩盖故障：
+
+| 现象 | 首要检查 | 停止条件/处理 |
+|---|---|---|
+| 设备数为 0、创建/打开失败 | MVS 版本、USB 线、电源、udev 权限、SDK 返回码 | 记录返回码、型号和权限；未恢复前不启动检测器 |
+| 转换失败或图像数据为空 | `ConvertPixelType` 返回码、目标缓冲区 size/step、源像素格式 | 回到相机代码修复 `reserve`/`resize` 问题；不得发布空帧 |
+| 话题没有数据或 QoS 不匹配 | 最终 topic 名、`ros2 topic info -v`、编码/宽高/时间戳 | 保持 `serial_enabled=false`，修正 launch/remap/QoS 后再试 |
+| CameraInfo 缺失、尺寸或 K/D 不符 | URL、序列号、分辨率和标定版本 | 停止 PnP；禁止把候选 YAML 当 production |
+| OpenVINO/模型加载失败或 `ldd not found` | `OpenVINO_DIR`、模型 profile、`file`/`ldd` 架构 | 停止真实链路，回到离线 smoke；不得复制 WSL 二进制到 Orin |
+| 图像/输入超时 | `ros2 topic hz`、节点时间戳和 timeout 日志 | 只允许安全保持输出；未验证 watchdog 前不得接串口 |
+
+每条记录都要带 commit、软件/SDK 版本、命令、开始/结束时间和停止原因；只要
+`fire_command`、串口开关或标定来源无法证明为安全状态，就回到 `backend=null`、
+`dry_run=true`、`serial_enabled=false`、`allow_fire=false` 的启动方式。

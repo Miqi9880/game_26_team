@@ -110,6 +110,7 @@ enum class PoseFailure : std::uint8_t
   None = 0,
   InvalidRawDetection,
   GeometryNotConfigured,
+  GeometrySemanticConflict,
   InvalidConfiguration,
   ImageDimensionsMismatch,
   KeypointOrderRejected,

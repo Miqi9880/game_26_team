@@ -20,20 +20,25 @@ namespace
 struct Options
 {
   std::string model_path;
+  std::string model_profile_path;
   std::string video_path;
   std::string pnp_config_path;
   std::string csv_path;
   std::string annotated_dir;
   std::string device{"CPU"};
   int frames{5};
+  bool allow_test_profile{false};
   bool allow_test_config{false};
 };
 
 void usage()
 {
   std::cerr <<
-    "Usage: auto_aim_pnp_smoke --model MODEL.xml --video VIDEO.avi --pnp-config CONFIG.yaml [options]\n"
+    "Usage: auto_aim_pnp_smoke --model MODEL.xml --model-profile PROFILE.yaml "
+    "--video VIDEO.avi --pnp-config CONFIG.yaml [options]\n"
     "Options:\n"
+    "  --model-profile PATH  explicit versioned detector model profile YAML\n"
+    "  --allow-test-profile  allow profile: test_only\n"
     "  --allow-test-config  explicitly allow a profile: test_only YAML\n"
     "  --frames N           frames to process (default 5)\n"
     "  --csv PATH           write RawArmorDetection and PnP rows as CSV\n"
@@ -54,6 +59,10 @@ Options parse_options(int argc, char ** argv)
     };
     if (argument == "--model") {
       result.model_path = require_value("--model");
+    } else if (argument == "--model-profile") {
+      result.model_profile_path = require_value("--model-profile");
+    } else if (argument == "--allow-test-profile") {
+      result.allow_test_profile = true;
     } else if (argument == "--video") {
       result.video_path = require_value("--video");
     } else if (argument == "--pnp-config") {
@@ -75,8 +84,11 @@ Options parse_options(int argc, char ** argv)
       throw std::invalid_argument("unknown option: " + argument);
     }
   }
-  if (result.model_path.empty() || result.video_path.empty() || result.pnp_config_path.empty()) {
-    throw std::invalid_argument("--model, --video, and --pnp-config are required");
+  if (result.model_path.empty() || result.model_profile_path.empty() ||
+    result.video_path.empty() || result.pnp_config_path.empty())
+  {
+    throw std::invalid_argument(
+            "--model, --model-profile, --video, and --pnp-config are required");
   }
   if (result.frames <= 0) {
     throw std::invalid_argument("--frames must be positive");
@@ -156,13 +168,19 @@ int main(int argc, char ** argv)
     rm_auto_aim::pnp::PnpStage pnp_stage(
       rm_auto_aim::pnp::load_pnp_configuration(options.pnp_config_path, load_options));
 
-    rm_auto_aim::detector::DetectorConfig detector_config{};
-    detector_config.model_path = options.model_path;
-    detector_config.device = options.device;
+    rm_auto_aim::detector::ModelProfileLoadOptions profile_options{};
+    profile_options.allow_test_only = options.allow_test_profile;
+    const auto model_profile = rm_auto_aim::detector::load_model_profile(
+      options.model_profile_path, profile_options);
+    auto detector_config = rm_auto_aim::detector::detector_config_from_model_profile(
+      model_profile, options.model_path, options.device);
     rm_auto_aim::detector::OpenVinoYoloDetector detector(std::move(detector_config));
 
     std::cout << "dry_run=true allow_fire=false serial_enabled=false fire_command=0\n";
     std::cout << "pnp_profile=" << (pnp_stage.config().test_only ? "test_only" : "production") <<
+      " model_profile=" << model_profile.model_id << "@" << model_profile.version <<
+      " model_profile_kind=" << (model_profile.test_only ? "test_only" : "production") <<
+      " effective_test_only=" << (pnp_stage.config().test_only || model_profile.test_only ? "true" : "false") <<
       " camera_frame=" << pnp_stage.config().camera.coordinate_frame <<
       " gimbal_extrinsic_configured=" <<
       (pnp_stage.config().camera_to_gimbal.configured ? "true" : "false") << '\n';

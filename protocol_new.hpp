@@ -34,7 +34,7 @@ struct __attribute__((packed)) VisionData
   float pitch_vel = 0.0f; // external unit pending confirmation
   float roll = 0.0f;      // degree; serial field is forwarded unchanged
   float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};  // w, x, y, z
-  float shoot_speed = 0.0f;
+  float shoot_speed = 0.0f;  // m/s; serial field is forwarded unchanged
   uint16_t bullet_count = 0;
   uint8_t game_progress = 0;
 };
@@ -48,7 +48,7 @@ struct __attribute__((packed)) RobotCtrlData
   float pitch_vel = 0.0f; // external unit pending confirmation; currently 0
   float pitch_acc = 0.0f; // external unit pending confirmation; currently 0
   int8_t target_lock = 50;  // 49: lock, 50: unlock
-  int8_t fire_command = 0;
+  int8_t fire_command = 0;   // 0: none, 1: burst, 2: single (when authorized)
 };
 
 struct __attribute__((packed)) MsgEndInfo

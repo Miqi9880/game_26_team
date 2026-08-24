@@ -87,6 +87,9 @@ Vision 输入中的对应速度字段只做有限值检查，不进入算法核�
 但当前不解释 quaternion 的世界方向，不把 Vision 绝对角写入 PnP 相对角或
 RobotCtrl 绝对目标角。`id`、`mode`、`bullet_count`、`game_progress` 目前只记录；
 其中 `mode=33` 作为协议字段透传，不在算法中到处硬编码。
+ROS 适配层会拒绝负数、未设置或超出规范范围的时间戳，并只保存有限的四元数 wxyz；它不会自行归一化、
+猜测 IMU/world 方向或把 Vision 时间戳当作图像与云台的同步依据。真实 freshness、同步和四元数
+方向仍需场景 3 联调确认。
 
 ## ROS 节点
 
@@ -96,6 +99,30 @@ RobotCtrl 绝对目标角。`id`、`mode`、`bullet_count`、`game_progress` 目
 - 订阅 `/camera_info`：`sensor_msgs/msg/CameraInfo`
 - 订阅 `/Vision_data`：`auto_aim_interfaces/msg/Vision`
 - 发布 `/Robot_ctrl_data`：`auto_aim_interfaces/msg/RobotCtrl`
+
+`backend=offline_reference` 必须接收 `offline_model_profile` 参数。节点先校验版本化模型
+profile，再检查 OpenVINO 实际模型的 shape 和 element type；没有 profile 时直接拒绝启动，
+不再允许 CSV 标记为未审查的 `unprofiled_legacy_reference`。模型 profile 不能替代 PnP
+标定配置。
+ROS CSV 目前将 `backend`、`calibration_profile`、`model_profile`、
+`test_only`、诊断/发布锁定状态和 `fire_command` 作为显式安全字段。
+
+ROS 级安全探针位于 `src/auto_aim_ros2/test/ros_safety_integration_probe.py`。
+在另一个终端启动 `auto_aim_node` 后，可依次运行 `no_target`、`mock_target`、
+`missing_camera_info`、`invalid_camera_info` 和 `input_timeout`；每个 case 都要求
+`/Robot_ctrl_data` 存在且 `fire_command=0`。`offline_reference` case 还要提供旧参考
+视频和显式 test-only PnP/model profile。短暂/长时间丢失用
+`--frames-before-stop` 改变停止发布后的等待时长；这类探针是 dry-run 证据，不替代实车验证。
+
+构建后的 CTest 会自动启动一个隔离的 `auto_aim_node`，执行最小 topic-level
+null/mock/非法图像时间戳检查：`ros_safety_integration_test`。它验证锁定、输入超时和
+非法时间戳都保持 `fire_command=0`，并不连接真实串口或硬件。上面的手工探针仍用于
+`missing_camera_info`、`invalid_camera_info` 和 `offline_reference` 等需要显式录像、模型或
+PnP 配置的场景；手工探针不能被未运行误写成已验证。
+
+图像消息进入 `to_image_frame()` 前必须具有已设置且 canonical 的 ROS 时间（`sec >= 0`、
+`nanosec < 1e9` 且不为 `(0,0)`）；backend 直接收到非正 `stamp_ns` 也会 fail-closed，
+不再把异常时间转换后继续产生锁定诊断。`/Vision_data` 适配层使用相同边界。
 
 在收到有效 `/camera_info` 前，图像回调只记录帧并产生安全命令；这避免在没有标定信息时误把图像送入真实算法。
 
@@ -124,9 +151,9 @@ shoot speed 供未来弹道模块使用，bullet_count/game_progress 不参与�
 
 `auto_aim_detector_smoke` 是独立的检测器离线工具，必须显式提供 `--model` 和 `--video`。它打印模型签名和逐帧检测数量，可用 `--csv PATH` 保存原始检测，可用 `--annotated-dir PATH` 保存标注图。它始终打印 `dry_run=true allow_fire=false serial_enabled=false fire_command=0`，检测器本身不生成任何开火命令。
 
-`auto_aim_pnp_smoke` 在检测器之后调用独立 PnpStage。它要求显式提供 `--pnp-config`；只有传入 `--allow-test-config` 才会读取 profile 为 test_only 的 YAML。它输出 RawArmorDetection 和 PoseObservation CSV、PnP 标注图、camera xyz（m）、重投影 RMS（px），以及仅在外参有效时输出的 gimbal xyz（m）和 relative yaw/pitch（rad）。它不初始化 ROS node、串口或控制发布者，并始终打印 `fire_command=0`。
+`auto_aim_pnp_smoke` 在检测器之后调用独立 PnpStage。它要求显式提供版本化 `--model-profile` 和 `--pnp-config`；只有分别传入 `--allow-test-profile`、`--allow-test-config` 才会读取对应的 `test_only` YAML。这样 PnP 链路不会静默绕过模型类别、颜色和关键点语义审查。它输出 RawArmorDetection 和 PoseObservation CSV、PnP 标注图、camera xyz（m）、重投影 RMS（px），以及仅在外参有效时输出的 gimbal xyz（m）和 relative yaw/pitch（rad）；启动行还记录 model/pnp profile 类型和 `effective_test_only`。它不初始化 ROS node、串口或控制发布者，并始终打印 `fire_command=0`。
 
-`auto_aim_offline` 在上述组件之后继续运行 Tracker、TargetSelector 和 SafeOfflineAimer，输出逐帧跟踪状态、诊断锁定、相对角和 test-only 绝对角候选；它不创建 ROS publisher、不打开串口，也不产生开火请求。ROS `offline_reference` backend 使用同一条链路，但在本阶段强制 `command_publishable=false`，因此不会把候选绝对角送入 `/Robot_ctrl_data`。
+`auto_aim_offline` 同样要求显式的版本化 `--model-profile`；在 test-only 回放中必须同时显式传入 `--allow-test-profile` 和 `--allow-test-config`。它在上述组件之后继续运行 Tracker、TargetSelector 和 SafeOfflineAimer，输出逐帧跟踪状态、诊断锁定、相对角和 test-only 绝对角候选；它不创建 ROS publisher、不打开串口，也不产生开火请求。ROS `offline_reference` backend 使用同一条链路，但在本阶段强制 `command_publishable=false`，因此不会把候选绝对角送入 `/Robot_ctrl_data`。
 
 当前在 WSL 中验证过的参考模型是只读旧仓库中的：
 
@@ -142,9 +169,9 @@ input  = FP32 [1, 3, 640, 640]
 output = FP32 [1, 25200, 22]
 ```
 
-该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。
+该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。生产 profile 还要求 runtime `offline_model_path` 与 profile 的绝对 `model.path` 一致；不同路径的同 shape/type artifact 会在 OpenVINO 初始化前拒绝。非有限 objectness logit 也会被丢弃，不会通过 `sigmoid(+Inf)=1` 进入检测链路。
 
-本阶段 smoke 命令（执行目录为 `game_26_dev`）为：
+历史运行 B 的 smoke 命令（执行目录为 `game_26_dev`）为：
 
 ```bash
 source /opt/ros/humble/setup.bash

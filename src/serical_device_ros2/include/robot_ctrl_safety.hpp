@@ -59,12 +59,24 @@ public:
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (!IsValid(input, config_)) {
+      // An invalid message must not leave a previously valid firing command
+      // active for the timeout window. Keep the last finite position as a
+      // hold point, but immediately replace motion/lock/fire with safe values.
+      const auto held_yaw = std::isfinite(last_valid_.yaw) ? last_valid_.yaw : 0.0f;
+      const auto held_pitch = std::isfinite(last_valid_.pitch) ? last_valid_.pitch : 0.0f;
+      last_valid_ = io::RobotCtrlData{};
+      last_valid_.yaw = held_yaw;
+      last_valid_.pitch = held_pitch;
+      last_valid_.target_lock = kTargetUnlocked;
+      last_valid_.fire_command = kFireNone;
+      force_stale_ = true;
       return false;
     }
 
     last_valid_ = input;
     last_valid_ns_ = clock_();
     have_valid_ = true;
+    force_stale_ = false;
     return true;
   }
 
@@ -75,7 +87,7 @@ public:
     Output output{};
     const std::int64_t now_ns = clock_();
 
-    const bool fresh = have_valid_ && now_ns >= last_valid_ns_ &&
+    const bool fresh = have_valid_ && !force_stale_ && now_ns >= last_valid_ns_ &&
       (now_ns - last_valid_ns_) < kTimeoutNs;
     output.fresh = fresh;
 
@@ -110,7 +122,8 @@ public:
            (input.target_lock == kTargetLocked || input.target_lock == kTargetUnlocked) &&
            (input.fire_command == kFireNone ||
             input.fire_command == config.burst_command ||
-            input.fire_command == config.single_command);
+            input.fire_command == config.single_command) &&
+           (input.target_lock == kTargetLocked || input.fire_command == kFireNone);
   }
 
 private:
@@ -120,6 +133,7 @@ private:
   io::RobotCtrlData last_valid_{};
   std::int64_t last_valid_ns_{0};
   bool have_valid_{false};
+  bool force_stale_{false};
 };
 
 }  // namespace rm_auto_aim::safety

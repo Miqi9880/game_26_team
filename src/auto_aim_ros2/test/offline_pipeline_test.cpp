@@ -167,11 +167,35 @@ TEST(OfflineTracker, TimestampRollbackAndDuplicateAreRejected)
   EXPECT_FALSE(rollback.target_lock());
   ASSERT_EQ(rollback.tracks.size(), 1U);
   EXPECT_EQ(rollback.tracks[0].state, TrackingState::TempLost);
+  ASSERT_TRUE(rollback.primary_track.has_value());
+  EXPECT_EQ(rollback.state, TrackingState::TempLost);
+  EXPECT_EQ(rollback.primary_track->state, TrackingState::TempLost);
   const auto duplicate = tracker.update(
     std::vector<TargetObservation>{observation(110, 0, 0.0, 0.0, 0.0)}, 110);
   EXPECT_TRUE(duplicate.rejected);
   ASSERT_EQ(duplicate.tracks.size(), 1U);
   EXPECT_EQ(duplicate.tracks[0].last_valid_timestamp_ns, 110);
+  ASSERT_TRUE(duplicate.primary_track.has_value());
+  EXPECT_EQ(duplicate.state, TrackingState::TempLost);
+  EXPECT_EQ(duplicate.primary_track->state, TrackingState::TempLost);
+}
+
+TEST(OfflineTracker, NegativeTimestampReportsSafeDiagnosticState)
+{
+  OfflineTracker tracker(tracker_config());
+  ASSERT_TRUE(tracker.update(
+    std::vector<TargetObservation>{observation(100, 0, 0.0, 0.0, 0.0)}, 100).accepted);
+  ASSERT_TRUE(tracker.update(
+    std::vector<TargetObservation>{observation(110, 0, 0.0, 0.0, 0.0)}, 110).accepted);
+
+  const auto invalid = tracker.update(
+    std::vector<TargetObservation>{observation(0, 0, 0.0, 0.0, 0.0)}, -1);
+  EXPECT_TRUE(invalid.rejected);
+  EXPECT_FALSE(invalid.lock_allowed);
+  EXPECT_FALSE(invalid.target_lock());
+  ASSERT_TRUE(invalid.primary_track.has_value());
+  EXPECT_EQ(invalid.state, TrackingState::TempLost);
+  EXPECT_EQ(invalid.primary_track->state, TrackingState::TempLost);
 }
 
 TEST(OfflineTracker, PositionAndAngleJumpsAreRejectedWithoutReplacingEvidence)
@@ -261,6 +285,22 @@ TEST(TargetSelector, PreviousTrackBreaksConfidenceTieThenCenterAndIdBreakTies)
   EXPECT_EQ(center_wins->track_id, 9U);
 }
 
+TEST(TargetSelector, SelectsAvailableReplacementWhenPreviousTargetDisappears)
+{
+  TargetSelector selector;
+  const auto first = selector.select(
+    {tracked(3, 0.9F, 640.0F), tracked(8, 0.75F, 700.0F)}, 1280, 800);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->track_id, 3U);
+
+  // A target switch is observable and deterministic, but does not imply that
+  // a real two-robot scenario or firing policy has been validated.
+  const auto replacement = selector.select({tracked(8, 0.75F, 700.0F)}, 1280, 800);
+  ASSERT_TRUE(replacement.has_value());
+  EXPECT_EQ(replacement->track_id, 8U);
+  EXPECT_EQ(selector.previous_track_id(), std::optional<std::uint64_t>(8U));
+}
+
 TEST(TargetSelector, NonTrackingAndInvalidTracksAreFiltered)
 {
   TargetSelector selector;
@@ -345,6 +385,16 @@ TEST(OfflineAimer, ShootSpeedIsDiagnosticOnlyAndInvalidValuesAreSafe)
   const auto output = aimer.aim(
     tracked(1, 0.8F, 640.0F), std::numeric_limits<double>::quiet_NaN());
   EXPECT_DOUBLE_EQ(output.shoot_speed_mps, 0.0);
+  EXPECT_EQ(output.fire_command, rm_auto_aim::pipeline::kFireNone);
+}
+
+TEST(OfflineAimer, NonFiniteTrackedMotionCannotBecomeLockableOutput)
+{
+  rm_auto_aim::offline::SafeOfflineAimer aimer;
+  auto selected = tracked(1, 0.8F, 640.0F);
+  selected.yaw_vel_rad_s = std::numeric_limits<double>::quiet_NaN();
+  const auto output = aimer.aim(selected);
+  EXPECT_EQ(output.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
   EXPECT_EQ(output.fire_command, rm_auto_aim::pipeline::kFireNone);
 }
 

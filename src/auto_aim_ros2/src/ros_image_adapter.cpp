@@ -98,6 +98,13 @@ std::optional<pipeline::ImageFrame> to_image_frame(
   std::uint8_t game_progress,
   std::string * error)
 {
+  if (message.header.stamp.sec < 0 ||
+    message.header.stamp.nanosec >= 1'000'000'000U ||
+    (message.header.stamp.sec == 0 && message.header.stamp.nanosec == 0))
+  {
+    set_error(error, "sensor_msgs/Image has an invalid or unset timestamp");
+    return std::nullopt;
+  }
   auto bgr = to_bgr_image(message, error);
   if (!bgr.has_value()) {
     return std::nullopt;

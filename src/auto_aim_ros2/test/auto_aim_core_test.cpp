@@ -140,6 +140,58 @@ TEST(RosAdapter, ConvertsRadiansToDegreesAndZerosUnconfirmedMotionUnits)
   EXPECT_EQ(message.fire_command, command.fire_command);
 }
 
+TEST(RosAdapter, InvalidAimCommandFailsClosedAtRobotCtrlBoundary)
+{
+  using rm_auto_aim::pipeline::AimCommand;
+  using rm_auto_aim::pipeline::kFireBurst;
+  using rm_auto_aim::pipeline::kFireNone;
+  using rm_auto_aim::pipeline::kTargetLocked;
+  using rm_auto_aim::pipeline::kTargetUnlocked;
+
+  AimCommand non_finite_angle{};
+  non_finite_angle.yaw_rad = std::numeric_limits<float>::quiet_NaN();
+  non_finite_angle.pitch_rad = 0.2F;
+  non_finite_angle.target_lock = kTargetLocked;
+  non_finite_angle.fire_command = kFireBurst;
+  auto message = rm_auto_aim::ros_adapters::to_ros(non_finite_angle);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand invalid_lock{};
+  invalid_lock.yaw_rad = 0.2F;
+  invalid_lock.pitch_rad = -0.1F;
+  invalid_lock.target_lock = 0;
+  message = rm_auto_aim::ros_adapters::to_ros(invalid_lock);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand invalid_fire{};
+  invalid_fire.yaw_rad = 0.2F;
+  invalid_fire.pitch_rad = -0.1F;
+  invalid_fire.target_lock = kTargetLocked;
+  invalid_fire.fire_command = 99;
+  message = rm_auto_aim::ros_adapters::to_ros(invalid_fire);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand unlocked_fire{};
+  unlocked_fire.yaw_rad = 0.2F;
+  unlocked_fire.pitch_rad = -0.1F;
+  unlocked_fire.target_lock = kTargetUnlocked;
+  unlocked_fire.fire_command = kFireBurst;
+  message = rm_auto_aim::ros_adapters::to_ros(unlocked_fire);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+}
+
 TEST(RosAdapter, ConvertsCanonicalAnglesBothDirections)
 {
   EXPECT_FLOAT_EQ(rm_auto_aim::units::degrees_to_radians(0.0F), 0.0F);
@@ -206,5 +258,22 @@ TEST(RosAdapter, RejectsNonFiniteVisionEvidence)
 
   message.yaw = 0.0F;
   message.quaternion[2] = std::numeric_limits<float>::infinity();
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}
+
+TEST(RosAdapter, RejectsNonCanonicalVisionTimestamp)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  message.header.stamp.sec = -1;
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+
+  message.header.stamp.sec = 0;
+  message.header.stamp.nanosec = 1'000'000'000U;
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}
+
+TEST(RosAdapter, RejectsUnsetVisionTimestamp)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
   EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
 }

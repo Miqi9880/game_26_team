@@ -114,6 +114,7 @@ struct Backend::Impl
 
   Config config;
   std::string calibration_profile{"none"};
+  std::string model_profile{"none"};
   bool test_only{true};
   std::unique_ptr<pipeline::AutoAimPipeline> core_pipeline;
   std::unique_ptr<detector::OpenVinoYoloDetector> detector;
@@ -152,9 +153,18 @@ Backend::Backend(Config config) : impl_(std::make_unique<Impl>(std::move(config)
     state.test_only = pnp_config.test_only || state.config.aimer.test_only;
     state.pnp_stage = std::make_unique<pnp::PnpStage>(std::move(pnp_config));
 
-    detector::DetectorConfig detector_config{};
-    detector_config.model_path = state.config.model_path;
-    detector_config.device = state.config.device;
+    if (state.config.model_profile_path.empty()) {
+      throw std::invalid_argument(
+              "offline_reference requires offline_model_profile; unprofiled models are not permitted");
+    }
+    detector::ModelProfileLoadOptions profile_options{};
+    profile_options.allow_test_only = state.config.allow_test_only;
+    const auto model_profile = detector::load_model_profile(
+      state.config.model_profile_path, profile_options);
+    state.model_profile = model_profile.model_id + "@" + model_profile.version;
+    auto detector_config = detector::detector_config_from_model_profile(
+      model_profile, state.config.model_path, state.config.device);
+    state.test_only = state.test_only || model_profile.test_only;
     state.detector = std::make_unique<detector::OpenVinoYoloDetector>(
       std::move(detector_config));
     state.tracker = std::make_unique<offline::OfflineTracker>(state.config.tracker);
@@ -176,6 +186,7 @@ FrameResult Backend::safe_result(std::int64_t stamp_ns) const
   FrameResult result{};
   result.backend = backend_kind_name(impl_->config.kind);
   result.calibration_profile = impl_->calibration_profile;
+  result.model_profile = impl_->model_profile;
   result.aimer_mode = impl_->config.kind == BackendKind::OfflineReference ?
     offline::aimer_mode_name(impl_->config.aimer.mode) : "core";
   result.test_only = impl_->test_only;
@@ -192,13 +203,22 @@ FrameResult Backend::process(const pipeline::ImageFrame & frame)
 {
   auto & state = *impl_;
   FrameResult result = safe_result(frame.stamp_ns);
+  if (frame.stamp_ns <= 0) {
+    result.error = "invalid_image_timestamp";
+    result.command = pipeline::AutoAimPipeline::safe_command();
+    result.command.fire_command = pipeline::kFireNone;
+    result.command.target_lock = pipeline::kTargetUnlocked;
+    result.diagnostic_target_lock = pipeline::kTargetUnlocked;
+    result.absolute_command_valid = false;
+    result.command_publishable = false;
+    return result;
+  }
   try {
     if (state.config.kind != BackendKind::OfflineReference) {
       // Use the frame stamp as the deterministic time source.  This avoids
       // sampling wall time during replay or inside a ROS image callback.
-      const auto safe_stamp_ns = std::max<std::int64_t>(frame.stamp_ns, 0);
       const auto timestamp = std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(safe_stamp_ns));
+        std::chrono::nanoseconds(frame.stamp_ns));
       result.command = state.core_pipeline->process(frame, timestamp);
       result.command.fire_command = pipeline::kFireNone;
       result.diagnostic_target_lock = result.command.target_lock;
@@ -271,6 +291,11 @@ const std::string & Backend::calibration_profile() const noexcept
   return impl_->calibration_profile;
 }
 
+const std::string & Backend::model_profile() const noexcept
+{
+  return impl_->model_profile;
+}
+
 bool Backend::test_only() const noexcept
 {
   return impl_->test_only;
@@ -283,7 +308,7 @@ const Config & Backend::config() const noexcept
 
 std::string csv_header()
 {
-  return "backend,calibration_profile,aimer_mode,test_only,diagnostic_target_lock,"
+  return "backend,calibration_profile,model_profile,aimer_mode,test_only,diagnostic_target_lock,"
          "published_target_lock,absolute_command_valid,command_publishable,stamp_ns,"
          "detection_count,valid_pnp_count,track_id,tracking_state,consecutive_valid,"
          "camera_x_m,camera_y_m,camera_z_m,"
@@ -302,6 +327,7 @@ std::string csv_row(const FrameResult & result)
   };
   append(result.backend);
   append(result.calibration_profile);
+  append(result.model_profile);
   append(result.aimer_mode);
   append(result.test_only ? "1" : "0");
   append(std::to_string(static_cast<int>(result.diagnostic_target_lock)));

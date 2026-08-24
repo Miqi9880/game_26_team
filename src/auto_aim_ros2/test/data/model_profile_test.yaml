@@ -1,0 +1,59 @@
+# Synthetic/reference contract only.  This profile documents the legacy
+# YOLOv5 IR used for offline smoke tests; it is not the competition model and
+# must not be used as a production detector profile.
+schema_version: 1
+profile: test_only
+
+model:
+  id: legacy_yolov5_reference
+  path: external://sp_vision_25/assets/yolov5.xml
+  source: sp_vision_25_assets_yolov5_xml
+  version: legacy-reference-v1
+
+input:
+  shape: [1, 3, 640, 640]
+  layout: NCHW
+  element_type: f32
+  source_color_order: BGR
+  model_color_order: RGB
+  normalization: divide_255
+  resize_mode: top_left
+
+output:
+  shape: [1, 25200, 22]
+  layout: NRC
+  element_type: f32
+  keypoint_count: 4
+  objectness_index: 8
+  color_logits_offset: 9
+  color_class_count: 4
+  armor_logits_offset: 13
+  armor_class_count: 9
+
+postprocess:
+  objectness_threshold: 0.7
+  nms_threshold: 0.3
+  # Raw model coordinate pairs are reordered to TL,TR,BR,BL.
+  keypoint_order: [0, 3, 2, 1]
+
+semantics:
+  # Color names are intentionally marked as unconfirmed for this legacy
+  # fixture.  Do not infer current-game enemy color from these labels.
+  color_id_to_name: [legacy_unconfirmed_0, legacy_unconfirmed_1,
+                      legacy_unconfirmed_2, legacy_unconfirmed_3]
+  armor_class_names: [legacy_unconfirmed_0, legacy_unconfirmed_1,
+                      legacy_unconfirmed_2, legacy_unconfirmed_3,
+                      legacy_unconfirmed_4, legacy_unconfirmed_5,
+                      legacy_unconfirmed_6, legacy_unconfirmed_7,
+                      legacy_unconfirmed_8]
+  # This mapping matches only the synthetic PnP fixture used by tests.
+  class_to_armor_type:
+    0: small
+    1: large
+    2: small
+    3: small
+    4: small
+    5: small
+    6: small
+    7: small
+    8: small

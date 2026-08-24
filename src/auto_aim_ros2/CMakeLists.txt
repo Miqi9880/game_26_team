@@ -75,6 +75,7 @@ install(TARGETS auto_aim_offline
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   ament_auto_add_gtest(
     auto_aim_core_test
     test/auto_aim_core_test.cpp
@@ -82,6 +83,10 @@ if(BUILD_TESTING)
   ament_auto_add_gtest(
     raw_armor_detector_test
     test/raw_armor_detector_test.cpp
+  )
+  target_compile_definitions(
+    raw_armor_detector_test PRIVATE
+    MODEL_PROFILE_TEST_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/data/model_profile_test.yaml"
   )
   ament_auto_add_gtest(
     ros_image_adapter_test
@@ -103,6 +108,12 @@ if(BUILD_TESTING)
     pnp_stage_test PRIVATE
     PNP_TEST_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/data/pnp_test_config.yaml"
   )
+  add_test(
+    NAME ros_safety_integration_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/ros_safety_integration_test.py
+  )
+  set_tests_properties(ros_safety_integration_test PROPERTIES TIMEOUT 30)
 endif()
 
 ament_auto_package()

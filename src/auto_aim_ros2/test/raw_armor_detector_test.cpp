@@ -12,9 +12,12 @@
 namespace
 {
 using rm_auto_aim::detector::DetectorConfig;
+using rm_auto_aim::detector::ModelProfileLoadOptions;
 using rm_auto_aim::detector::make_letterbox;
 using rm_auto_aim::detector::make_raw_armor_detection;
 using rm_auto_aim::detector::model_point_to_image;
+using rm_auto_aim::detector::load_model_profile;
+using rm_auto_aim::detector::sigmoid_probability;
 using rm_auto_aim::detector::validate_input_shape;
 using rm_auto_aim::detector::validate_output_shape;
 }
@@ -148,6 +151,100 @@ TEST(RawArmorDetection, RejectsUnexpectedModelShapes)
   EXPECT_TRUE(validate_output_shape({1, 25200, 21}, config).has_value());
   EXPECT_TRUE(validate_output_shape({1, 100, 22}, config).has_value());
   EXPECT_FALSE(validate_output_shape({1, 25200, 22}, config).has_value());
+}
+
+TEST(ModelProfile, TestOnlyRequiresExplicitOptIn)
+{
+  EXPECT_THROW(load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH), std::runtime_error);
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  const auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  EXPECT_TRUE(profile.test_only);
+  EXPECT_EQ(profile.model_id, "legacy_yolov5_reference");
+  EXPECT_EQ(profile.model_path, "external://sp_vision_25/assets/yolov5.xml");
+  EXPECT_EQ(profile.input_shape, (std::array<std::size_t, 4>{{1, 3, 640, 640}}));
+  EXPECT_EQ(profile.output_shape, (std::array<std::size_t, 3>{{1, 25200, 22}}));
+  EXPECT_EQ(profile.color_class_count, 4U);
+  EXPECT_EQ(profile.armor_class_count, 9U);
+  EXPECT_EQ(profile.keypoint_order, (std::array<int, 4>{{0, 3, 2, 1}}));
+  ASSERT_EQ(profile.class_to_armor_type.size(), 9U);
+}
+
+TEST(ModelProfile, ConvertsOnlyValidatedProfileToDetectorConfig)
+{
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  const auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
+    profile, "/tmp/reference.xml");
+  EXPECT_EQ(config.model_path, "/tmp/reference.xml");
+  EXPECT_EQ(config.input_width, 640);
+  EXPECT_EQ(config.input_height, 640);
+  EXPECT_EQ(config.expected_output_rows, 25200U);
+  EXPECT_EQ(config.expected_output_columns, 22U);
+  EXPECT_EQ(config.expected_input_element_type, "f32");
+  EXPECT_EQ(config.expected_output_element_type, "f32");
+  EXPECT_EQ(config.color_logits_offset, 9U);
+  EXPECT_EQ(config.armor_logits_offset, 13U);
+  ASSERT_EQ(config.class_to_armor_type.size(), 9U);
+  EXPECT_EQ(
+    config.class_to_armor_type.at(0),
+    rm_auto_aim::detector::RawArmorDetection::ArmorTypeHint::Small);
+  EXPECT_FALSE(config.center_padding);
+}
+
+TEST(ModelProfile, ProductionProfileBindsRuntimePathToReviewedArtifact)
+{
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  profile.test_only = false;
+  profile.model_path = "/opt/game26/models/reviewed.xml";
+
+  EXPECT_FALSE(profile.validate().has_value());
+  EXPECT_THROW(
+    rm_auto_aim::detector::detector_config_from_model_profile(
+      profile, "/opt/game26/models/other.xml"),
+    std::invalid_argument);
+
+  const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
+    profile, "/opt/game26/models/reviewed.xml");
+  EXPECT_TRUE(config.require_model_path_match);
+  EXPECT_EQ(config.reviewed_model_path, profile.model_path);
+
+  profile.model_path = "relative/reviewed.xml";
+  EXPECT_TRUE(profile.validate().has_value());
+}
+
+TEST(ModelProfile, RejectsNonFiniteObjectnessLogits)
+{
+  EXPECT_FALSE(sigmoid_probability(std::numeric_limits<float>::infinity()).has_value());
+  EXPECT_FALSE(sigmoid_probability(-std::numeric_limits<float>::infinity()).has_value());
+  EXPECT_FALSE(sigmoid_probability(std::numeric_limits<float>::quiet_NaN()).has_value());
+  ASSERT_TRUE(sigmoid_probability(0.0F).has_value());
+  EXPECT_FLOAT_EQ(*sigmoid_probability(0.0F), 0.5F);
+}
+
+TEST(ModelProfile, RejectsInvalidTensorOrSemanticContract)
+{
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+
+  profile.output_layout = "NHWC";
+  EXPECT_TRUE(profile.validate().has_value());
+
+  profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  profile.keypoint_order[1] = profile.keypoint_order[0];
+  EXPECT_TRUE(profile.validate().has_value());
+
+  profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  profile.class_to_armor_type.erase(8);
+  EXPECT_TRUE(profile.validate().has_value());
+
+  profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
+  profile.input_shape[2] = static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1U;
+  EXPECT_TRUE(profile.validate().has_value());
 }
 
 TEST(OpenVinoYoloDetector, MissingModelIsReportedClearly)

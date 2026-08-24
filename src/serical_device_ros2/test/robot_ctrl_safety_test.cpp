@@ -71,11 +71,13 @@ TEST(RobotCtrlSafety, ConfiguredFireIsAllowedOnlyForLockedTarget)
 
   now_ns += 1;
   auto unlocked = make_control(50, 7);
-  ASSERT_TRUE(safety.Accept(unlocked));
+  EXPECT_FALSE(safety.Accept(unlocked));
   const auto output = safety.Tick();
-  EXPECT_TRUE(output.fresh);
+  EXPECT_FALSE(output.fresh);
   EXPECT_EQ(output.control.target_lock, 50);
   EXPECT_EQ(output.control.fire_command, 0);
+  EXPECT_FLOAT_EQ(output.control.yaw, unlocked.yaw);
+  EXPECT_FLOAT_EQ(output.control.pitch, unlocked.pitch);
 }
 
 TEST(RobotCtrlSafety, TimeoutStartsAtTheHundredMillisecondBoundary)
@@ -128,6 +130,31 @@ TEST(RobotCtrlSafety, InvalidInputDoesNotRefreshOrReplaceHeldAngles)
   EXPECT_FALSE(output.fresh);
   EXPECT_FLOAT_EQ(output.control.yaw, valid.yaw);
   EXPECT_FLOAT_EQ(output.control.pitch, valid.pitch);
+}
+
+TEST(RobotCtrlSafety, InvalidInputImmediatelyCancelsPreviouslyAcceptedFire)
+{
+  std::int64_t now_ns = 0;
+  const Config config{true, 7, 9};
+  RobotCtrlSafety safety(config, [&now_ns]() { return now_ns; });
+  const auto locked_fire = make_control(49, 7);
+  ASSERT_TRUE(safety.Accept(locked_fire));
+  EXPECT_EQ(safety.Tick().control.fire_command, 7);
+
+  now_ns = 1;
+  auto invalid = locked_fire;
+  invalid.yaw = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(safety.Accept(invalid));
+  const auto output = safety.Tick();
+  EXPECT_FALSE(output.fresh);
+  EXPECT_EQ(output.control.target_lock, 50);
+  EXPECT_EQ(output.control.fire_command, 0);
+  EXPECT_FLOAT_EQ(output.control.yaw, locked_fire.yaw);
+  EXPECT_FLOAT_EQ(output.control.pitch, locked_fire.pitch);
+  EXPECT_FLOAT_EQ(output.control.yaw_vel, 0.0f);
+  EXPECT_FLOAT_EQ(output.control.yaw_acc, 0.0f);
+  EXPECT_FLOAT_EQ(output.control.pitch_vel, 0.0f);
+  EXPECT_FLOAT_EQ(output.control.pitch_acc, 0.0f);
 }
 
 TEST(RobotCtrlSafety, ClockRollbackIsStale)

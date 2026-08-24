@@ -156,24 +156,53 @@ def new_alignment_csv_path():
     return path
 
 
-def assert_alignment_status(path, expected_status, expected_matched_ns=None,
-                            expected_delta_ns=None, expected_latest_ns=None,
-                            expected_latest_received_ns=None):
+def read_alignment_rows(path):
+    if not os.path.exists(path):
+        return []
     with open(path, newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    assert rows, f"alignment diagnostic CSV is empty: {path}"
-    matching_rows = [row for row in rows if row["status"] == expected_status]
-    assert matching_rows, (expected_status, [row["status"] for row in rows])
-    row = matching_rows[-1]
-    if expected_matched_ns is not None:
-        assert int(row["matched_stamp_ns"]) == expected_matched_ns, row
-    if expected_delta_ns is not None:
-        assert int(row["delta_ns"]) == expected_delta_ns, row
-    if expected_latest_ns is not None:
-        assert int(row["latest_history_vision_header_ns"]) == expected_latest_ns, row
-    if expected_latest_received_ns is not None:
-        assert int(row["latest_received_vision_header_ns"]) == expected_latest_received_ns, row
-    return row
+        return list(csv.DictReader(handle))
+
+
+def alignment_row_matches(row, expected_status, expected_matched_ns,
+                          expected_delta_ns, expected_latest_ns,
+                          expected_latest_received_ns):
+    return (
+        row["status"] == expected_status and
+        (expected_matched_ns is None or
+         int(row["matched_stamp_ns"]) == expected_matched_ns) and
+        (expected_delta_ns is None or int(row["delta_ns"]) == expected_delta_ns) and
+        (expected_latest_ns is None or
+         int(row["latest_history_vision_header_ns"]) == expected_latest_ns) and
+        (expected_latest_received_ns is None or
+         int(row["latest_received_vision_header_ns"]) == expected_latest_received_ns)
+    )
+
+
+def wait_for_alignment_status(probe, path, image_sec, expected_status,
+                              expected_matched_ns=None, expected_delta_ns=None,
+                              expected_latest_ns=None,
+                              expected_latest_received_ns=None):
+    deadline = time.monotonic() + 5.0
+    rows = []
+    while time.monotonic() < deadline:
+        # Replaying the same synthetic image timestamp is safe in this
+        # dry-run test and removes a cross-process DDS callback ordering race:
+        # the assertion succeeds only after the child node has received the
+        # expected Vision history.
+        probe.publish_image(image_sec)
+        rclpy.spin_once(probe, timeout_sec=0.02)
+        rows = read_alignment_rows(path)
+        for row in reversed(rows):
+            if alignment_row_matches(
+                    row, expected_status, expected_matched_ns, expected_delta_ns,
+                    expected_latest_ns, expected_latest_received_ns):
+                return row
+        time.sleep(0.02)
+
+    raise AssertionError(
+        (expected_status, expected_matched_ns, expected_delta_ns,
+         expected_latest_ns, expected_latest_received_ns, rows)
+    )
 
 
 def assert_all_safe(probe):
@@ -200,10 +229,19 @@ def run_mock_case():
         # the 90-degree Vision yaw and shoot speed must not alter the mock
         # command or fire output.
         probe.publish_vision(1)
-        time.sleep(0.1)
         probe.publish_vision(2)
-        time.sleep(0.1)
-        probe.publish_image(1)
+        matched_row = wait_for_alignment_status(
+            probe,
+            alignment_csv_path,
+            1,
+            "matched",
+            expected_matched_ns=1_000_000_001,
+            expected_delta_ns=0,
+            expected_latest_ns=2_000_000_001,
+            expected_latest_received_ns=2_000_000_001,
+        )
+        assert matched_row["image_timestamp_domain"] == "shared_ros_header"
+        assert matched_row["vision_timestamp_domain"] == "shared_ros_header"
         assert spin_until(
             probe,
             lambda: any(int(message.target_lock) == 49 for message in probe.controls),
@@ -226,16 +264,6 @@ def run_mock_case():
         assert_all_safe(probe)
     finally:
         stop_node(process)
-    try:
-        assert_alignment_status(
-            alignment_csv_path,
-            "matched",
-            expected_matched_ns=1_000_000_001,
-            expected_delta_ns=0,
-            expected_latest_ns=2_000_000_001,
-            expected_latest_received_ns=2_000_000_001,
-        )
-    finally:
         if os.path.exists(alignment_csv_path):
             os.unlink(alignment_csv_path)
 
@@ -273,8 +301,11 @@ def run_incomparable_alignment_case():
         assert wait_for_graph(probe), "ROS graph discovery did not complete"
         assert spin_until(probe, lambda: bool(probe.controls), 5.0)
         probe.publish_vision(3)
-        time.sleep(0.1)
-        probe.publish_image(3)
+        incomparable_row = wait_for_alignment_status(
+            probe, alignment_csv_path, 3, "incomparable")
+        assert incomparable_row["matched_stamp_ns"] == "0"
+        assert incomparable_row["image_timestamp_domain"] == "image_header"
+        assert incomparable_row["vision_timestamp_domain"] == "vision_header"
         assert spin_until(
             probe,
             lambda: any(int(message.target_lock) == 49 for message in probe.controls),
@@ -288,9 +319,6 @@ def run_incomparable_alignment_case():
                    for message in locked)
     finally:
         stop_node(process)
-    try:
-        assert_alignment_status(alignment_csv_path, "incomparable")
-    finally:
         if os.path.exists(alignment_csv_path):
             os.unlink(alignment_csv_path)
 

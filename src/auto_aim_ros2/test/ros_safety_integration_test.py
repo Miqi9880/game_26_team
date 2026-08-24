@@ -76,6 +76,7 @@ def start_node(
     mock_target=False,
     input_timeout_ms=100,
     mock_yaw_rad=0.0,
+    vehicle_profile="new_turtle",
     assume_shared_ros_clock=False,
     alignment_tolerance_ns=-1,
     alignment_csv_path="",
@@ -98,6 +99,8 @@ def start_node(
         f"mock_target:={'true' if mock_target else 'false'}",
         "-p",
         f"mock_yaw_rad:={mock_yaw_rad}",
+        "-p",
+        f"vehicle_profile:={vehicle_profile}",
         "-p",
         f"vision_time_alignment_assume_shared_ros_clock:={'true' if assume_shared_ros_clock else 'false'}",
         "-p",
@@ -208,6 +211,10 @@ def wait_for_alignment_status(probe, path, image_sec, expected_status,
 def assert_all_safe(probe):
     assert probe.controls, "AutoAimNode did not publish /Robot_ctrl_data"
     assert all(int(message.fire_command) == 0 for message in probe.controls)
+    assert all(abs(float(message.yaw_vel)) == 0.0 for message in probe.controls)
+    assert all(abs(float(message.yaw_acc)) == 0.0 for message in probe.controls)
+    assert all(abs(float(message.pitch_vel)) == 0.0 for message in probe.controls)
+    assert all(abs(float(message.pitch_acc)) == 0.0 for message in probe.controls)
 
 
 def run_mock_case():
@@ -323,6 +330,19 @@ def run_incomparable_alignment_case():
             os.unlink(alignment_csv_path)
 
 
+def run_unselected_profile_case():
+    process = start_node("mock", mock_target=True, vehicle_profile="unselected")
+    try:
+        assert wait_for_graph(probe), "ROS graph discovery did not complete"
+        assert spin_until(probe, lambda: bool(probe.controls), 5.0)
+        probe.publish_image(4)
+        assert spin_until(probe, lambda: len(probe.controls) >= 2, 1.0)
+        assert_all_safe(probe)
+        assert all(int(message.target_lock) == 50 for message in probe.controls)
+    finally:
+        stop_node(process)
+
+
 def main():
     global probe
     # Keep this CTest independent of unrelated ROS nodes in the developer's
@@ -339,9 +359,11 @@ def main():
         run_incomparable_alignment_case()
         probe.controls.clear()
         run_null_case()
+        probe.controls.clear()
+        run_unselected_profile_case()
         print(
             "ros_safety_integration_test: matched/incomparable diagnostics, "
-            "mock lock, timeout, invalid timestamp, fire=0 OK"
+            "mock lock, timeout, invalid timestamp, profile fail-closed, fire=0 OK"
         )
     finally:
         probe.destroy_node()

@@ -1,9 +1,3 @@
-/*这个头文件只声明四项可离线测试的安全逻辑：
-- 按序列号安全选择相机；
-- 计算 rgb8 缓冲区大小；
-- 检查参数是否为有限值且处于范围内；
-- 把 SDK 返回码格式化成可读的十六进制。 */
-
 #ifndef HIK_CAMERA__CAMERA_SAFETY_HPP_
 #define HIK_CAMERA__CAMERA_SAFETY_HPP_
 

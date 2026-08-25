@@ -1,0 +1,28 @@
+# Synthetic evidence-tool input only. These identifiers and board values are
+# not competition camera calibration and must not be copied into production.
+schema_version: 1
+profile: evidence_only
+
+board:
+  type: chessboard
+  inner_corners_cols: 9
+  inner_corners_rows: 6
+  square_size_m: 0.030
+
+image:
+  width_px: 640
+  height_px: 480
+  pipeline: raw_image_no_resize_no_crop_no_rectify
+
+acceptance:
+  min_accepted_views: 10
+  max_global_rms_reprojection_error_px: 0.5
+
+metadata:
+  report_id: synthetic-camera-calibration-test
+  camera_serial: synthetic-camera
+  lens_identifier: synthetic-lens
+  acquisition_date: "2026-08-25"
+  operator: automated-test
+  code_commit: 7f452ef
+  dataset_id: synthetic-project-points-v1

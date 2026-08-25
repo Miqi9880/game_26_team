@@ -22,6 +22,7 @@ find_package(OpenVINO CONFIG QUIET COMPONENTS Runtime)
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/auto_aim_core.cpp
   src/auto_aim_node.cpp
+  src/camera_calibration.cpp
   src/offline_pipeline.cpp
   src/pnp_stage.cpp
   src/raw_armor_detector.cpp
@@ -74,6 +75,13 @@ install(TARGETS auto_aim_offline
   DESTINATION lib/${PROJECT_NAME}
 )
 
+add_executable(auto_aim_camera_calibrate src/auto_aim_camera_calibrate.cpp)
+target_link_libraries(auto_aim_camera_calibrate ${PROJECT_NAME})
+target_include_directories(auto_aim_camera_calibrate PRIVATE include)
+install(TARGETS auto_aim_camera_calibrate
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -108,6 +116,15 @@ if(BUILD_TESTING)
   ament_auto_add_gtest(
     vision_time_alignment_test
     test/vision_time_alignment_test.cpp
+  )
+  ament_auto_add_gtest(
+    camera_calibration_test
+    test/camera_calibration_test.cpp
+  )
+  target_compile_definitions(
+    camera_calibration_test PRIVATE
+    CAMERA_CALIBRATION_TEST_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/data/camera_calibration_test.yaml"
+    CAMERA_CALIBRATION_EXECUTABLE_PATH="$<TARGET_FILE:auto_aim_camera_calibrate>"
   )
   target_compile_definitions(
     pnp_stage_test PRIVATE

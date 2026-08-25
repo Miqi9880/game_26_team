@@ -371,6 +371,11 @@ def _validate_sequence_and_frames(analysis: Analysis) -> None:
         if current < previous:
             analysis.error("frame_rollback", f"frame number rolled back from {previous} to {current}", value=current)
 
+    track_ids = [row.values.get("track_id") for row in analysis.records if isinstance(row.values.get("track_id"), int)]
+    for previous, current in zip(track_ids, track_ids[1:]):
+        if current < previous:
+            analysis.error("track_id_rollback", f"track_id rolled back from {previous} to {current}", value=current)
+
     # Missing frame IDs are useful evidence of dropped/filtered frames but are
     # a warning rather than a malformed CSV.  Keep the complete list bounded
     # for pathological input while retaining the total count.

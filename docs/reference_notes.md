@@ -93,4 +93,4 @@ production 配置。
 1. 获取正式比赛模型后，核对输入尺寸、颜色顺序、预处理、输出 shape、类别/颜色/大小语义和四点顺序，并加入版本化 profile。
 2. 使用比赛相机和实际分辨率完成 K/D、装甲尺寸、camera→gimbal 外参和误差报告；在此之前继续拒绝 production PnP 配置。
 3. 用带时间戳的离线帧验证跟踪、延迟补偿和预测；所有调参结果附带 commit、模型、标定和数据集版本。
-4. 在电控确认速度/加速度单位、绝对零点、四元数方向、golden frame、watchdog 和开火语义前，保持外部速度/加速度为 0，`fire_command=0`。
+4. 速度/加速度单位和 Vision/RobotCtrl 共享上电原点已确认；在电控确认前馈控制语义、四元数方向、golden frame、车型 watchdog 精确值和开火语义前，保持外部速度/加速度为 0，`fire_command=0`。

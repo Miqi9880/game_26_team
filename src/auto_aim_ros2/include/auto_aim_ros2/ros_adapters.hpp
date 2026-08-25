@@ -3,6 +3,7 @@
 
 #include "auto_aim_interfaces/msg/robot_ctrl.hpp"
 #include "auto_aim_interfaces/msg/vision.hpp"
+#include "control_interface_constraints.hpp"
 #include "auto_aim_ros2/angle_units.hpp"
 #include "auto_aim_ros2/auto_aim_core.hpp"
 
@@ -15,8 +16,9 @@ namespace rm_auto_aim::ros_adapters
 inline std::optional<pipeline::VisionState> to_algorithm_vision(
   const auto_aim_interfaces::msg::Vision & message)
 {
-  // Vision.msg and VisionData carry position angles in degree.  Convert only
-  // at this ROS/algorithm boundary; do not repeat this in the serial bridge.
+  // Vision.msg and VisionData carry positions in degree and velocities in
+  // degree/s.  Convert only at this ROS/algorithm boundary; do not repeat
+  // conversion in the serial bridge.
   // A Vision message is a stamped sensor sample, not a duration.  Reject
   // negative, unset, or non-canonical ROS time values rather than allowing an
   // invalid timestamp to participate in freshness or replay decisions later.
@@ -40,7 +42,10 @@ inline std::optional<pipeline::VisionState> to_algorithm_vision(
   state.id = message.id;
   state.mode = message.mode;
   state.yaw_rad = units::degrees_to_radians(message.yaw);
+  state.yaw_vel_rad_s = units::degrees_per_second_to_radians_per_second(message.yaw_vel);
   state.pitch_rad = units::degrees_to_radians(message.pitch);
+  state.pitch_vel_rad_s =
+    units::degrees_per_second_to_radians_per_second(message.pitch_vel);
   state.roll_rad = units::degrees_to_radians(message.roll);
   state.shoot_speed_mps = message.shoot_speed;
   state.bullet_count = message.bullet_count;
@@ -51,20 +56,39 @@ inline std::optional<pipeline::VisionState> to_algorithm_vision(
     }
     state.quaternion_wxyz[index] = message.quaternion[index];
   }
-  if (!units::finite(state.yaw_rad) || !units::finite(state.pitch_rad) ||
+  if (!units::finite(state.yaw_rad) || !units::finite(state.yaw_vel_rad_s) ||
+    !units::finite(state.pitch_rad) || !units::finite(state.pitch_vel_rad_s) ||
     !units::finite(state.roll_rad))
   {
     return std::nullopt;
   }
-  // yaw_vel/pitch_vel are deliberately checked above but not copied: their
-  // external unit is unconfirmed and the algorithm has no valid conversion.
+  // Converted Vision velocity is retained only for diagnostic completeness.
+  // It must not cross into Tracker, Aimer, RobotCtrl, quaternion handling,
+  // or time-alignment control decisions in this phase.
   return state;
 }
 
-inline auto to_ros(const pipeline::AimCommand & command)
-  -> auto_aim_interfaces::msg::RobotCtrl
+struct RobotCtrlAdapterResult
 {
-  auto message = auto_aim_interfaces::msg::RobotCtrl{};
+  auto_aim_interfaces::msg::RobotCtrl message{};
+  auto_aim_interfaces::control::PositionConstraint position_constraint{};
+  bool valid_command{false};
+
+  bool accepted() const noexcept
+  {
+    return valid_command && position_constraint.accepted();
+  }
+};
+
+inline auto to_ros_with_profile(
+  const pipeline::AimCommand & command,
+  const auto_aim_interfaces::control::VehicleProfile vehicle_profile)
+  -> RobotCtrlAdapterResult
+{
+  RobotCtrlAdapterResult result{};
+  auto & message = result.message;
+  message.target_lock = pipeline::kTargetUnlocked;
+  message.fire_command = pipeline::kFireNone;
   const bool valid_target_lock = command.target_lock == pipeline::kTargetLocked ||
     command.target_lock == pipeline::kTargetUnlocked;
   const bool valid_fire_command = command.fire_command == pipeline::kFireNone ||
@@ -80,31 +104,44 @@ inline auto to_ros(const pipeline::AimCommand & command)
   if (!valid_target_lock || !valid_fire_command || fire_requires_lock || !finite_angles) {
     message.target_lock = pipeline::kTargetUnlocked;
     message.fire_command = pipeline::kFireNone;
-    return message;
+    return result;
   }
 
   // AimCommand is internal rad.  RobotCtrl.msg/RobotCtrlData are degree for
-  // position angles, so convert exactly once at this output boundary.
-  message.yaw = units::finite(command.yaw_rad) ? units::radians_to_degrees(command.yaw_rad) : 0.0F;
-  message.pitch = units::finite(command.pitch_rad) ?
-    units::radians_to_degrees(command.pitch_rad) : 0.0F;
-  if (!units::finite(message.yaw) || !units::finite(message.pitch)) {
-    message.yaw = 0.0F;
-    message.pitch = 0.0F;
-    message.target_lock = pipeline::kTargetUnlocked;
-    message.fire_command = pipeline::kFireNone;
-    return message;
+  // position angles, so convert exactly once at this output boundary and
+  // apply the shared yaw/pitch safety contract in external units.
+  const auto yaw_degree = units::radians_to_degrees(command.yaw_rad);
+  const auto pitch_degree = units::radians_to_degrees(command.pitch_rad);
+  result.position_constraint = auto_aim_interfaces::control::constrain_position_degrees(
+    yaw_degree, pitch_degree, vehicle_profile);
+  if (!result.position_constraint.accepted()) {
+    return result;
   }
-  // External velocity/acceleration units are not confirmed.  Never send the
-  // internal rad/s or rad/s^2 values over ROS/serial until the contract is
-  // confirmed by the electrical-control team.
+  message.yaw = result.position_constraint.yaw_degree;
+  message.pitch = result.position_constraint.pitch_degree;
+  // The units are confirmed (degree/s and degree/s^2), but MCU feedforward
+  // control semantics are not.  Never send internal rad/s or rad/s^2 values
+  // over ROS/serial in this phase: all four hardware-facing fields stay zero.
   message.yaw_vel = 0.0F;
   message.yaw_acc = 0.0F;
   message.pitch_vel = 0.0F;
   message.pitch_acc = 0.0F;
   message.target_lock = command.target_lock;
-  message.fire_command = command.fire_command;
-  return message;
+  // This is the production-facing ROS control boundary.  No reviewed fire
+  // authorization or MCU pulse/level contract exists yet, so an otherwise
+  // valid internal request must never become RobotCtrlData fire=1/2.
+  message.fire_command = pipeline::kFireNone;
+  result.valid_command = true;
+  return result;
+}
+
+inline auto to_ros(
+  const pipeline::AimCommand & command,
+  const auto_aim_interfaces::control::VehicleProfile vehicle_profile =
+    auto_aim_interfaces::control::VehicleProfile::Unselected)
+  -> auto_aim_interfaces::msg::RobotCtrl
+{
+  return to_ros_with_profile(command, vehicle_profile).message;
 }
 
 inline pipeline::AimCommand force_dry_run_safe(pipeline::AimCommand command) noexcept

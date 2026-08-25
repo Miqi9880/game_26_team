@@ -11,9 +11,10 @@ namespace rm_auto_aim::serial_ros
 {
 
 // These helpers are deliberately raw field mappings.  VisionData and
-// RobotCtrlData use degree for position angles, and the ROS messages use the
-// same external units.  Unit conversion belongs only to auto_aim_ros2's
-// algorithm adapter, never in this serial package.
+// RobotCtrlData, as well as their ROS messages, use degree for position,
+// degree/s for velocity, and degree/s^2 for acceleration.  Quaternion is
+// copied as wxyz without interpreting its direction.  Unit conversion belongs
+// only to auto_aim_ros2's algorithm adapter, never in this serial package.
 inline auto to_ros_vision(const io::VisionData & data)
   -> auto_aim_interfaces::msg::Vision
 {

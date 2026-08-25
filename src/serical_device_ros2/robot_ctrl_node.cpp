@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 #include <rclcpp/rclcpp.hpp>
 #include "robot_ctrl_safety.hpp"
@@ -10,11 +11,6 @@
 
 namespace rm_auto_aim
 {
-namespace
-{
-constexpr auto kControlPeriod = std::chrono::milliseconds(10);  // 100 Hz
-}  // namespace
-
 class RobotCtrlSub : public rclcpp::Node
 {
 public:
@@ -25,8 +21,15 @@ public:
 
     const auto serial_device = this->declare_parameter<std::string>(
       "serial_device", "/dev/robomaster");
-    const auto serial_enabled = this->declare_parameter<bool>("serial_enabled", false);
-    allow_fire_ = this->declare_parameter<bool>("allow_fire", false);
+    const auto serial_requested = this->declare_parameter<bool>("serial_enabled", false);
+    dry_run_ = this->declare_parameter<bool>("dry_run", true);
+    const auto allow_fire_requested = this->declare_parameter<bool>("allow_fire", false);
+    allow_fire_ = false;
+    if (allow_fire_requested) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "allow_fire was requested but is disabled until fire timing semantics are confirmed");
+    }
     fire_burst_command_ = this->declare_parameter<int>("fire_burst_command", 1);
     fire_single_command_ = this->declare_parameter<int>("fire_single_command", 2);
     if (fire_burst_command_ <= 0 || fire_burst_command_ > 127 ||
@@ -40,19 +43,45 @@ public:
       allow_fire_ = false;
     }
 
+    const auto vehicle_profile_name = this->declare_parameter<std::string>(
+      "vehicle_profile", "unselected");
+    const auto parsed_profile = auto_aim_interfaces::control::parse_vehicle_profile(
+      vehicle_profile_name);
+    if (!parsed_profile.has_value()) {
+      throw std::invalid_argument(
+              "vehicle_profile must be unselected, new_turtle, or dog_leg");
+    }
+    vehicle_profile_ = *parsed_profile;
+
+    output_hz_ = this->declare_parameter<double>("output_hz", 100.0);
+    input_timeout_ms_ = this->declare_parameter<int>("input_timeout_ms", 100);
+    const auto control_period = safety::control_period_from_hz(output_hz_);
+    if (!control_period.has_value() || input_timeout_ms_ <= 0) {
+      throw std::invalid_argument(
+              "output_hz must produce a positive timer period and input_timeout_ms must be positive");
+    }
+    const auto input_timeout_ns = static_cast<std::int64_t>(input_timeout_ms_) * 1'000'000LL;
+
     serial.SetDevicePath(serial_device);
     safety_ = std::make_unique<safety::RobotCtrlSafety>(
       safety::Config{
         allow_fire_, static_cast<std::int8_t>(fire_burst_command_),
-        static_cast<std::int8_t>(fire_single_command_)});
+        static_cast<std::int8_t>(fire_single_command_), vehicle_profile_, input_timeout_ns});
 
+    const auto serial_enabled = serial_requested && !dry_run_;
+    if (serial_requested && dry_run_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "serial_enabled was requested but dry_run=true; keeping the serial device closed");
+    }
     if (serial_enabled && !serial.Enable())
     {
       RCLCPP_ERROR(this->get_logger(), "Unable to open serial device '%s'", serial_device.c_str());
     }
     else if (!serial_enabled)
     {
-      RCLCPP_INFO(this->get_logger(), "Serial disabled; RobotCtrlSub is running in dry-run mode");
+      RCLCPP_INFO(
+        this->get_logger(), "Serial disabled; RobotCtrlSub will not write a device");
     }
 
     subscription_ = this->create_subscription<auto_aim_interfaces::msg::RobotCtrl>(
@@ -60,9 +89,14 @@ public:
       std::bind(&RobotCtrlSub::robotCtrlReceive, this, std::placeholders::_1));
 
     timer_ = this->create_wall_timer(
-      kControlPeriod, std::bind(&RobotCtrlSub::sendControl, this));
+      *control_period, std::bind(&RobotCtrlSub::sendControl, this));
 
-    RCLCPP_INFO(this->get_logger(), "-- RobotCtrlSub Node Started (100 Hz output) --");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "-- RobotCtrlSub started: profile=%s output_hz=%.2f timeout_ms=%d dry_run=%s "
+      "serial_enabled=%s fire=disabled --",
+      auto_aim_interfaces::control::vehicle_profile_name(vehicle_profile_), output_hz_,
+      input_timeout_ms_, dry_run_ ? "true" : "false", serial_enabled ? "true" : "false");
   }
 
 private:
@@ -87,7 +121,14 @@ private:
     {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 1000,
-        "No fresh valid RobotCtrl input for 100 ms; sending safe hold command");
+        "No fresh valid RobotCtrl input for %d ms; sending safe hold command",
+        input_timeout_ms_);
+    }
+    if (output.yaw_wrapped || output.pitch_clamped) {
+      RCLCPP_DEBUG_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Applied RobotCtrl position constraints (yaw_wrapped=%s pitch_clamped=%s)",
+        output.yaw_wrapped ? "true" : "false", output.pitch_clamped ? "true" : "false");
     }
 
     serial.SenderMain(output.control);
@@ -98,6 +139,11 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Subscription<auto_aim_interfaces::msg::RobotCtrl>::SharedPtr subscription_;
   bool allow_fire_{false};
+  bool dry_run_{true};
+  double output_hz_{100.0};
+  int input_timeout_ms_{100};
+  auto_aim_interfaces::control::VehicleProfile vehicle_profile_{
+    auto_aim_interfaces::control::VehicleProfile::Unselected};
   int fire_burst_command_{1};
   int fire_single_command_{2};
 };

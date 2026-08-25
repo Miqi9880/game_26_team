@@ -21,10 +21,11 @@ constexpr std::int8_t kFireBurst = 1;
 constexpr std::int8_t kFireSingle = 2;
 
 // VisionState is the ROS input adapter boundary.  Position angles have
-// already been converted from ROS/serial degree to algorithm radians when a
-// value reaches this type.  The serial velocity/acceleration fields are kept
-// outside the core because their external unit is not confirmed; they must
-// not be converted or used as non-zero algorithm motion inputs in this phase.
+// already been converted from ROS/serial degree to algorithm rad and Vision
+// velocities from degree/s to rad/s when a value reaches this type.  These
+// fields are diagnostic-only in the current phase: they are not used for
+// IMU integration, prediction, tracker input, aimer input, or RobotCtrl
+// feedforward.
 struct VisionState
 {
   std::int64_t stamp_ns{0};
@@ -32,7 +33,9 @@ struct VisionState
   std::uint16_t id{0};
   std::uint16_t mode{0};
   float yaw_rad{0.0F};
+  float yaw_vel_rad_s{0.0F};
   float pitch_rad{0.0F};
+  float pitch_vel_rad_s{0.0F};
   float roll_rad{0.0F};
   std::array<float, 4> quaternion_wxyz{{1.0F, 0.0F, 0.0F, 0.0F}};
   float shoot_speed_mps{0.0F};

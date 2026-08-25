@@ -23,7 +23,9 @@ VisionData degree
 → RobotCtrlData degree
 ```
 
-串口桥只做字段映射，不做角度转换。外部速度/加速度单位尚未由电控确认，因此当前 ROS/串口输出适配层固定为 0。
+串口桥只做字段映射，不做角度转换。外部速度单位为 degree/s、加速度单位为 degree/s²，
+但 MCU 前馈控制语义尚未确认，因此当前 ROS/串口输出适配层固定为 0。独立控制约束层负责
+yaw 环绕和车型 pitch 预限幅；离线 Aimer 的 relative 输出仍不能直接作为 RobotCtrl 绝对角。
 
 ## Aimer 模式
 

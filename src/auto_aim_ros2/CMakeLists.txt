@@ -118,7 +118,10 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/test/ros_safety_integration_test.py
   )
-  set_tests_properties(ros_safety_integration_test PROPERTIES TIMEOUT 30)
+  # Two isolated rounds start several ROS process groups and deliberately
+  # exercise watchdog timeouts.  Give their Python signal/atexit cleanup a
+  # realistic budget rather than terminating it before child groups are reaped.
+  set_tests_properties(ros_safety_integration_test PROPERTIES TIMEOUT 120)
 endif()
 
 ament_auto_package()

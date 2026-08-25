@@ -11,5 +11,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES std_msgs
 )
 
+install(DIRECTORY include/
+  DESTINATION include
+)
+
+ament_export_include_directories(include)
 ament_export_dependencies(rosidl_default_runtime std_msgs)
 ament_package()

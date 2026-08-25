@@ -78,12 +78,14 @@ VisionData degree
   → RobotCtrlData degree（RobotCtrlSub 原样透传）
 ```
 
-`yaw`、`pitch`、`roll` 的外部位置单位是 degree；核心字段明确带 `_rad`。
-`yaw_vel`、`pitch_vel`、`yaw_acc`、`pitch_acc` 的外部单位尚未由电控确认，
-因此 ROS 输出适配层当前强制它们为 `0`，不得把内部 rad/s 或 rad/s² 直接发送。
-Vision 输入中的对应速度字段只做有限值检查，不进入算法核心。
+`yaw`、`pitch`、`roll` 的外部位置单位是 degree，角速度是 degree/s，角加速度是 degree/s²；
+核心字段明确使用 rad、rad/s、rad/s²。单位已经由电控确认，但 MCU 前馈控制语义仍未确认，
+因此 ROS 输出适配层当前强制四个运动字段为 `0`，不得把内部 rad/s 或 rad/s² 直接发送。
+Vision 输入中的速度会转换为诊断值，但不进入算法核心控制。
 
-`VisionState` 保存已转换的 Vision 角度、四元数 wxyz 和比赛记录字段，
+`VisionState` 保存已转换的 Vision 角度/速度、四元数 wxyz 和比赛记录字段；四元数表示相对
+上电原点的姿态证据，但不解释 IMU/world 方向、不做旋转或积分。Vision 与 RobotCtrl 共享
+上电控制参考系，PnP 相对角仍不能直接成为绝对控制角。
 但当前不解释 quaternion 的世界方向，不把 Vision 绝对角写入 PnP 相对角或
 RobotCtrl 绝对目标角。`id`、`mode`、`bullet_count`、`game_progress` 目前只记录；
 其中 `mode=33` 作为协议字段透传，不在算法中到处硬编码。
@@ -138,8 +140,8 @@ PnP 配置的场景；手工探针不能被未运行误写成已验证。
 dry_run=true
 allow_fire=false
 mock_target=false
-output_hz=100
-input_timeout_ms=100
+  output_hz=100       # 保守默认，可按实测提高到数百 Hz
+  input_timeout_ms=100
 ```
 
 `dry_run=true` 时无论配置如何都强制 `fire_command=0`。`mock_target=true` 仅用于离线验证锁定和角度字段，角度由参数直接提供，不能当作真实相机坐标转换。
@@ -204,7 +206,7 @@ CSV 和 10 张标注图均成功生成；其中一帧目视检查显示四点形
 - 新模型颜色/类别语义，以及旧模型的 class mapping 是否完全失效；
 - 正式比赛相机内参、装甲物理尺寸、camera→gimbal 外参及其测量证据；当前仓库只提供 test-only 合成 PnP 配置；
 - 新比赛模型的关键点语义。参考 YOLOv5 的 TL,TR,BR,BL 顺序只在 test-only smoke 中使用，循环错位无法仅靠四边形几何可靠识别，必须人工核验；
-- ROS/算法适配层的 degree↔rad 边界已固定，但 Vision 绝对角的零点、RobotCtrl 绝对角的零点和二者关系仍需电控确认；
+- ROS/算法适配层的 degree/rad、degree/s↔rad/s、degree/s²↔rad/s² 边界已固定；PnP camera→control 外参、安装关系和正式标定仍待确认；
 - 正式 Tracker/Target EKF 参数和运动模型；当前离线 Tracker 只做有限差分与 fail-closed 跳变检查；
 - Aimer 弹道模型和 bullet speed 来源；
 - target_lock/fire_command 的硬件时序；

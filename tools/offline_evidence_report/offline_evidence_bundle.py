@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -69,9 +70,32 @@ CSV_REPORT_METADATA_KEYS = {
     "dataset_id",
     "source_label",
 }
-SENSITIVE_KEY_RE = re.compile(r"(?:token|password|passwd|secret|api[_-]?key|credential)", re.I)
-ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_>])(?:[A-Za-z]:[\\/]|/)(?:[^\s'\"`;,]+)"
+_SENSITIVE_NAME = (
+    r"(?:access[-_]?token|refresh[-_]?token|auth[-_]?token|"
+    r"client[-_]?secret|api[-_]?key|private[-_]?key|"
+    r"password|passwd|secret|credential|token)"
+)
+SENSITIVE_KEY_RE = re.compile(_SENSITIVE_NAME, re.I)
+_SENSITIVE_QUOTED_RE = re.compile(
+    rf'''(?ix)
+    (?P<prefix>(?<![\w-])(?:--?|/)?{_SENSITIVE_NAME}(?![\w-])\s*(?:=|:|\s+)\s*)
+    (?P<quote>["']) (?P<value>[^\r\n]*?) (?P=quote)
+    '''
+)
+_SENSITIVE_UNQUOTED_RE = re.compile(
+    rf'''(?ix)
+    (?P<prefix>(?<![\w-])(?:--?|/)?{_SENSITIVE_NAME}(?![\w-])\s*(?:=|:|\s+)\s*)
+    (?P<value>[^\s"';,\r\n]+)
+    '''
+)
+_BEARER_QUOTED_RE = re.compile(r'''(?ix)(?P<prefix>\bbearer\s+)(?P<quote>["'])(?P<value>[^\r\n]*?)(?P=quote)''')
+_BEARER_UNQUOTED_RE = re.compile(r'''(?ix)(?P<prefix>\bbearer\s+)(?P<value>[^\s"';,\r\n]+)''')
+_ABSOLUTE_PATH_PREFIX = r"(?:/[A-Za-z0-9_~.-]|//|[A-Za-z]:[\\/]|\\\\)"
+_QUOTED_ABSOLUTE_PATH_RE = re.compile(
+    rf'''(?P<quote>["'])(?P<path>{_ABSOLUTE_PATH_PREFIX}[^\r\n]*?)(?P=quote)'''
+)
+_UNQUOTED_ABSOLUTE_PATH_RE = re.compile(
+    rf'''(?<![\w])(?P<path>{_ABSOLUTE_PATH_PREFIX}[^\r\n"'`;|&,]+?)(?=\s+(?:--?[A-Za-z0-9_]|/[A-Za-z0-9_]|[A-Za-z]:[\\/]|\\\\)|[;|&,]|$)'''
 )
 HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -83,42 +107,32 @@ def _safe_name(value: Any) -> str:
 
 
 def _redact_text(value: str) -> str:
-    """Remove absolute path and common bearer/token material from text."""
+    """Remove absolute paths and sensitive command arguments from text."""
     text = str(value)
-    # Handle quoted values before the unquoted form so a command such as
-    # ``--password \"value with spaces\"`` does not leak the tail of the
-    # quoted value.  Keep the option spelling and quote delimiters for a
-    # useful, non-secret producer command record.
-    text = re.sub(
-        r'''(?ix)((?<![\w-])(?:--?|/)?(?:token|password|passwd|secret|api[-_]?key|credential)(?![\w-])\s*(?:=|:|\s+)\s*)(["'])([^\r\n]*?)(\2)''',
-        r"\1<redacted>",
-        text,
-    )
-    # Bearer credentials are commonly quoted in generated shell commands;
-    # redact the whole quoted value before the generic one-token fallback.
-    text = re.sub(
-        r'''(?ix)(\bbearer\s+)(["'])([^\r\n]*?)(\2)''',
-        r"\1<redacted>",
-        text,
-    )
-    text = re.sub(r"(?i)(\bbearer\s+|\btoken\s*[:=]\s*)[^\s]+", r"\1<redacted>", text)
+    # Handle quoted values before unquoted values so ``--client-secret
+    # "multi word"`` cannot leak the tail of the quoted secret.  Keep the
+    # option spelling and replace only the value for a useful command record.
+    text = _SENSITIVE_QUOTED_RE.sub(lambda match: f"{match.group('prefix')}<redacted>", text)
+    text = _BEARER_QUOTED_RE.sub(lambda match: f"{match.group('prefix')}<redacted>", text)
+    text = _SENSITIVE_UNQUOTED_RE.sub(lambda match: f"{match.group('prefix')}<redacted>", text)
+    text = _BEARER_UNQUOTED_RE.sub(lambda match: f"{match.group('prefix')}<redacted>", text)
     text = re.sub(r"(?i)(ghp_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_\-]+", "<redacted>", text)
-    text = re.sub(
-        r"(?i)((?<![\w-])(?:--?|/)?(?:token|password|passwd|secret|api[-_]?key|credential)(?![\w-])\s*(?:=|:)\s*)([\"']?)[^\s\"';,]+\2",
-        r"\1<redacted>",
-        text,
-    )
-    text = re.sub(
-        r"(?i)((?<![\w-])(?:--?|/)?(?:token|password|passwd|secret|api[-_]?key|credential)(?![\w-])\s+)([\"']?)[^\s\"';,]+\2",
-        r"\1<redacted>",
-        text,
-    )
 
     def replace_path(match: re.Match[str]) -> str:
-        candidate = match.group(0)
-        return "<path>/" + _safe_name(candidate)
+        candidate = match.group("path").rstrip()
+        basename = _safe_name(candidate)
+        # A path basename can itself contain a credential-like marker
+        # (e.g. ``WINDOW_SECRET.csv``).  Preserve harmless basenames for
+        # traceability, but never echo a sensitive-looking filename.
+        if SENSITIVE_KEY_RE.search(basename):
+            basename = "<redacted>"
+        return "<path>/" + basename
 
-    return ABSOLUTE_PATH_RE.sub(replace_path, text)
+    # Redact quoted paths first, then unquoted drive/UNC paths.  The unquoted
+    # expression consumes spaces until a shell option or delimiter, preventing
+    # ``C:\\Program Files\\secret.csv`` from leaking ``Program Files``.
+    text = _QUOTED_ABSOLUTE_PATH_RE.sub(replace_path, text)
+    return _UNQUOTED_ABSOLUTE_PATH_RE.sub(replace_path, text)
 
 
 def _safe_metadata(metadata: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -208,22 +222,206 @@ def _artifact(role: str, path: Path, bundle_root: Path) -> dict[str, Any]:
     }
 
 
-def _copy_file(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.resolve(strict=False) == destination.resolve(strict=False):
-        return
-    shutil.copyfile(source, destination)
+def _same_path_or_file(left: Path, right: Path) -> bool:
+    """Return true when two paths name the same path or filesystem object.
+
+    ``Path.resolve`` catches lexical aliases and symlinks even when the target
+    does not exist yet.  ``samefile`` additionally catches hardlinks, which is
+    the important case for a destination that would otherwise truncate an
+    input file (or a file outside the bundle) through a second directory
+    entry.
+    """
+    try:
+        if left.resolve(strict=False) == right.resolve(strict=False):
+            return True
+    except (OSError, RuntimeError):
+        pass
+    try:
+        return left.exists() and right.exists() and os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return False
 
 
-def _copy_text_redacted(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(_redact_text(source.read_text(encoding="utf-8")), encoding="utf-8")
+def _lexical_relative(path: Path, root: Path) -> Optional[Path]:
+    """Return a lexical relative path without following symlinks."""
+    try:
+        return path.absolute().relative_to(root.absolute())
+    except (ValueError, OSError):
+        return None
 
 
-def _copy_annotated(source: Path, destination: Path) -> list[Path]:
+def _ensure_output_parent(destination: Path, bundle_root: Path) -> None:
+    """Create/check destination parents without traversing symlink aliases."""
+    root = bundle_root
+    _ensure_bundle_root(root)
+
+    relative = _lexical_relative(destination, root)
+    if relative is None or not relative.parts:
+        raise OSError("destination is outside bundle output directory")
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise OSError(f"destination parent is a symlink: {part}")
+        if current.exists():
+            if not current.is_dir():
+                raise OSError(f"destination parent is not a directory: {part}")
+        else:
+            # Create one component at a time so a symlink cannot be silently
+            # accepted by ``mkdir(parents=True)`` between checks.
+            current.mkdir()
+        if current.is_symlink():
+            raise OSError(f"destination parent became a symlink: {part}")
+
+
+def _ensure_bundle_root(root: Path) -> None:
+    """Create the bundle root only when it is a real directory."""
+    root = Path(root)
+    absolute = Path(os.path.abspath(os.fspath(root)))
+    # Do not create through a symlinked ancestor.  A check of ``root`` alone
+    # is insufficient for ``link-to-external/new-bundle`` because mkdir would
+    # otherwise create the bundle outside the caller's intended tree.
+    for ancestor in (absolute, *absolute.parents):
+        try:
+            info = os.lstat(ancestor)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(f"unable to inspect output path component: {ancestor}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError(f"output path contains a symlink component: {ancestor.name or ancestor}")
+        if ancestor != absolute and not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"output path component is not a directory: {ancestor}")
+    if root.is_symlink():
+        raise OSError("bundle output directory must not be a symlink")
+    if root.exists() and not root.is_dir():
+        raise OSError("bundle output path is not a directory")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise OSError("bundle output directory is not a real directory")
+
+
+def _ensure_empty_output_root(root: Path) -> None:
+    """Allow only a new or genuinely empty output directory.
+
+    Reusing a directory is ambiguous: old optional artifacts can survive a
+    subsequent run and become undeclared evidence.  Refusing the run before
+    creating any generated file is safer than trying to infer which files are
+    ours or deleting user data.  The normal per-file gates remain in place for
+    symlink/hardlink races and for callers of the lower-level helpers.
+    """
+    root = Path(root)
+    existed = root.exists() or root.is_symlink()
+    _ensure_bundle_root(root)
+    if existed:
+        try:
+            with os.scandir(root) as entries:
+                first = next(entries, None)
+        except OSError as exc:
+            raise OSError(f"unable to inspect existing output directory: {exc}") from exc
+        if first is not None:
+            raise OSError("output directory must be empty; refusing to reuse stale bundle files")
+
+
+def _prepare_output_destination(
+    destination: Path,
+    bundle_root: Path,
+    protected_sources: Iterable[Path] = (),
+) -> None:
+    """Reject aliases before any operation can write through them.
+
+    Existing regular files with one link are intentionally replaceable: this
+    is what makes rebuilding a bundle deterministic.  Symlinks, hardlinks,
+    directories and non-regular files are never replaceable because doing so
+    could mutate a path outside the bundle or an input alias.
+    """
+    _ensure_output_parent(destination, bundle_root)
+    if destination.is_symlink():
+        raise OSError(f"destination is a symlink: {destination.name}")
+    if destination.exists():
+        try:
+            info = destination.stat()
+        except OSError as exc:
+            raise OSError(f"unable to stat destination {destination.name}: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"destination is not a regular file: {destination.name}")
+        if info.st_nlink > 1:
+            raise OSError(f"destination is a hardlink alias: {destination.name}")
+    for source in protected_sources:
+        if _same_path_or_file(Path(source), destination):
+            raise OSError(f"destination aliases input/source: {destination.name}")
+
+
+def _open_output_file(destination: Path, bundle_root: Path, protected_sources: Iterable[Path] = ()):
+    """Open a verified output file without following a destination symlink."""
+    _prepare_output_destination(destination, bundle_root, protected_sources)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        return os.fdopen(os.open(destination, flags, 0o600), "wb")
+    except OSError as exc:
+        raise OSError(f"unable to open safe destination {destination.name}: {exc}") from exc
+
+
+def _copy_file(source: Path, destination: Path, *, bundle_root: Optional[Path] = None, protected_sources: Iterable[Path] = ()) -> None:
+    """Copy a file only after validating the destination and all aliases."""
+    source = Path(source)
+    destination = Path(destination)
+    if bundle_root is None:
+        bundle_root = destination.parent
+    # Reading the source is safe, but a same-file source/destination must never
+    # be treated as a harmless no-op: it is an output/input collision that the
+    # caller should report and keep unchanged.
+    if _same_path_or_file(source, destination):
+        raise OSError("source and destination alias the same file")
+    _prepare_output_destination(destination, bundle_root, tuple(protected_sources) + (source,))
+    try:
+        with source.open("rb") as src, _open_output_file(destination, bundle_root, tuple(protected_sources) + (source,)) as dst:
+            shutil.copyfileobj(src, dst)
+    except OSError:
+        raise
+
+
+def _copy_text_redacted(source: Path, destination: Path, *, bundle_root: Optional[Path] = None, protected_sources: Iterable[Path] = ()) -> None:
+    if bundle_root is None:
+        bundle_root = destination.parent
+    text = source.read_text(encoding="utf-8")
+    if _same_path_or_file(Path(source), Path(destination)):
+        raise OSError("source and destination alias the same file")
+    with _open_output_file(Path(destination), bundle_root, tuple(protected_sources) + (Path(source),)) as handle:
+        handle.write(_redact_text(text).encode("utf-8"))
+
+
+def _ensure_output_directory(destination: Path, bundle_root: Path) -> None:
+    """Create an output subdirectory while rejecting symlink aliases."""
+    destination = Path(destination)
+    _ensure_output_parent(destination / ".codex_output_probe", bundle_root)
+    if destination.is_symlink():
+        raise OSError(f"destination directory is a symlink: {destination.name}")
+    if destination.exists() and not destination.is_dir():
+        raise OSError(f"destination path is not a directory: {destination.name}")
+    if not destination.exists():
+        destination.mkdir()
+    if destination.is_symlink() or not destination.is_dir():
+        raise OSError(f"destination directory is not a real directory: {destination.name}")
+
+
+def _copy_annotated(
+    source: Path,
+    destination: Path,
+    *,
+    bundle_root: Optional[Path] = None,
+    protected_sources: Iterable[Path] = (),
+) -> list[Path]:
     if not source.is_dir():
         raise OSError(f"annotated path is not a directory: {_safe_name(source)}")
-    destination.mkdir(parents=True, exist_ok=True)
+    if bundle_root is None:
+        bundle_root = destination.parent
+    if _same_path_or_file(source, destination) or _resolved_under(destination, source) or _resolved_under(source, destination):
+        raise OSError("annotated source aliases or contains its bundle destination")
+    _ensure_output_directory(destination, bundle_root)
     copied: list[Path] = []
     for item in sorted(source.rglob("*"), key=lambda p: p.as_posix()):
         if item.is_symlink():
@@ -236,7 +434,7 @@ def _copy_annotated(source: Path, destination: Path) -> list[Path]:
         destination_file = destination / relative
         if not _resolved_under(destination_file, destination):
             raise OSError(f"annotated path escapes bundle: {relative}")
-        _copy_file(item, destination_file)
+        _copy_file(item, destination_file, bundle_root=bundle_root, protected_sources=protected_sources)
         copied.append(destination_file)
     return copied
 
@@ -324,14 +522,55 @@ def _check_calibration_promotion(source: Path, errors: list[dict[str, Any]]) -> 
         errors.append(_diagnostic("calibration_promotion", "evidence_only calibration claims production_ready=true"))
 
 
+def _iter_bundle_files(root: Path) -> Iterable[Path]:
+    """Yield bundle entries without following symlinked directories."""
+    if not root.is_dir() or root.is_symlink():
+        return
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = sorted(os.scandir(current), key=lambda item: item.name)
+        except OSError:
+            continue
+        for entry in entries:
+            candidate = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    yield candidate
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(candidate)
+                else:
+                    yield candidate
+            except OSError:
+                yield candidate
+
+
 def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None = None) -> dict[str, Any]:
     """Validate manifest schema, relative paths, roles, sizes and hashes."""
     root = Path(bundle_dir)
     path = Path(manifest_path) if manifest_path is not None else root / "manifest.json"
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    if root.is_symlink():
+        errors.append(_diagnostic("bundle_symlink", "bundle directory must not be a symlink"))
+    elif root.exists() and not root.is_dir():
+        errors.append(_diagnostic("bundle_not_directory", "bundle path is not a directory"))
     if not _resolved_under(path, root):
         errors.append(_diagnostic("manifest_outside_bundle", "manifest path is outside bundle directory"))
+    if path.is_symlink():
+        errors.append(_diagnostic("manifest_symlink", "manifest must not be a symlink"))
+    elif path.exists():
+        try:
+            manifest_info = path.stat()
+            if manifest_info.st_nlink > 1:
+                errors.append(_diagnostic("manifest_hardlink", "manifest must not be a hardlink alias"))
+            if not stat.S_ISREG(manifest_info.st_mode):
+                errors.append(_diagnostic("manifest_not_regular", "manifest must be a regular file"))
+        except OSError as exc:
+            errors.append(_diagnostic("manifest_stat", f"unable to stat manifest: {exc}"))
+    if errors and any(item["code"] in {"bundle_symlink", "bundle_not_directory", "manifest_outside_bundle", "manifest_symlink", "manifest_not_regular", "manifest_hardlink"} for item in errors):
+        return {"status": "FAIL", "errors": errors, "warnings": warnings}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -377,6 +616,21 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
     if not isinstance(artifacts, list):
         errors.append(_diagnostic("manifest_artifacts", "manifest artifacts must be a list"))
         return {"status": "FAIL", "errors": errors, "warnings": warnings}
+    unhashed_files = value.get("unhashed_files")
+    unhashed_paths: set[str] = set()
+    if not isinstance(unhashed_files, list) or any(not isinstance(item, str) for item in unhashed_files):
+        errors.append(_diagnostic("manifest_unhashed_files", "unhashed_files must be a list of strings"))
+    else:
+        for item in unhashed_files:
+            relative = _normal_relpath(item)
+            if relative is None:
+                errors.append(_diagnostic("manifest_unhashed_files", f"unhashed file path is invalid: {item!r}"))
+                continue
+            unhashed_paths.add(relative)
+            if relative != "manifest.json":
+                errors.append(_diagnostic("manifest_unhashed_files", f"only manifest.json may be unhashed: {relative}"))
+        if len(unhashed_paths) != len(unhashed_files):
+            errors.append(_diagnostic("manifest_unhashed_files", "unhashed_files must not contain duplicates"))
     declared_roles = value.get("required_roles")
     if "required_roles" not in value:
         errors.append(_diagnostic("manifest_required_roles", "manifest must declare required_roles"))
@@ -463,12 +717,47 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
         for strict_role in STRICT_ROLES:
             if strict_role not in roles:
                 errors.append(_diagnostic("strict_artifact_missing", f"strict artifact role is missing: {strict_role}", role=strict_role))
+    declared_files = paths | unhashed_paths
+    for candidate in _iter_bundle_files(root):
+        try:
+            relative = candidate.relative_to(root).as_posix()
+        except ValueError:
+            errors.append(_diagnostic("unexpected_bundle_file", f"bundle entry is outside root: {candidate}"))
+            continue
+        if relative not in declared_files:
+            errors.append(_diagnostic("unexpected_bundle_file", f"file is not declared by manifest: {relative}", path=relative))
     return {"status": _bundle_status(errors, warnings), "errors": errors, "warnings": warnings, "artifact_count": len(artifacts)}
 
 
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _write_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    bundle_root: Optional[Path] = None,
+    protected_sources: Iterable[Path] = (),
+) -> None:
+    """Write generated JSON without following symlink/hardlink aliases."""
+    path = Path(path)
+    if bundle_root is None:
+        bundle_root = path.parent
+    payload = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    with _open_output_file(path, bundle_root, protected_sources) as handle:
+        handle.write(payload.encode("utf-8"))
+
+
+def _write_text(
+    path: Path,
+    value: str,
+    *,
+    bundle_root: Optional[Path] = None,
+    protected_sources: Iterable[Path] = (),
+) -> None:
+    """Write generated UTF-8 text through the same safe destination gate."""
+    path = Path(path)
+    if bundle_root is None:
+        bundle_root = path.parent
+    with _open_output_file(path, bundle_root, protected_sources) as handle:
+        handle.write(str(value).encode("utf-8"))
 
 
 def _summary_markdown(manifest: Mapping[str, Any]) -> str:
@@ -534,6 +823,47 @@ def _summary_markdown(manifest: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _rejected_bundle_manifest(root: Path, input_csv: str | Path, mode: str, errors: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return a complete in-memory FAIL manifest when output is unsafe."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "FAIL",
+        "mode": mode if mode in MODES else "evidence_only",
+        "bundle_id": _safe_name(root),
+        "input_csv_name": _safe_name(Path(input_csv)),
+        "metadata": {},
+        "run_identity": {},
+        "csv_report_status": "FAIL",
+        "artifacts": [],
+        "required_roles": list(REQUIRED_ROLES),
+        "strict_roles": list(STRICT_ROLES),
+        "unhashed_files": ["manifest.json"],
+        "diagnostics": {"errors": _redact_data(errors), "warnings": []},
+        "safety_boundary": _boundary(),
+        "unconfirmed_items": list(UNCONFIRMED_ITEMS),
+        "evidence_boundary": {
+            "software_structure_statistics_only": True,
+            "real_hit_rate_computed": False,
+            "hardware_validation": False,
+            "gimbal_closed_loop_validated": False,
+            "firing_validated": False,
+        },
+        "capability_validation": {
+            "production_ready": False,
+            "hardware_validation": False,
+            "gimbal_closed_loop_validated": False,
+            "firing_validated": False,
+            "real_hit_rate_computed": False,
+            "competition_result": False,
+        },
+        "artifact_presence": {key: False for key in (
+            "input_csv", "csv_report_json", "csv_report_markdown", "summary",
+            "run_metadata", "camera_intrinsic_report", "model_profile", "pnp_config",
+            "annotated_png", "producer_command",
+        )},
+    }
+
+
 def build_bundle(
     input_csv: str | Path,
     output_dir: str | Path,
@@ -548,9 +878,20 @@ def build_bundle(
 ) -> dict[str, Any]:
     """Build a bundle and return the JSON-compatible manifest object."""
     root = Path(output_dir)
-    root.mkdir(parents=True, exist_ok=True)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    try:
+        _ensure_empty_output_root(root)
+    except OSError as exc:
+        # Refuse before any generated write.  In particular, never append a
+        # report to an existing directory containing stale producer/annotated
+        # files, and never follow an output-directory symlink.
+        return _rejected_bundle_manifest(
+            root,
+            input_csv,
+            mode,
+            [_diagnostic("unsafe_output_directory", str(exc))],
+        )
     if mode not in MODES:
         errors.append(_diagnostic("invalid_mode", f"unsupported mode: {mode}"))
         mode = "evidence_only"
@@ -570,17 +911,27 @@ def build_bundle(
                 errors.append(_diagnostic("metadata_required", f"strict metadata field is missing: {key}", field=key))
 
     source = Path(input_csv)
+    protected_sources = [
+        Path(item)
+        for item in (metadata_json, camera_intrinsic_report, model_profile, pnp_config, producer_command_file)
+        if item is not None
+    ]
+    protected_sources.insert(0, source)
     generated_paths = {
         root / "csv_report.json",
         root / "csv_report.md",
+        root / "_rejected_csv_report.json",
+        root / "_rejected_csv_report.md",
         root / "manifest.json",
         root / "summary.md",
         root / "run_metadata.json",
+        root / "camera_intrinsic_report.yaml",
+        root / "model_profile.yaml",
+        root / "pnp_config.yaml",
+        root / "producer_command.txt",
+        root / "input" / "auto_aim.csv",
     }
-    source_output_collision = any(
-        _resolved_under(source, root) and source.resolve(strict=False) == protected.resolve(strict=False)
-        for protected in generated_paths
-    )
+    source_output_collision = any(_same_path_or_file(source, protected) for protected in generated_paths)
     if source_output_collision:
         errors.append(_diagnostic("input_output_collision", "input CSV aliases a generated bundle output; source was not overwritten"))
     # PR #16 intentionally has a narrower metadata allow-list.  Keep the
@@ -592,8 +943,14 @@ def build_bundle(
     csv_report = _redact_data(build_report(analysis))
     report_json_path = root / ("_rejected_csv_report.json" if source_output_collision else "csv_report.json")
     report_markdown_path = root / ("_rejected_csv_report.md" if source_output_collision else "csv_report.md")
-    _write_json(report_json_path, csv_report)
-    report_markdown_path.write_text(markdown_report(csv_report), encoding="utf-8")
+    try:
+        _write_json(report_json_path, csv_report, bundle_root=root, protected_sources=protected_sources)
+    except OSError as exc:
+        errors.append(_diagnostic("csv_report_json_write", f"unable to write CSV JSON report: {exc}"))
+    try:
+        _write_text(report_markdown_path, markdown_report(csv_report), bundle_root=root, protected_sources=protected_sources)
+    except OSError as exc:
+        errors.append(_diagnostic("csv_report_markdown_write", f"unable to write CSV Markdown report: {exc}"))
     _check_boundary(csv_report, errors)
     if csv_report.get("status") == "FAIL":
         errors.append(_diagnostic("csv_report_fail", "CSV evidence report status is FAIL"))
@@ -620,7 +977,7 @@ def build_bundle(
     if source.is_file():
         destination = root / "input" / "auto_aim.csv"
         try:
-            _copy_file(source, destination)
+            _copy_file(source, destination, bundle_root=root, protected_sources=protected_sources)
             register("input_csv", destination)
         except OSError as exc:
             errors.append(_diagnostic("input_csv_copy", f"unable to package input CSV: {exc}"))
@@ -632,11 +989,14 @@ def build_bundle(
         register("csv_report_markdown", root / "csv_report.md")
     if metadata_json and isinstance(metadata, Mapping) and not any(item["code"] == "metadata" for item in errors):
         metadata_destination = root / "run_metadata.json"
-        if Path(metadata_json).resolve(strict=False) == metadata_destination.resolve(strict=False):
+        if _same_path_or_file(Path(metadata_json), metadata_destination):
             errors.append(_diagnostic("metadata_output_collision", "metadata JSON aliases generated run_metadata.json"))
         else:
-            _write_json(metadata_destination, metadata)
-            register("run_metadata", metadata_destination)
+            try:
+                _write_json(metadata_destination, metadata, bundle_root=root, protected_sources=protected_sources)
+                register("run_metadata", metadata_destination)
+            except OSError as exc:
+                errors.append(_diagnostic("metadata_copy", f"unable to package run metadata: {exc}"))
 
     provided = {
         "camera_intrinsic_report": camera_intrinsic_report,
@@ -656,11 +1016,11 @@ def build_bundle(
         if not source_path.is_file():
             errors.append(_diagnostic("missing_artifact", f"{role} is missing or unreadable: {_safe_name(source_path)}", role=role))
             continue
-        if any(source_path.resolve(strict=False) == generated.resolve(strict=False) for generated in generated_paths):
+        if any(_same_path_or_file(source_path, generated) for generated in generated_paths):
             errors.append(_diagnostic("artifact_output_collision", f"{role} aliases a generated bundle output", role=role))
             continue
         try:
-            _copy_file(source_path, destinations[role])
+            _copy_file(source_path, destinations[role], bundle_root=root, protected_sources=protected_sources)
             register(role, destinations[role])
             if role == "camera_intrinsic_report":
                 _check_calibration_promotion(source_path, errors)
@@ -672,12 +1032,12 @@ def build_bundle(
         try:
             annotated_destination = root / "annotated"
             if (
-                source_path.resolve(strict=False) == annotated_destination.resolve(strict=False)
+                _same_path_or_file(source_path, annotated_destination)
                 or _resolved_under(annotated_destination, source_path)
                 or _resolved_under(source_path, annotated_destination)
             ):
                 raise OSError("annotated source aliases or contains its bundle destination")
-            copied = _copy_annotated(source_path, root / "annotated")
+            copied = _copy_annotated(source_path, root / "annotated", bundle_root=root, protected_sources=protected_sources)
             if not copied:
                 warnings.append(_diagnostic("annotated_empty", "annotated directory contained no PNG files"))
             for path in copied:
@@ -693,9 +1053,9 @@ def build_bundle(
         else:
             try:
                 producer_destination = root / "producer_command.txt"
-                if source_path.resolve(strict=False) == producer_destination.resolve(strict=False):
+                if _same_path_or_file(source_path, producer_destination):
                     raise OSError("producer command source aliases its bundle destination")
-                _copy_text_redacted(source_path, producer_destination)
+                _copy_text_redacted(source_path, producer_destination, bundle_root=root, protected_sources=protected_sources)
                 register("producer_command", producer_destination)
             except (OSError, UnicodeError) as exc:
                 errors.append(_diagnostic("producer_command_copy", str(exc)))
@@ -753,32 +1113,47 @@ def build_bundle(
         "annotated_png": any(role.startswith("annotated_png:") for role in artifact_roles),
         "producer_command": "producer_command" in artifact_roles,
     }
-    _write_json(root / "manifest.json", manifest)
+    try:
+        _write_json(root / "manifest.json", manifest, bundle_root=root, protected_sources=protected_sources)
+    except OSError as exc:
+        errors.append(_diagnostic("manifest_write", f"unable to write manifest: {exc}"))
     verification = validate_manifest(root)
     errors.extend(verification.get("errors", []))
     warnings.extend(verification.get("warnings", []))
     manifest["diagnostics"] = {"errors": errors, "warnings": warnings}
     manifest["status"] = _bundle_status(errors, warnings)
     summary_path = root / "summary.md"
-    summary_path.write_text(_summary_markdown(manifest), encoding="utf-8")
-    register("summary", summary_path)
+    try:
+        _write_text(summary_path, _summary_markdown(manifest), bundle_root=root, protected_sources=protected_sources)
+        register("summary", summary_path)
+    except OSError as exc:
+        errors.append(_diagnostic("summary_write", f"unable to write summary: {exc}"))
     artifacts.sort(key=lambda item: (item["role"], item["path"]))
     artifact_roles = {item["role"] for item in artifacts}
     manifest["artifact_presence"]["summary"] = "summary" in artifact_roles
     manifest["artifacts"] = artifacts
-    _write_json(root / "manifest.json", manifest)
+    try:
+        _write_json(root / "manifest.json", manifest, bundle_root=root, protected_sources=protected_sources)
+    except OSError as exc:
+        errors.append(_diagnostic("manifest_write", f"unable to write manifest: {exc}"))
     verification = validate_manifest(root)
     if verification.get("errors"):
         errors.extend(verification["errors"])
         manifest["diagnostics"] = {"errors": errors, "warnings": warnings}
         manifest["status"] = _bundle_status(errors, warnings)
-        summary_path.write_text(_summary_markdown(manifest), encoding="utf-8")
-        for entry in manifest["artifacts"]:
-            if entry.get("role") == "summary":
-                entry.update(_artifact("summary", summary_path, root))
-                break
+        try:
+            _write_text(summary_path, _summary_markdown(manifest), bundle_root=root, protected_sources=protected_sources)
+            for entry in manifest["artifacts"]:
+                if entry.get("role") == "summary":
+                    entry.update(_artifact("summary", summary_path, root))
+                    break
+        except OSError as exc:
+            errors.append(_diagnostic("summary_write", f"unable to refresh summary: {exc}"))
         manifest["artifacts"].sort(key=lambda item: (item["role"], item["path"]))
-        _write_json(root / "manifest.json", manifest)
+        try:
+            _write_json(root / "manifest.json", manifest, bundle_root=root, protected_sources=protected_sources)
+        except OSError as exc:
+            errors.append(_diagnostic("manifest_write", f"unable to write manifest: {exc}"))
     return manifest
 
 
@@ -821,7 +1196,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"status={manifest['status']}")
         return {"PASS": 0, "WARN": 2, "FAIL": 1}[manifest["status"]]
     except Exception as exc:  # keep an output diagnostic for unexpected input failures
-        root.mkdir(parents=True, exist_ok=True)
         fallback = {
             "schema_version": SCHEMA_VERSION,
             "status": "FAIL",
@@ -832,10 +1206,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "safety_boundary": _boundary(),
         }
         try:
-            _write_json(root / "manifest.json", fallback)
-            _write_json(root / "csv_report.json", {"status": "FAIL", "report_status": "FAIL", "errors": fallback["diagnostics"]["errors"], "evidence_boundary": fallback["safety_boundary"]})
-            (root / "csv_report.md").write_text("# Offline auto-aim evidence report\n\n**Report status: `FAIL`**\n", encoding="utf-8")
-            (root / "summary.md").write_text(_summary_markdown(fallback), encoding="utf-8")
+            # An exception must not turn the fallback into a second write pass
+            # over a partially written or reused output directory.  Only a
+            # newly-created/empty real directory is eligible for fallback.
+            _ensure_empty_output_root(root)
+            _write_json(root / "manifest.json", fallback, bundle_root=root)
+            _write_json(root / "csv_report.json", {"status": "FAIL", "report_status": "FAIL", "errors": fallback["diagnostics"]["errors"], "evidence_boundary": fallback["safety_boundary"]}, bundle_root=root)
+            _write_text(root / "csv_report.md", "# Offline auto-aim evidence report\n\n**Report status: `FAIL`**\n", bundle_root=root)
+            _write_text(root / "summary.md", _summary_markdown(fallback), bundle_root=root)
         except OSError:
             pass
         print("status=FAIL")

@@ -21,9 +21,9 @@ python3 tools/offline_evidence_report/offline_evidence_bundle.py \
   --mode evidence_only
 ```
 
-`--input-csv` 和 `--output-dir` 是构建模式的必需参数；metadata 和其他证据是可选的。输出目录不存在时自动创建。`--mode evidence_only` 允许缺少真实硬件材料，但会写出明确 WARN；`--mode strict` 要求 metadata、相机内参引用、model profile 和 PnP config 均存在且哈希通过，缺失即 FAIL。两种模式都要求 CSV 和生成的 JSON/Markdown 报告完整，CSV 本身 FAIL 或安全异常时包为 FAIL；strict 模式下 CSV WARN 也会升级为 FAIL。
+`--input-csv` 和 `--output-dir` 是构建模式的必需参数；metadata 和其他证据是可选的。输出目录不存在时自动创建，但已存在的目录必须真正为空；复用已有目录会在任何写入前 FAIL，避免旧的 producer command、标注图或其他未声明文件混入归档。不安全的输出根、父级 symlink、目标 symlink/hardlink 或输入别名同样会在写入前 FAIL，并尽量不创建任何输出物。`--mode evidence_only` 允许缺少真实硬件材料，但会写出明确 WARN；`--mode strict` 要求 metadata、相机内参引用、model profile 和 PnP config 均存在且哈希通过，缺失即 FAIL。两种模式都要求 CSV 和生成的 JSON/Markdown 报告完整，CSV 本身 FAIL 或安全异常时包为 FAIL；strict 模式下 CSV WARN 也会升级为 FAIL。
 
-状态码固定为：`PASS=0`、`WARN=2`、`FAIL=1`。即使 CSV 缺失、损坏或输入异常，工具仍尽量写出 `manifest.json`、`summary.md`、`csv_report.json` 和 `csv_report.md`。
+状态码固定为：`PASS=0`、`WARN=2`、`FAIL=1`。即使 CSV 缺失、损坏或输入异常，工具仍尽量写出 `manifest.json`、`summary.md`、`csv_report.json` 和 `csv_report.md`；但若 output-dir 不安全或非空，工具会优先保护既有文件，返回完整的内存 FAIL manifest 而不写入该目录。
 
 已有包可以只校验 manifest：
 
@@ -50,7 +50,7 @@ evidence_bundle/
 
 ## Manifest schema
 
-`manifest.json` 是稳定排序的 JSON 对象：
+`manifest.json` 是稳定排序的 JSON 对象。每次构建请使用新的空 output-dir；工具不会删除或覆盖非空目录中的既有文件：
 
 ```yaml
 schema_version: 1
@@ -85,11 +85,11 @@ evidence_boundary:
 
 artifact `role` 和 POSIX 相对 `path` 必须唯一；路径不能是绝对路径、Windows drive/UNC 路径或包含 `..`，也不能指向 bundle 外的 symlink。文件大小和 SHA-256 每次校验。annotated 文件使用 `annotated_png:<relative-path>` 角色。
 
-`manifest.json` 是索引文件，不能对自己做原始字节 SHA-256 自引用，所以在 `unhashed_files` 中明确列出；`summary.md` 作为 artifact 记录并哈希，但它的表格排除自身，避免循环依赖。构建两次时相同输入、metadata 和证据文件会得到稳定的 manifest/artifact 排序和内容。
+`manifest.json` 是索引文件，不能对自己做原始字节 SHA-256 自引用，所以在 `unhashed_files` 中明确列出；`summary.md` 作为 artifact 记录并哈希，但它的表格排除自身，避免循环依赖。使用两个不同的空 output-dir 构建时，相同输入、metadata 和证据文件会得到稳定的 manifest/artifact 排序和内容；对已有 bundle 目录再次构建会被拒绝。manifest 校验还会扫描 bundle 内所有文件，未声明文件会导致 FAIL。
 
 ## Metadata 与脱敏
 
-允许记录：`run_id`、`commit`、`dataset_id`、`model_profile_id`、`model_profile_version`、`pnp_profile`、`source_label`、`run_command`。未知字段、token、password、secret、API key 等被忽略或脱敏；命令中的绝对路径仅保留 `<path>/basename`，不会执行命令。manifest 只记录输入源 basename，不记录完整个人目录。
+允许记录：`run_id`、`commit`、`dataset_id`、`model_profile_id`、`model_profile_version`、`pnp_profile`、`source_label`、`run_command`。未知字段、token、access_token、client_secret、password、secret、API key 等被忽略或脱敏；UNC 路径、Windows drive 路径（包括空格）和 POSIX 绝对路径仅保留 `<path>/basename`，不会执行命令。manifest 只记录输入源 basename，不记录完整个人目录。
 
 ## 准入与安全边界
 

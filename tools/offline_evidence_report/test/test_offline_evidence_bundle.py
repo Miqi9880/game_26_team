@@ -114,24 +114,36 @@ class EvidenceBundleTests(unittest.TestCase):
 
     def test_absolute_path_and_sensitive_metadata_are_redacted(self):
         metadata = self.root / "metadata.json"
-        metadata.write_text(json.dumps({"run_id": "r", "run_command": "python /private/user/run.csv --password=foo --secret bar --api-key baz --token xyz ghp_secret --password \"quoted password\" --secret='quoted secret' --api-key \"quoted api key\" --token \"quoted token\" token: \"colon token\" Bearer \"bearer token\"", "password": "bad"}))
+        unc_path = chr(92) * 2 + "server" + chr(92) + "share" + chr(92) + "folder" + chr(92) + "UNC_SECRET.csv"
+        unc_forward_path = "//server/share/folder/UNC_FORWARD_SECRET.csv"
+        windows_path = "C:" + chr(92) + "Program Files" + chr(92) + "WINDOW_SECRET.csv"
+        command = (
+            "python /private/user/run.csv "
+            "--password=foo --secret bar --api-key baz --token xyz ghp_secret "
+            "--password \"quoted password\" --secret='quoted secret' "
+            "--api-key \"quoted api key\" --token \"quoted token\" "
+            "token: \"colon token\" Bearer \"bearer token\" "
+            "--access-token ACCESS_SPACE --client-secret=CLIENT_EQ "
+            "client_secret=CLIENT_UNDERSCORE access_token=ACCESS_UNDERSCORE "
+            "--client-secret \"CLIENT QUOTED\" " + unc_path + " " + unc_forward_path + " " + windows_path
+        )
+        metadata.write_text(json.dumps({"run_id": "r", "run_command": command, "password": "bad"}))
         output = self.root / "redacted"
-        build_bundle(self.csv, output, metadata_json=metadata)
-        text = (output / "run_metadata.json").read_text()
-        self.assertNotIn("/private/user", text)
-        self.assertNotIn("ghp_secret", text)
-        self.assertNotIn('"password": "bad"', text)
-        self.assertNotIn("foo", text)
-        self.assertNotIn("bar", text)
-        self.assertNotIn("baz", text)
-        self.assertNotIn("xyz", text)
-        self.assertNotIn("quoted password", text)
-        self.assertNotIn("quoted secret", text)
-        self.assertNotIn("quoted api key", text)
-        self.assertNotIn("quoted token", text)
-        self.assertNotIn("colon token", text)
-        self.assertNotIn("bearer token", text)
-        self.assertNotIn("<path><path>", text)
+        report = build_bundle(self.csv, output, metadata_json=metadata)
+        self.assertIn(report["status"], {"PASS", "WARN"})
+        output_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in output.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".json", ".md", ".txt"}
+        )
+        for marker in (
+            "/private/user", "ghp_secret", '"password": "bad"', "foo", "bar", "baz", "xyz",
+            "quoted password", "quoted secret", "quoted api key", "quoted token", "colon token",
+            "bearer token", "ACCESS_SPACE", "CLIENT_EQ", "CLIENT_UNDERSCORE", "ACCESS_UNDERSCORE",
+            "CLIENT QUOTED", "server\\share", "Program Files",
+        ):
+            self.assertNotIn(marker, output_text, marker)
+        self.assertNotIn("<path><path>", output_text)
 
     def test_producer_command_file_redacts_quoted_sensitive_values(self):
         producer = self.root / "producer.txt"
@@ -204,6 +216,97 @@ class EvidenceBundleTests(unittest.TestCase):
         help_result = subprocess.run([sys.executable, str(SCRIPT), "--help"], check=False, capture_output=True, text=True)
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("evidence bundle", help_result.stdout)
+
+    def test_nonempty_output_directory_is_rejected_without_mutation(self):
+        output = self.root / "reused"
+        output.mkdir()
+        old_producer = output / "producer_command.txt"
+        old_producer.write_text("old producer", encoding="utf-8")
+        report = build_bundle(self.csv, output)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(old_producer.read_text(encoding="utf-8"), "old producer")
+        self.assertTrue(any(item["code"] == "unsafe_output_directory" for item in report["diagnostics"]["errors"]))
+
+    def test_preexisting_symlink_hardlink_and_output_root_symlink_never_mutate_victim(self):
+        victim = self.root / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+
+        symlink_output = self.root / "symlink_output"
+        symlink_output.mkdir()
+        os.symlink(victim, symlink_output / "manifest.json")
+        report = build_bundle(self.csv, symlink_output)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+        hardlink_output = self.root / "hardlink_output"
+        hardlink_output.mkdir()
+        os.link(victim, hardlink_output / "manifest.json")
+        report = build_bundle(self.csv, hardlink_output)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+        output_alias = self.root / "output_alias"
+        os.symlink(self.root, output_alias)
+        report = build_bundle(self.csv, output_alias)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+        parent_alias = self.root / "parent_alias"
+        os.symlink(self.root, parent_alias)
+        report = build_bundle(self.csv, parent_alias / "new_bundle")
+        self.assertEqual(report["status"], "FAIL")
+        self.assertFalse((self.root / "new_bundle").exists())
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+    def test_all_generated_aliases_are_rejected_before_external_overwrite(self):
+        generated_names = (
+            "csv_report.json",
+            "csv_report.md",
+            "manifest.json",
+            "summary.md",
+            "run_metadata.json",
+            "camera_intrinsic_report.yaml",
+            "model_profile.yaml",
+            "pnp_config.yaml",
+            "producer_command.txt",
+            "input/auto_aim.csv",
+        )
+        for index, relative in enumerate(generated_names):
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(relative=relative, kind=kind):
+                    victim = self.root / f"victim_{index}_{kind}.txt"
+                    victim.write_text("do not overwrite", encoding="utf-8")
+                    output = self.root / f"alias_{index}_{kind}"
+                    output.mkdir()
+                    destination = output / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if kind == "symlink":
+                        os.symlink(victim, destination)
+                    else:
+                        os.link(victim, destination)
+                    report = build_bundle(self.csv, output)
+                    self.assertEqual(report["status"], "FAIL")
+                    self.assertEqual(victim.read_text(encoding="utf-8"), "do not overwrite")
+
+    def test_input_inside_output_alias_is_rejected_without_overwriting_source(self):
+        output = self.root / "input_alias"
+        output.mkdir()
+        source = output / "manifest.json"
+        original = self.csv.read_bytes()
+        source.write_bytes(original)
+        report = build_bundle(source, output)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(source.read_bytes(), original)
+        self.assertTrue(any(item["code"] == "unsafe_output_directory" for item in report["diagnostics"]["errors"]))
+
+    def test_validate_manifest_rejects_unlisted_stale_files(self):
+        output = self.root / "valid"
+        build_bundle(self.csv, output)
+        stale = output / "producer_command.txt"
+        stale.write_text("stale", encoding="utf-8")
+        result = validate_manifest(output)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any(item["code"] == "unexpected_bundle_file" for item in result["errors"]))
 
     def test_annotated_directory_requires_png_files(self):
         annotated = self.root / "annotated"

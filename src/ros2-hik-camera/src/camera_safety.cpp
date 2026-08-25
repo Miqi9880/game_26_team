@@ -89,6 +89,21 @@ bool isFiniteInRange(double value, double minimum, double maximum)
          value >= minimum && value <= maximum;
 }
 
+std::string boundedByteString(const unsigned char * data, std::size_t capacity)
+{
+  if (data == nullptr || capacity == 0U) {
+    return {};
+  }
+
+  std::size_t length = 0U;
+  while (length < capacity && data[length] != '\0') {
+    ++length;
+  }
+
+  return std::string(
+    reinterpret_cast<const char *>(data), length);
+}
+
 std::string formatSdkStatus(int status)
 {
   std::ostringstream stream;

@@ -27,6 +27,8 @@ bool calculateRgb8BufferSize(
 
 bool isFiniteInRange(double value, double minimum, double maximum);
 
+std::string boundedByteString(const unsigned char * data, std::size_t capacity);
+
 std::string formatSdkStatus(int status);
 
 }  // namespace hik_camera

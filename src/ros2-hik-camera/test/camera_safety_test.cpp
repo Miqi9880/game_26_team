@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -115,6 +116,36 @@ TEST(ParameterRange, RejectsInvalidValuesAndRanges)
     isFiniteInRange(
       std::numeric_limits<double>::infinity(), 1.0, 2.0));
   EXPECT_FALSE(isFiniteInRange(1.5, 2.0, 1.0));
+}
+
+TEST(BoundedByteString, StopsAtNullTerminator)
+{
+  const std::array<unsigned char, 8U> bytes{
+    {'S', 'E', 'R', 'I', 'A', 'L', '\0', 'X'}};
+
+  EXPECT_EQ(boundedByteString(bytes.data(), bytes.size()), "SERIAL");
+}
+
+TEST(BoundedByteString, AcceptsFullNonTerminatedBuffer)
+{
+  const std::array<unsigned char, 4U> bytes{{'A', 'B', 'C', 'D'}};
+
+  EXPECT_EQ(boundedByteString(bytes.data(), bytes.size()), "ABCD");
+}
+
+TEST(BoundedByteString, HonorsSmallerCapacity)
+{
+  const std::array<unsigned char, 6U> bytes{{'S', 'E', 'R', 'I', 'A', 'L'}};
+
+  EXPECT_EQ(boundedByteString(bytes.data(), 3U), "SER");
+}
+
+TEST(BoundedByteString, RejectsMissingStorage)
+{
+  const std::array<unsigned char, 1U> bytes{{'X'}};
+
+  EXPECT_TRUE(boundedByteString(nullptr, bytes.size()).empty());
+  EXPECT_TRUE(boundedByteString(bytes.data(), 0U).empty());
 }
 
 TEST(SdkStatus, FormatsFixedWidthHexadecimal)

@@ -1,155 +1,341 @@
 #include "MvCameraControl.h"
+
+#include "hik_camera/camera_safety.hpp"
+
 // ROS
 #include <camera_info_manager/camera_info_manager.hpp>
 #include <image_transport/image_transport.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/utilities.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
 namespace hik_camera
 {
+namespace
+{
+
+constexpr std::size_t kSerialNumberCapacity = INFO_MAX_BUFFER_SIZE;
+constexpr unsigned int kCaptureTimeoutMs = 1000U;
+constexpr int kMaxConsecutiveCaptureFailures = 5;
+
+std::runtime_error sdkError(const char * operation, int status)
+{
+  return std::runtime_error(
+    std::string(operation) + " failed with SDK status " + formatSdkStatus(status));
+}
+
+void throwIfSdkFailed(const char * operation, int status)
+{
+  if (status != MV_OK) {
+    throw sdkError(operation, status);
+  }
+}
+
+bool isParameterDouble(const rclcpp::Parameter & parameter)
+{
+  return parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE;
+}
+
+bool isParameterInteger(const rclcpp::Parameter & parameter)
+{
+  return parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER;
+}
+
+}  // namespace
+
 class HikCameraNode : public rclcpp::Node
 {
 public:
-  explicit HikCameraNode(const rclcpp::NodeOptions & options) : Node("hik_camera", options)
+  explicit HikCameraNode(const rclcpp::NodeOptions & options)
+  : Node("hik_camera", options)
   {
-    RCLCPP_INFO(this->get_logger(), "Starting HikCameraNode!");
+    RCLCPP_INFO(get_logger(), "Starting HikCameraNode");
 
-    MV_CC_DEVICE_INFO_LIST device_list; //一个临时的“花名册”。用来存储电脑上目前插着的所有海康相机的信息
-    // enum device
-    nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
-    RCLCPP_INFO(this->get_logger(), "Found camera count = %d", device_list.nDeviceNum);
-
-    while (device_list.nDeviceNum == 0 && rclcpp::ok()) {
-      RCLCPP_ERROR(this->get_logger(), "No camera found!");
-      RCLCPP_INFO(this->get_logger(), "Enum state: [%x]", nRet);
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-      nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
-    }
-
-    MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]); //硬编码选择第一台相机
-
-    MV_CC_OpenDevice(camera_handle_); //打开相机
-
-    // Get camera infomation
-    MV_CC_GetImageInfo(camera_handle_, &img_info_); //获取图像基本信息，存入img_info_结构体
-    image_msg_.data.reserve(img_info_.nHeightMax * img_info_.nWidthMax * 3); //预分配图像数据内存，最大支持rgb8格式
-
-    // Init convert param
-    //初始化像素格式转换参数
-    convert_param_.nWidth = img_info_.nWidthValue;
-    convert_param_.nHeight = img_info_.nHeightValue;
-    convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
-
-    bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
-    auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+    const bool use_sensor_data_qos =
+      declare_parameter("use_sensor_data_qos", true);
+    const auto qos = use_sensor_data_qos ?
+      rmw_qos_profile_sensor_data : rmw_qos_profile_default;
     camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
 
-    declareParameters(); //声明并初始化参数
+    camera_serial_ = declare_parameter<std::string>("camera_serial", "");
+    image_msg_.header.frame_id = "camera_optical_frame";
+    image_msg_.encoding = "rgb8";
 
-    MV_CC_StartGrabbing(camera_handle_); //开始不停采集图像
+    try {
+      initializeCamera();
+      declareParameters();
+      loadCameraInfo();
 
-    // Load camera info
-    camera_name_ = this->declare_parameter("camera_name", "narrow_stereo");
-    camera_info_manager_ =
-      std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_); //实例化相机信息管理器
-    auto camera_info_url =
-      this->declare_parameter("camera_info_url", "package://hik_camera/config/camera_info.yaml");
-    if (camera_info_manager_->validateURL(camera_info_url)) {
-      camera_info_manager_->loadCameraInfo(camera_info_url); //加载相机内参文件
-      camera_info_msg_ = camera_info_manager_->getCameraInfo(); //获取并存入相机内参消息
-    } else {
-      RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+      params_callback_handle_ = add_on_set_parameters_callback(
+        std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
+
+      const int start_status = MV_CC_StartGrabbing(camera_handle_);
+      throwIfSdkFailed("MV_CC_StartGrabbing", start_status);
+      grabbing_.store(true);
+
+      RCLCPP_INFO(
+        get_logger(),
+        "/image_raw.header.stamp uses this node's local ROS clock immediately before "
+        "publication; no SDK hardware, IMU, or MCU timestamp is used");
+
+      capture_thread_ = std::thread{&HikCameraNode::captureLoop, this};
+    } catch (const std::exception & exception) {
+      RCLCPP_FATAL(get_logger(), "Camera initialization failed: %s", exception.what());
+      stopCamera();
+      throw;
+    } catch (...) {
+      RCLCPP_FATAL(get_logger(), "Camera initialization failed with an unknown error");
+      stopCamera();
+      throw;
     }
-
-    params_callback_handle_ = this->add_on_set_parameters_callback(
-      std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1)); //注册参数回调函数
-
-    capture_thread_ = std::thread{[this]() -> void {
-      MV_FRAME_OUT out_frame; //定义一个帧结构体，用于存储每一帧采集到的原始图像的指针和信息
-
-      RCLCPP_INFO(this->get_logger(), "Publishing image!");
-
-      image_msg_.header.frame_id = "camera_optical_frame";
-      image_msg_.encoding = "rgb8";
-
-      while (rclcpp::ok()) {
-        nRet = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);// 1. 获取原始数据 (超时时间 1000ms)
-                                                                      // 数据指针会存在 out_frame.pBufAddr 中
-        if (MV_OK == nRet) {
-          convert_param_.pDstBuffer = image_msg_.data.data();
-          convert_param_.nDstBufferSize = image_msg_.data.size();
-          convert_param_.pSrcData = out_frame.pBufAddr;
-          convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
-          convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
-
-          MV_CC_ConvertPixelType(camera_handle_, &convert_param_); //转换像素格式 (Bayer 转 RGB)
-
-          image_msg_.header.stamp = this->now();
-          image_msg_.height = out_frame.stFrameInfo.nHeight;
-          image_msg_.width = out_frame.stFrameInfo.nWidth;
-          image_msg_.step = out_frame.stFrameInfo.nWidth * 3; // 步长：宽 * 3通道,rgb8 每个像素 3 字节
-          image_msg_.data.resize(image_msg_.width * image_msg_.height * 3); //根据实际图像大小调整图像数据大小
-
-          camera_info_msg_.header = image_msg_.header;
-          camera_pub_.publish(image_msg_, camera_info_msg_);
-
-          MV_CC_FreeImageBuffer(camera_handle_, &out_frame); //释放图像缓冲区
-          fail_conut_ = 0;
-        } else { //采集图像失败
-          RCLCPP_WARN(this->get_logger(), "Get buffer failed! nRet: [%x]", nRet);
-          MV_CC_StopGrabbing(camera_handle_);
-          MV_CC_StartGrabbing(camera_handle_);
-          fail_conut_++;
-        }
-
-        if (fail_conut_ > 5) {
-          RCLCPP_FATAL(this->get_logger(), "Camera failed!");
-          rclcpp::shutdown();
-        }
-      }
-    }};
   }
 
   ~HikCameraNode() override
   {
-    if (capture_thread_.joinable()) {
-      capture_thread_.join();
-    }
-    if (camera_handle_) {
-      MV_CC_StopGrabbing(camera_handle_);
-      MV_CC_CloseDevice(camera_handle_);
-      MV_CC_DestroyHandle(&camera_handle_);
-    }
-    RCLCPP_INFO(this->get_logger(), "HikCameraNode destroyed!");
+    stopCamera();
+    RCLCPP_INFO(get_logger(), "HikCameraNode destroyed");
   }
 
 private:
+  struct ParameterRange
+  {
+    double minimum{0.0};
+    double maximum{0.0};
+  };
+
+  struct PendingParameterWrite
+  {
+    std::string parameter_name;
+    const char * sdk_name{nullptr};
+    double value{0.0};
+    float previous_value{0.0F};
+  };
+
+  void initializeCamera()
+  {
+    MV_CC_DEVICE_INFO_LIST device_list{};
+    const int enum_status = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+    if (enum_status != MV_OK) {
+      RCLCPP_ERROR(
+        get_logger(), "MV_CC_EnumDevices failed with SDK status %s",
+        formatSdkStatus(enum_status).c_str());
+      throw sdkError("MV_CC_EnumDevices", enum_status);
+    }
+
+    const auto max_device_count =
+      sizeof(device_list.pDeviceInfo) / sizeof(device_list.pDeviceInfo[0]);
+    if (device_list.nDeviceNum == 0U) {
+      throw std::runtime_error("MV_CC_EnumDevices returned no USB cameras");
+    }
+    if (device_list.nDeviceNum > max_device_count) {
+      throw std::runtime_error("MV_CC_EnumDevices returned an invalid camera count");
+    }
+
+    std::vector<std::string> serial_numbers;
+    serial_numbers.reserve(device_list.nDeviceNum);
+    for (unsigned int index = 0U; index < device_list.nDeviceNum; ++index) {
+      const auto * device_info = device_list.pDeviceInfo[index];
+      if (device_info == nullptr) {
+        throw std::runtime_error("camera enumeration returned a null device entry");
+      }
+      if (device_info->nTLayerType != MV_USB_DEVICE) {
+        throw std::runtime_error("camera enumeration returned a non-USB device");
+      }
+
+      serial_numbers.push_back(
+        boundedByteString(
+          device_info->SpecialInfo.stUsb3VInfo.chSerialNumber,
+          kSerialNumberCapacity));
+    }
+
+    const auto selection = selectCameraDevice(serial_numbers, camera_serial_);
+    if (!selection.success) {
+      RCLCPP_ERROR(get_logger(), "Camera selection rejected: %s", selection.reason.c_str());
+      throw std::runtime_error("camera selection rejected: " + selection.reason);
+    }
+
+    const int create_status = MV_CC_CreateHandle(
+      &camera_handle_, device_list.pDeviceInfo[selection.index]);
+    if (create_status != MV_OK) {
+      if (camera_handle_ != nullptr) {
+        const int destroy_status = MV_CC_DestroyHandle(camera_handle_);
+        if (destroy_status != MV_OK) {
+          RCLCPP_WARN(
+            get_logger(), "Cleanup after MV_CC_CreateHandle failure returned SDK status %s",
+            formatSdkStatus(destroy_status).c_str());
+        }
+      }
+      camera_handle_ = nullptr;
+      throw sdkError("MV_CC_CreateHandle", create_status);
+    }
+    handle_created_ = true;
+
+    const int open_status = MV_CC_OpenDevice(camera_handle_);
+    if (open_status != MV_OK) {
+      throw sdkError("MV_CC_OpenDevice", open_status);
+    }
+    device_open_ = true;
+
+    const int info_status = MV_CC_GetImageInfo(camera_handle_, &img_info_);
+    if (info_status != MV_OK) {
+      throw sdkError("MV_CC_GetImageInfo", info_status);
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "Selected USB camera index %zu; maximum frame %ux%u",
+      selection.index, img_info_.nWidthMax, img_info_.nHeightMax);
+  }
+
   void declareParameters()
   {
-    rcl_interfaces::msg::ParameterDescriptor param_desc;
-    MVCC_FLOATVALUE f_value;
-    param_desc.integer_range.resize(1);
-    param_desc.integer_range[0].step = 1;
-    // Exposure time
-    param_desc.description = "Exposure time in microseconds";
-    MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure_time);
-    RCLCPP_INFO(this->get_logger(), "Exposure time: %f", exposure_time);
+    declareExposureParameter();
+    declareDoubleParameter("gain", "Gain", "Camera gain");
+    declareDoubleParameter(
+      "balance_ratio_r", "BalanceRatio_R", "Red balance ratio");
+    declareDoubleParameter(
+      "balance_ratio_g", "BalanceRatio_G", "Green balance ratio");
+    declareDoubleParameter(
+      "balance_ratio_b", "BalanceRatio_B", "Blue balance ratio");
+  }
 
-    // Gain
-    param_desc.description = "Gain";
-    MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double gain = this->declare_parameter("gain", f_value.fCurValue, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
-    RCLCPP_INFO(this->get_logger(), "Gain: %f", gain);
+  MVCC_FLOATVALUE getFloatValue(const char * sdk_name)
+  {
+    MVCC_FLOATVALUE value{};
+    const int status = MV_CC_GetFloatValue(camera_handle_, sdk_name, &value);
+    if (status != MV_OK) {
+      throw std::runtime_error(
+        std::string("MV_CC_GetFloatValue(") + sdk_name + ") failed with SDK status " +
+        formatSdkStatus(status));
+    }
+    if (!isFiniteInRange(value.fCurValue, value.fMin, value.fMax)) {
+      throw std::runtime_error(
+        std::string("SDK returned invalid range for ") + sdk_name);
+    }
+    return value;
+  }
+
+  void declareExposureParameter()
+  {
+    const auto value = getFloatValue("ExposureTime");
+    if (value.fMin < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
+      value.fMax > static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+    {
+      throw std::runtime_error("ExposureTime exceeds the ROS integer parameter range");
+    }
+
+    const auto minimum = static_cast<std::int64_t>(std::ceil(value.fMin));
+    const auto maximum = static_cast<std::int64_t>(std::floor(value.fMax));
+    if (minimum > maximum) {
+      throw std::runtime_error("ExposureTime has no valid integer range");
+    }
+
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.description = "Exposure time in microseconds";
+    rcl_interfaces::msg::IntegerRange range;
+    range.from_value = minimum;
+    range.to_value = maximum;
+    range.step = 1;
+    descriptor.integer_range.push_back(range);
+
+    const auto default_exposure =
+      std::max(minimum, std::min(maximum, std::int64_t{5000}));
+    const auto exposure_time =
+      declare_parameter<std::int64_t>("exposure_time", default_exposure, descriptor);
+    if (!isFiniteInRange(
+        static_cast<double>(exposure_time), value.fMin, value.fMax))
+    {
+      throw std::runtime_error("exposure_time is outside the SDK range");
+    }
+
+    parameter_ranges_["exposure_time"] = {value.fMin, value.fMax};
+    setFloatParameter("exposure_time", "ExposureTime", static_cast<double>(exposure_time));
+  }
+
+  void declareDoubleParameter(
+    const std::string & parameter_name,
+    const char * sdk_name,
+    const char * description)
+  {
+    const auto value = getFloatValue(sdk_name);
+
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.description = description;
+    rcl_interfaces::msg::FloatingPointRange range;
+    range.from_value = value.fMin;
+    range.to_value = value.fMax;
+    range.step = 0.0;
+    descriptor.floating_point_range.push_back(range);
+
+    const auto parameter_value =
+      declare_parameter<double>(parameter_name, static_cast<double>(value.fCurValue), descriptor);
+    if (!isFiniteInRange(parameter_value, value.fMin, value.fMax)) {
+      throw std::runtime_error(parameter_name + " is outside the SDK range");
+    }
+
+    parameter_ranges_[parameter_name] = {value.fMin, value.fMax};
+    setFloatParameter(parameter_name, sdk_name, parameter_value);
+  }
+
+  void setFloatParameter(
+    const std::string & parameter_name,
+    const char * sdk_name,
+    double value)
+  {
+    const auto range = parameter_ranges_.find(parameter_name);
+    if (range == parameter_ranges_.end() ||
+      !isFiniteInRange(value, range->second.minimum, range->second.maximum))
+    {
+      throw std::runtime_error(parameter_name + " is outside the SDK range");
+    }
+
+    const int status =
+      MV_CC_SetFloatValue(camera_handle_, sdk_name, static_cast<float>(value));
+    if (status != MV_OK) {
+      throw std::runtime_error(
+        std::string("MV_CC_SetFloatValue(") + sdk_name + ") failed with SDK status " +
+        formatSdkStatus(status));
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "%s set to %.3f", parameter_name.c_str(), value);
+  }
+
+  void loadCameraInfo()
+  {
+    camera_name_ = declare_parameter("camera_name", "narrow_stereo");
+    camera_info_manager_ =
+      std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
+
+    const auto camera_info_url =
+      declare_parameter("camera_info_url", "package://hik_camera/config/camera_info.yaml");
+    if (!camera_info_manager_->validateURL(camera_info_url)) {
+      RCLCPP_WARN(get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+      return;
+    }
+
+    if (!camera_info_manager_->loadCameraInfo(camera_info_url)) {
+      RCLCPP_WARN(get_logger(), "Unable to load camera info from: %s", camera_info_url.c_str());
+      return;
+    }
+
+    camera_info_msg_ = camera_info_manager_->getCameraInfo();
   }
 
   rcl_interfaces::msg::SetParametersResult parametersCallback(
@@ -157,84 +343,315 @@ private:
   {
     rcl_interfaces::msg::SetParametersResult result;
     result.successful = true;
-  
-    for (const auto & param : parameters) {
-      if (param.get_name() == "exposure_time") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", param.as_int());
-        if (MV_OK != status) {
-          result.successful = false;
-          result.reason = "Failed to set exposure time, status = " + std::to_string(status);
-        }
-      }
-      else if (param.get_name() == "gain") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "Gain", param.as_double());
-        if (MV_OK != status) {
-          result.successful = false;
-          result.reason = "Failed to set gain, status = " + std::to_string(status);
-        }
-      }
-      else if (param.get_name() == "balance_ratio_r") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "BalanceRatio_R", param.as_double());
-        if (MV_OK != status) {
-          result.successful = false;
-          result.reason = "Failed to set BalanceRatio_R, status = " + std::to_string(status);
-        }
-      }
-      else if (param.get_name() == "balance_ratio_g") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "BalanceRatio_G", param.as_double());
-        if (MV_OK != status) {
-          result.successful = false;
-          result.reason = "Failed to set BalanceRatio_G, status = " + std::to_string(status);
-        }
-      }
-      else if (param.get_name() == "balance_ratio_b") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "BalanceRatio_B", param.as_double());
-        if (MV_OK != status) {
-          result.successful = false;
-          result.reason = "Failed to set BalanceRatio_B, status = " + std::to_string(status);
-        }
-      }
-      else {
+
+    std::vector<PendingParameterWrite> pending_writes;
+
+    for (const auto & parameter : parameters) {
+      if (parameter.get_name() == "camera_serial" ||
+        parameter.get_name() == "camera_name" ||
+        parameter.get_name() == "camera_info_url" ||
+        parameter.get_name() == "use_sensor_data_qos")
+      {
         result.successful = false;
-        result.reason = "Unknown parameter: " + param.get_name();
-      }
-  
-      // 一旦失败就可以直接返回，也可以继续检查其它参数：
-      if (!result.successful) {
+        result.reason = parameter.get_name() + " cannot be changed while the node is running";
         return result;
       }
+
+      const auto range = parameter_ranges_.find(parameter.get_name());
+      if (range == parameter_ranges_.end()) {
+        continue;
+      }
+
+      double value = 0.0;
+      if (parameter.get_name() == "exposure_time") {
+        if (!isParameterInteger(parameter)) {
+          result.successful = false;
+          result.reason = "exposure_time must be an integer";
+          return result;
+        }
+        value = static_cast<double>(parameter.as_int());
+      } else {
+        if (!isParameterDouble(parameter)) {
+          result.successful = false;
+          result.reason = parameter.get_name() + " must be a floating-point value";
+          return result;
+        }
+        value = parameter.as_double();
+      }
+
+      if (!isFiniteInRange(value, range->second.minimum, range->second.maximum)) {
+        result.successful = false;
+        result.reason = parameter.get_name() + " is outside the SDK range";
+        return result;
+      }
+
+      const char * sdk_name = nullptr;
+      if (parameter.get_name() == "exposure_time") {
+        sdk_name = "ExposureTime";
+      } else if (parameter.get_name() == "gain") {
+        sdk_name = "Gain";
+      } else if (parameter.get_name() == "balance_ratio_r") {
+        sdk_name = "BalanceRatio_R";
+      } else if (parameter.get_name() == "balance_ratio_g") {
+        sdk_name = "BalanceRatio_G";
+      } else if (parameter.get_name() == "balance_ratio_b") {
+        sdk_name = "BalanceRatio_B";
+      }
+
+      if (sdk_name == nullptr) {
+        result.successful = false;
+        result.reason = parameter.get_name() + " has no SDK field mapping";
+        return result;
+      }
+
+      pending_writes.push_back(
+        PendingParameterWrite{parameter.get_name(), sdk_name, value, 0.0F});
     }
-  
+
+    for (auto & write : pending_writes) {
+      MVCC_FLOATVALUE current_value{};
+      const int status =
+        MV_CC_GetFloatValue(camera_handle_, write.sdk_name, &current_value);
+      if (status != MV_OK) {
+        RCLCPP_ERROR(
+          get_logger(), "Unable to read %s before update; SDK status %s",
+          write.parameter_name.c_str(), formatSdkStatus(status).c_str());
+        result.successful = false;
+        result.reason =
+          write.parameter_name + " read-before-write failed with SDK status " +
+          formatSdkStatus(status);
+        return result;
+      }
+      const auto range = parameter_ranges_.at(write.parameter_name);
+      if (!isFiniteInRange(
+          current_value.fCurValue, range.minimum, range.maximum))
+      {
+        RCLCPP_ERROR(
+          get_logger(), "SDK returned an invalid current value for %s",
+          write.parameter_name.c_str());
+        result.successful = false;
+        result.reason = write.parameter_name + " returned an invalid current SDK value";
+        return result;
+      }
+      write.previous_value = current_value.fCurValue;
+    }
+
+    for (std::size_t index = 0U; index < pending_writes.size(); ++index) {
+      const auto & write = pending_writes[index];
+      const int status = MV_CC_SetFloatValue(
+        camera_handle_, write.sdk_name, static_cast<float>(write.value));
+      if (status != MV_OK) {
+        RCLCPP_ERROR(
+          get_logger(), "%s write failed with SDK status %s",
+          write.parameter_name.c_str(), formatSdkStatus(status).c_str());
+
+        bool rollback_failed = false;
+        for (std::size_t rollback_count = index + 1U; rollback_count > 0U; --rollback_count) {
+          const auto & rollback_write = pending_writes[rollback_count - 1U];
+          const int rollback_status = MV_CC_SetFloatValue(
+            camera_handle_, rollback_write.sdk_name, rollback_write.previous_value);
+          if (rollback_status != MV_OK) {
+            rollback_failed = true;
+            RCLCPP_ERROR(
+              get_logger(), "Rollback of %s failed with SDK status %s",
+              rollback_write.parameter_name.c_str(),
+              formatSdkStatus(rollback_status).c_str());
+          }
+        }
+
+        result.successful = false;
+        result.reason =
+          write.parameter_name + " write failed with SDK status " +
+          formatSdkStatus(status);
+        if (rollback_failed) {
+          result.reason += "; one or more rollback writes also failed";
+        }
+        return result;
+      }
+
+      RCLCPP_INFO(
+        get_logger(), "%s set to %.3f", write.parameter_name.c_str(), write.value);
+    }
+
     return result;
   }
-  
 
-  //ROS通信相关
-  sensor_msgs::msg::Image image_msg_; //图像消息
-  sensor_msgs::msg::CameraInfo camera_info_msg_; //相机内参消息
+  bool publishFrame(const MV_FRAME_OUT & out_frame)
+  {
+    const auto width = static_cast<std::uint32_t>(out_frame.stFrameInfo.nWidth);
+    const auto height = static_cast<std::uint32_t>(out_frame.stFrameInfo.nHeight);
+    if (out_frame.pBufAddr == nullptr || out_frame.stFrameInfo.nFrameLen == 0U) {
+      RCLCPP_ERROR(get_logger(), "Rejecting an empty SDK frame buffer");
+      return false;
+    }
 
-  image_transport::CameraPublisher camera_pub_; //相机专用发布器，发布内容包含图像和相机信息
-  
-  std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_; //负责读取和管理.yaml的相机信息
-  
-  OnSetParametersCallbackHandle::SharedPtr params_callback_handle_; //参数回调句柄，监听参数的动态修改
-  
-  //hik SDK硬件相关
-  int nRet = MV_OK; //SDK函数统一返回值，返回MV_OK（0）表示成功
-  void * camera_handle_; //相机句柄,指向要操作的相机
-  MV_IMAGE_BASIC_INFO img_info_; //图像基本信息，记录图像宽高等参数，用于申请内存
+    std::size_t buffer_size = 0U;
+    if (!calculateRgb8BufferSize(width, height, buffer_size)) {
+      RCLCPP_ERROR(get_logger(), "Rejecting frame with invalid dimensions %ux%u", width, height);
+      return false;
+    }
+    if (buffer_size > std::numeric_limits<unsigned int>::max()) {
+      RCLCPP_ERROR(get_logger(), "RGB8 frame is too large for the SDK conversion API");
+      return false;
+    }
 
-  MV_CC_PIXEL_CONVERT_PARAM convert_param_; //像素格式转换参数结构体，用于图像格式转换（bayer转rgb）
+    MV_CC_PIXEL_CONVERT_PARAM convert_param{};
+    convert_param.nWidth = out_frame.stFrameInfo.nWidth;
+    convert_param.nHeight = out_frame.stFrameInfo.nHeight;
+    convert_param.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
+    convert_param.nDstBufferSize = static_cast<unsigned int>(buffer_size);
+    convert_param.pSrcData = out_frame.pBufAddr;
+    convert_param.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
+    convert_param.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
 
-  //其他
-  std::string camera_name_; //相机名称，用于camera_info_manager_加载对应相机内参
-  int fail_conut_ = 0; //连续采集失败计数器
-  std::thread capture_thread_; //图像采集线程，用于循环采集图像并发布，不干扰ros主线程
+    image_msg_.data.resize(buffer_size);
+    convert_param.pDstBuffer = image_msg_.data.data();
 
+    const int convert_status =
+      MV_CC_ConvertPixelType(camera_handle_, &convert_param);
+    if (convert_status != MV_OK) {
+      RCLCPP_ERROR(
+        get_logger(), "MV_CC_ConvertPixelType failed with SDK status %s",
+        formatSdkStatus(convert_status).c_str());
+      return false;
+    }
+    if (convert_param.nDstLen != buffer_size) {
+      RCLCPP_ERROR(
+        get_logger(), "RGB8 conversion returned %u bytes, expected %zu",
+        convert_param.nDstLen, buffer_size);
+      return false;
+    }
+
+    image_msg_.header.stamp = now();
+    image_msg_.height = height;
+    image_msg_.width = width;
+    image_msg_.step = width * 3U;
+    camera_info_msg_.header = image_msg_.header;
+    camera_pub_.publish(image_msg_, camera_info_msg_);
+    return true;
+  }
+
+  void captureLoop()
+  {
+    RCLCPP_INFO(get_logger(), "Publishing image frames");
+
+    while (rclcpp::ok() && !stop_requested_.load()) {
+      MV_FRAME_OUT out_frame{};
+      const int get_status =
+        MV_CC_GetImageBuffer(camera_handle_, &out_frame, kCaptureTimeoutMs);
+      if (get_status != MV_OK) {
+        if (stop_requested_.load() || !rclcpp::ok()) {
+          break;
+        }
+
+        ++failure_count_;
+        RCLCPP_WARN(
+          get_logger(), "MV_CC_GetImageBuffer failed with SDK status %s (failure %d/%d)",
+          formatSdkStatus(get_status).c_str(), failure_count_.load(),
+          kMaxConsecutiveCaptureFailures);
+        if (failure_count_ >= kMaxConsecutiveCaptureFailures) {
+          RCLCPP_FATAL(get_logger(), "Camera capture failed repeatedly; stopping node");
+          stop_requested_.store(true);
+          rclcpp::shutdown();
+        }
+        continue;
+      }
+
+      bool frame_ok = false;
+      try {
+        frame_ok = publishFrame(out_frame);
+      } catch (const std::exception & exception) {
+        RCLCPP_ERROR(get_logger(), "Unhandled frame processing error: %s", exception.what());
+      } catch (...) {
+        RCLCPP_ERROR(get_logger(), "Unhandled frame processing error");
+      }
+
+      const int free_status = MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
+      if (free_status != MV_OK) {
+        RCLCPP_FATAL(
+          get_logger(), "MV_CC_FreeImageBuffer failed with SDK status %s",
+          formatSdkStatus(free_status).c_str());
+        stop_requested_.store(true);
+        rclcpp::shutdown();
+        break;
+      }
+
+      if (frame_ok) {
+        failure_count_ = 0;
+      } else {
+        ++failure_count_;
+        if (failure_count_ >= kMaxConsecutiveCaptureFailures) {
+          RCLCPP_FATAL(get_logger(), "Camera frame processing failed repeatedly; stopping node");
+          stop_requested_.store(true);
+          rclcpp::shutdown();
+          break;
+        }
+      }
+    }
+  }
+
+  void stopCamera()
+  {
+    stop_requested_.store(true);
+
+    if (grabbing_.exchange(false) && camera_handle_ != nullptr) {
+      const int stop_status = MV_CC_StopGrabbing(camera_handle_);
+      if (stop_status != MV_OK) {
+        RCLCPP_WARN(
+          get_logger(), "MV_CC_StopGrabbing failed with SDK status %s",
+          formatSdkStatus(stop_status).c_str());
+      }
+    }
+
+    if (capture_thread_.joinable() &&
+      capture_thread_.get_id() != std::this_thread::get_id())
+    {
+      capture_thread_.join();
+    }
+
+    if (device_open_ && camera_handle_ != nullptr) {
+      const int close_status = MV_CC_CloseDevice(camera_handle_);
+      if (close_status != MV_OK) {
+        RCLCPP_WARN(
+          get_logger(), "MV_CC_CloseDevice failed with SDK status %s",
+          formatSdkStatus(close_status).c_str());
+      }
+      device_open_ = false;
+    }
+
+    if (handle_created_ && camera_handle_ != nullptr) {
+      const int destroy_status = MV_CC_DestroyHandle(camera_handle_);
+      if (destroy_status != MV_OK) {
+        RCLCPP_WARN(
+          get_logger(), "MV_CC_DestroyHandle failed with SDK status %s",
+          formatSdkStatus(destroy_status).c_str());
+      }
+      camera_handle_ = nullptr;
+      handle_created_ = false;
+    }
+  }
+
+  sensor_msgs::msg::Image image_msg_;
+  sensor_msgs::msg::CameraInfo camera_info_msg_;
+  image_transport::CameraPublisher camera_pub_;
+  std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+  OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
+
+  void * camera_handle_{nullptr};
+  MV_IMAGE_BASIC_INFO img_info_{};
+  std::string camera_serial_;
+  std::string camera_name_;
+  std::map<std::string, ParameterRange> parameter_ranges_;
+  std::atomic<bool> handle_created_{false};
+  std::atomic<bool> device_open_{false};
+  std::atomic<bool> grabbing_{false};
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<int> failure_count_{0};
+  std::thread capture_thread_;
 };
+
 }  // namespace hik_camera
 
 #include "rclcpp_components/register_node_macro.hpp"
 
 RCLCPP_COMPONENTS_REGISTER_NODE(hik_camera::HikCameraNode)
-

@@ -1,6 +1,6 @@
 import os
 
-from ament_index_python.packages import get_package_share_directory, get_package_prefix
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -20,6 +20,8 @@ def generate_launch_description():
                               default_value=camera_info_url),
         DeclareLaunchArgument(name='use_sensor_data_qos',
                               default_value='false'),
+        DeclareLaunchArgument(name='camera_serial',
+                              default_value=''),
 
         Node(
             package='hik_camera',
@@ -29,6 +31,7 @@ def generate_launch_description():
             parameters=[LaunchConfiguration('params_file'), {
                 'camera_info_url': LaunchConfiguration('camera_info_url'),
                 'use_sensor_data_qos': LaunchConfiguration('use_sensor_data_qos'),
+                'camera_serial': LaunchConfiguration('camera_serial'),
             }],
         )
     ])

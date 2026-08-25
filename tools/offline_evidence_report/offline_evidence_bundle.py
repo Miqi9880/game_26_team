@@ -103,7 +103,13 @@ HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 def _safe_name(value: Any) -> str:
     """Return only a basename, including for Windows paths on Linux."""
     text = str(value or "").replace("\\", "/")
-    return text.rstrip("/").rsplit("/", 1)[-1]
+    basename = text.rstrip("/").rsplit("/", 1)[-1]
+    # Diagnostics and manifest identity also pass through this helper.  Do
+    # not reintroduce a credential-looking filename after path redaction has
+    # removed its parent directories.
+    if basename and SENSITIVE_KEY_RE.search(basename):
+        return "<redacted>"
+    return basename
 
 
 def _redact_text(value: str) -> str:

@@ -85,7 +85,24 @@ if(NOT HIK_MVS_MISSING_LIBRARIES)
 else()
   message(WARNING
     "MVS SDK libraries not found (${HIK_MVS_MISSING_LIBRARIES}). "
-    "Skipping the real camera driver; SDK-independent tests remain available."
+    "Skipping the real camera executable; compile checks and SDK-independent "
+    "tests remain available."
+  )
+
+  add_library(${PROJECT_NAME}_compile_check OBJECT
+    src/hik_camera_node.cpp
+  )
+  target_include_directories(${PROJECT_NAME}_compile_check PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    hikSDK/include
+  )
+  ament_target_dependencies(${PROJECT_NAME}_compile_check
+    camera_info_manager
+    image_transport
+    rcl_interfaces
+    rclcpp
+    rclcpp_components
+    sensor_msgs
   )
 endif()
 

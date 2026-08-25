@@ -9,7 +9,7 @@
 | 组件 | 当前仓库依赖 | 当前证据/状态 | 上线前动作 |
 |---|---|---|---|
 | `auto_aim_interfaces` | `std_msgs`、ROS 2 interface generation | 消息包可由 `colcon` 构建 | 与视觉程序、串口桥使用同一工作区并先 source |
-| `serical_device_ros2` | `rclcpp`、`rclcpp_components`、`message_filters`、`auto_aim_interfaces`；Linux 串口 API | dry-run/协议测试不需要设备 | 只在确认 golden frame、波特率和 watchdog 后再启用设备 |
+| `serical_device_ros2` | `rclcpp`、`rclcpp_components`、`message_filters`、`auto_aim_interfaces`；Linux 串口 API | dry-run/协议测试不需要设备 | MCU watchdog 约 500 ms 且车型可能不同；只在确认 golden frame、波特率和精确 watchdog 后再启用设备 |
 | `auto_aim_ros2` | `rclcpp`、`sensor_msgs`、`auto_aim_interfaces`、`yaml-cpp`；CMake 查找 OpenCV；OpenVINO 为可选构建依赖 | 自定义 `ros_image_adapter`，当前不依赖 `cv_bridge`；`calib3d` 在 PnP 中使用 | 安装 OpenCV development、yaml-cpp 和 OpenVINO Runtime；验证模型签名 |
 | `hik_camera` | `rclcpp`、`rclcpp_components`、`sensor_msgs`、`image_transport`、`camera_info_manager`、`image_transport_plugins`；海康 MVS SDK | 仓库当前只有 `hikSDK/include`，没有 `hikSDK/lib/amd64` 或 `hikSDK/lib/arm64`；WSL 当前未选择该包构建 | 获取与目标架构匹配且可再分发的 SDK 动态库，完成 USB 权限和 `ldd` 检查 |
 
@@ -303,7 +303,7 @@ dmesg --ctime | tail -100 | tee "${record_dir}/dmesg_tail.txt"
 | 话题没有数据或 QoS 不匹配 | 最终 topic 名、`ros2 topic info -v`、编码/宽高/时间戳 | 保持 `serial_enabled=false`，修正 launch/remap/QoS 后再试 |
 | CameraInfo 缺失、尺寸或 K/D 不符 | URL、序列号、分辨率和标定版本 | 停止 PnP；禁止把候选 YAML 当 production |
 | OpenVINO/模型加载失败或 `ldd not found` | `OpenVINO_DIR`、模型 profile、`file`/`ldd` 架构 | 停止真实链路，回到离线 smoke；不得复制 WSL 二进制到 Orin |
-| 图像/输入超时 | `ros2 topic hz`、节点时间戳和 timeout 日志 | 只允许安全保持输出；未验证 watchdog 前不得接串口 |
+| 图像/输入超时 | `ros2 topic hz`、节点时间戳和 timeout 日志 | 只允许安全保持输出；本机视觉侧 100 ms timeout 不替代约 500 ms、车型相关的 MCU watchdog；未验证 watchdog 前不得接串口 |
 
 每条记录都要带 commit、软件/SDK 版本、命令、开始/结束时间和停止原因；只要
 `fire_command`、串口开关或标定来源无法证明为安全状态，就回到 `backend=null`、

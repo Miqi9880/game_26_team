@@ -17,12 +17,13 @@ MCU VisionData（串口，degree）
   → MCU RobotCtrlData（degree）
 ```
 
-串口桥不做角度单位转换。位置角字段的外部单位是 degree；算法核心字段名带 `_rad`。
-外部速度、加速度单位尚未确认，因此输出适配层强制 `yaw_vel`、`pitch_vel`、
-`yaw_acc`、`pitch_acc` 为 0。Vision 输入中的速度字段只做有限值检查，不被算法使用。
+串口桥不做角度单位转换。位置角字段的外部单位是 degree，速度是 degree/s，加速度是
+degree/s²；算法核心字段名带 `_rad`。单位已经确认，但 MCU 前馈控制语义尚未确认，
+因此输出适配层强制 `yaw_vel`、`pitch_vel`、`yaw_acc`、`pitch_acc` 为 0。Vision 输入中的
+速度会转换为内部 rad/s 诊断值，但不被 Tracker、Aimer 或 RobotCtrl 使用。
 
-`quaternion` 的顺序是 w、x、y、z，但 IMU→world / world→IMU 方向和 world 轴仍未确认，
-当前只保存，不进行世界坐标补偿。`mode=33` 作为协议字段透传；`id`、`bullet_count`、
+`quaternion` 的顺序是 w、x、y、z，记录 IMU 相对上电原点的姿态，但 IMU→world /
+world→IMU 方向、乘法约定和 world 轴仍未确认，当前只保存，不进行世界坐标补偿。`mode=33` 作为协议字段透传；`id`、`bullet_count`、
 `game_progress` 只记录，不用于敌我判断、弹道或开火。
 
 ## 2.1 字段单位表
@@ -31,13 +32,14 @@ MCU VisionData（串口，degree）
 |---|---|---|---|
 | Vision | `id`, `mode` | 无量纲协议字段 | 原样透传和记录 |
 | Vision | `yaw`, `pitch`, `roll` | degree | ROS 输入边界转换为内部 rad |
-| Vision | `yaw_vel`, `pitch_vel` | 外部单位待确认 | 仅检查有限值，不进入核心 |
-| Vision | `quaternion[4]` | 无量纲，顺序 wxyz | 原样保存，不解释方向 |
+| Vision | `yaw_vel`, `pitch_vel` | degree/s | 转为 rad/s 诊断，不进入核心控制 |
+| Vision | `quaternion[4]` | 无量纲，顺序 wxyz、相对上电原点 | 原样保存，不解释方向 |
 | Vision | `shoot_speed` | m/s | 原样保存，暂不参与瞄准 |
 | Vision | `bullet_count` | 累计发送次数 | 只记录 |
 | Vision | `game_progress` | 历史内录字段 | 只记录，算法忽略 |
-| RobotCtrl | `yaw`, `pitch` | degree，绝对目标角 | 由核心 rad 转 degree |
-| RobotCtrl | `yaw_vel`, `pitch_vel`, `yaw_acc`, `pitch_acc` | 外部单位待确认 | 当前固定输出 0 |
+| RobotCtrl | `yaw`, `pitch` | degree，共享上电原点参考中的绝对目标 | 由核心 rad 转 degree，并执行 profile 约束 |
+| RobotCtrl | `yaw_vel`, `pitch_vel` | degree/s | 当前固定输出 0，等待 MCU 前馈语义 |
+| RobotCtrl | `yaw_acc`, `pitch_acc` | degree/s² | 当前固定输出 0，等待 MCU 前馈语义 |
 | RobotCtrl | `target_lock` | 49 锁定，50 未锁定 | 原样映射并由安全策略校验 |
 | RobotCtrl | `fire_command` | 0 不开火，1 连发，2 单发 | dry-run 固定为 0 |
 
@@ -45,7 +47,10 @@ ROS `Vision.header` 只用于时间戳和 frame_id，不进入串口结构体。
 
 ## 2. 坐标系和控制角边界
 
-当前已确认的视觉云台几何坐标为：
+控制接口的 VisionData 和 RobotCtrlData 已确认使用同一个上电姿态原点参考。PnP 几何仍在
+独立的相机坐标系中；camera→control 的正式外参尚未完成，因此不能把两者混为一谈。
+
+PnP/相机几何的记录约定为：
 
 ```text
 x：前
@@ -53,22 +58,15 @@ y：左
 z：上
 ```
 
-电控 IMU 坐标记录为：
-
-```text
-x：右
-y：前
-z：上
-```
-
-当前没有经过确认的视觉云台↔电控 IMU 旋转，因此软件不自行补偿。
+电控控制参考的上电原点和四元数轴/旋转方向仍由电控联调记录；软件不自行补偿。
 
 软件日志约定 `+yaw` 向左、`+pitch` 向上。OpenCV PnP 相机坐标为 `x` 右、`y` 下、`z` 前。
 
 PnP 输出的 `translation_in_camera_m` 是相机坐标；只有配置并验证
 `R_gimbal_from_camera`、`t_gimbal_from_camera_m` 后，才会产生 gimbal 坐标和
 `relative_yaw_rad` / `relative_pitch_rad`。这些相对角仅用于日志和几何核验，
-不能直接变成 `RobotCtrl.yaw` / `RobotCtrl.pitch`，因为绝对角零点和机械安装关系尚未确认。
+不能直接变成 `RobotCtrl.yaw` / `RobotCtrl.pitch`，因为 camera→control 外参、安装关系和
+正式标定证据尚未确认。
 
 ## 3. 标定数据边界
 
@@ -155,15 +153,13 @@ ros2 run auto_aim_ros2 auto_aim_pnp_smoke -- \
 
 ## 6. 电控仍需确认
 
-1. 绝对目标角相对于机械零位、IMU 还是 world；
-2. VisionData 与 RobotCtrlData 是否使用同一角度零点；
-3. yaw_vel/pitch_vel 是否为 degree/s，角加速度是否为 degree/s²；
-4. quaternion 是 IMU→world 还是 world→IMU，以及 world 轴定义；
-5. 实际波特率、端序、FP32 ABI、packed 约定；
-6. 真实收发 golden frame；
-7. MCU 频率、超时、watchdog、ACK、断线行为；
-8. yaw 环绕范围和 pitch 机械限位；
-9. `target_lock=49/50` 的硬件效果；
-10. `fire_command=1/2` 的电平/脉冲、保持时间和停止规则；
-11. `id=7/107` 的实际业务含义；
-12. `mode=33` 是否是允许视觉控制的前提。
+1. camera→control 正式外参、机械安装关系和绝对控制零点的实测记录；
+2. quaternion 是 IMU→world 还是 world→IMU，以及轴定义和乘法约定；
+3. 实际波特率、端序、FP32 ABI、packed 约定和真实收发 golden frame；
+4. MCU 精确频率、车型 watchdog、ACK 和断线行为；
+5. 新龟/狗腿最终 pitch 机械限位与 yaw 边界的实测确认；
+6. MCU 对四个前馈字段的控制语义；
+7. `target_lock=49/50` 的硬件效果；
+8. `fire_command=1/2` 的电平/脉冲、保持时间和停止规则；
+9. `id=7/107` 的实际业务含义；
+10. `mode=33` 是否是允许视觉控制的前提。

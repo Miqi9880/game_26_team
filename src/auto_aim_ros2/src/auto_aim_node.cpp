@@ -4,6 +4,7 @@
 #include "auto_aim_ros2/ros_backend.hpp"
 #include "auto_aim_ros2/ros_image_adapter.hpp"
 #include "auto_aim_ros2/vision_time_alignment.hpp"
+#include "control_interface_constraints.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -81,7 +82,16 @@ public:
   : Node("auto_aim", options)
   {
     dry_run_ = declare_parameter<bool>("dry_run", true);
-    allow_fire_ = declare_parameter<bool>("allow_fire", false);
+    const auto allow_fire_requested = declare_parameter<bool>("allow_fire", false);
+    // There is no reviewed production fire profile or confirmed MCU fire
+    // timing contract in this repository.  Reject the request at startup
+    // rather than treating allow_fire as an advisory dry-run flag.
+    if (allow_fire_requested) {
+      throw std::invalid_argument(
+              "allow_fire requires a reviewed production fire authorization; "
+              "it must remain false in the current control interface");
+    }
+    allow_fire_ = false;
     serial_enabled_ = declare_parameter<bool>("serial_enabled", false);
     require_camera_info_ = declare_parameter<bool>("require_camera_info", true);
     backend_name_ = declare_parameter<std::string>("backend", "null");
@@ -89,6 +99,15 @@ public:
     mock_yaw_rad_ = declare_parameter<double>("mock_yaw_rad", 0.0);
     mock_pitch_rad_ = declare_parameter<double>("mock_pitch_rad", 0.0);
     mock_fire_request_ = declare_parameter<bool>("mock_fire_request", false);
+    const auto vehicle_profile_name = declare_parameter<std::string>(
+      "vehicle_profile", "unselected");
+    const auto parsed_vehicle_profile = auto_aim_interfaces::control::parse_vehicle_profile(
+      vehicle_profile_name);
+    if (!parsed_vehicle_profile.has_value()) {
+      throw std::invalid_argument(
+              "vehicle_profile must be unselected, new_turtle, or dog_leg");
+    }
+    vehicle_profile_ = *parsed_vehicle_profile;
     output_hz_ = declare_parameter<double>("output_hz", 100.0);
     input_timeout_ms_ = declare_parameter<int>("input_timeout_ms", 100);
     csv_path_ = declare_parameter<std::string>("csv_path", "");
@@ -132,13 +151,11 @@ public:
     if (!std::isfinite(test_zero_yaw_degree) || !std::isfinite(test_zero_pitch_degree)) {
       throw std::invalid_argument("test zero angles must be finite");
     }
-    if (output_hz_ <= 0.0 || input_timeout_ms_ <= 0) {
-      throw std::invalid_argument("output_hz and input_timeout_ms must be positive");
-    }
-    const auto period_ms = static_cast<std::int64_t>(
-      std::llround(1000.0 / output_hz_));
-    if (period_ms <= 0) {
-      throw std::invalid_argument("output_hz is too high for a millisecond ROS timer");
+    const auto control_period = auto_aim_interfaces::control::control_period_from_hz(output_hz_);
+    if (!control_period.has_value() || input_timeout_ms_ <= 0) {
+      throw std::invalid_argument(
+              "output_hz must produce a positive nanosecond timer period and "
+              "input_timeout_ms must be positive");
     }
     if (serial_enabled_) {
       throw std::invalid_argument(
@@ -224,14 +241,15 @@ public:
       "/Robot_ctrl_data", 10);
 
     timer_ = create_wall_timer(
-      std::chrono::milliseconds(period_ms), std::bind(&AutoAimNode::publish_control, this));
+      *control_period, std::bind(&AutoAimNode::publish_control, this));
     RCLCPP_INFO(
       get_logger(),
       "AutoAimNode started: backend=%s calibration=%s test_only=%s dry_run=%s "
-      "model_profile=%s serial_enabled=false output_hz=%.1f fire=disabled",
+      "model_profile=%s vehicle_profile=%s serial_enabled=false output_hz=%.1f fire=disabled",
       backend_name_.c_str(), backend_->calibration_profile().c_str(),
       backend_->test_only() ? "true" : "false", dry_run_ ? "true" : "false",
-      backend_->model_profile().c_str(), output_hz_);
+      backend_->model_profile().c_str(),
+      auto_aim_interfaces::control::vehicle_profile_name(vehicle_profile_), output_hz_);
   }
 
 private:
@@ -503,8 +521,8 @@ private:
     // inhibit unconditional even if a caller supplies contradictory params.
     command.fire_command = pipeline::kFireNone;
     row.command = command;
-    const auto ros_message = ros_adapters::to_ros(command);
-    control_publisher_->publish(ros_message);
+    const auto adapter_result = ros_adapters::to_ros_with_profile(command, vehicle_profile_);
+    control_publisher_->publish(adapter_result.message);
     if (csv_) {
       csv_ << ros_backend::csv_row(row);
       csv_.flush();
@@ -527,6 +545,8 @@ private:
   double output_hz_{100.0};
   int input_timeout_ms_{100};
   bool allow_test_only_{false};
+  auto_aim_interfaces::control::VehicleProfile vehicle_profile_{
+    auto_aim_interfaces::control::VehicleProfile::Unselected};
   bool vision_time_alignment_allow_future_{false};
   bool vision_time_alignment_assume_shared_ros_clock_{false};
   float latest_shoot_speed_mps_{0.0F};

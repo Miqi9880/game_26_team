@@ -331,6 +331,46 @@ class EvidenceBundleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertTrue((self.root / "cli_anomaly" / "summary.md").exists())
 
+    def test_verify_manifest_preserves_declared_fail_warn_and_pass_status(self):
+        cases = (
+            ("FAIL", FIXTURES / "anomaly.csv", {}, 1),
+            ("WARN", self.csv, {}, 2),
+            (
+                "PASS",
+                self.csv,
+                {
+                    "metadata_json": self.metadata,
+                    "camera_intrinsic_report": self.calibration,
+                    "model_profile": self.model,
+                    "pnp_config": self.pnp,
+                },
+                0,
+            ),
+        )
+        for expected, csv_path, options, expected_rc in cases:
+            with self.subTest(expected=expected):
+                output = self.root / expected.lower()
+                manifest = build_bundle(csv_path, output, **options)
+                self.assertEqual(manifest["status"], expected)
+                verification = validate_manifest(output)
+                self.assertEqual(verification["status"], expected)
+                self.assertEqual(verification.get("declared_status"), expected)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "--output-dir",
+                        str(output),
+                        "--verify-manifest",
+                        str(output / "manifest.json"),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, expected_rc)
+                self.assertIn(f"status={expected}", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

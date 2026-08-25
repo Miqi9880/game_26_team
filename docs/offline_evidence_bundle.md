@@ -33,6 +33,8 @@ python3 tools/offline_evidence_report/offline_evidence_bundle.py \
   --verify-manifest /absolute/path/evidence_bundle/manifest.json
 ```
 
+校验会同时检查 manifest 的结构、文件哈希和包内未声明文件；如果包本身已经声明 `WARN` 或 `FAIL`，且没有发现更严重的结构错误，校验结果会保留该状态，不会把原有的非 PASS 结论降成 `PASS`。CLI 仍使用 `PASS=0`、`WARN=2`、`FAIL=1` 返回码。
+
 ## 输出结构
 
 最小包包含：

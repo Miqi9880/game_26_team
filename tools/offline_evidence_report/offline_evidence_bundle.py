@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - exercised by the CLI invocation.
 SCHEMA_VERSION = 1
 MODES = {"evidence_only", "strict"}
 STATUS_CODES = {"PASS", "WARN", "FAIL"}
+STATUS_SEVERITY = {"PASS": 0, "WARN": 1, "FAIL": 2}
 REQUIRED_ROLES = ("input_csv", "csv_report_json", "csv_report_markdown")
 STRICT_ROLES = (
     "run_metadata",
@@ -558,6 +559,30 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
     path = Path(manifest_path) if manifest_path is not None else root / "manifest.json"
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    # Keep a package's declared outcome when the structure is otherwise
+    # sound.  Validation must not turn an intentionally produced FAIL/WARN
+    # evidence package into PASS merely because no *new* structural problem
+    # was found.  A structural FAIL still takes precedence, and an invalid
+    # or missing declaration is handled by the normal schema diagnostics.
+    declared_status: Any = None
+
+    def validation_result(*, artifact_count: Optional[int] = None) -> dict[str, Any]:
+        structural_status = _bundle_status(errors, warnings)
+        status = structural_status
+        if isinstance(declared_status, str) and declared_status in STATUS_SEVERITY:
+            if STATUS_SEVERITY[declared_status] > STATUS_SEVERITY[status]:
+                status = declared_status
+        result: dict[str, Any] = {
+            "status": status,
+            "errors": errors,
+            "warnings": warnings,
+        }
+        if artifact_count is not None:
+            result["artifact_count"] = artifact_count
+        if declared_status is not None:
+            result["declared_status"] = declared_status
+        return result
+
     if root.is_symlink():
         errors.append(_diagnostic("bundle_symlink", "bundle directory must not be a symlink"))
     elif root.exists() and not root.is_dir():
@@ -576,15 +601,16 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
         except OSError as exc:
             errors.append(_diagnostic("manifest_stat", f"unable to stat manifest: {exc}"))
     if errors and any(item["code"] in {"bundle_symlink", "bundle_not_directory", "manifest_outside_bundle", "manifest_symlink", "manifest_not_regular", "manifest_hardlink"} for item in errors):
-        return {"status": "FAIL", "errors": errors, "warnings": warnings}
+        return validation_result()
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         errors.append(_diagnostic("manifest_invalid", f"unable to read manifest JSON: {exc}"))
-        return {"status": "FAIL", "errors": errors, "warnings": warnings}
+        return validation_result()
     if not isinstance(value, dict):
         errors.append(_diagnostic("manifest_invalid", "manifest root must be an object"))
-        return {"status": "FAIL", "errors": errors, "warnings": warnings}
+        return validation_result()
+    declared_status = value.get("status")
     if value.get("schema_version") != SCHEMA_VERSION:
         errors.append(_diagnostic("manifest_schema", "unsupported manifest schema_version"))
     if value.get("status") not in STATUS_CODES:
@@ -621,7 +647,7 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list):
         errors.append(_diagnostic("manifest_artifacts", "manifest artifacts must be a list"))
-        return {"status": "FAIL", "errors": errors, "warnings": warnings}
+        return validation_result()
     unhashed_files = value.get("unhashed_files")
     unhashed_paths: set[str] = set()
     if not isinstance(unhashed_files, list) or any(not isinstance(item, str) for item in unhashed_files):
@@ -732,7 +758,7 @@ def validate_manifest(bundle_dir: str | Path, manifest_path: str | Path | None =
             continue
         if relative not in declared_files:
             errors.append(_diagnostic("unexpected_bundle_file", f"file is not declared by manifest: {relative}", path=relative))
-    return {"status": _bundle_status(errors, warnings), "errors": errors, "warnings": warnings, "artifact_count": len(artifacts)}
+    return validation_result(artifact_count=len(artifacts))
 
 
 def _write_json(

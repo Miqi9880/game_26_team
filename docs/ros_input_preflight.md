@@ -6,7 +6,7 @@
 - `/camera_info`（`sensor_msgs/msg/CameraInfo`）
 - `/Vision_data`（`auto_aim_interfaces/msg/Vision`）
 
-它不发布 `/Robot_ctrl_data` 或任何其他业务 topic，不设置 ROS 参数，不打开相机、海康 SDK 或串口，也不对输入消息做修改。它没有 `serial_enabled`、`dry_run`、`allow_fire` 或 `fire_command` 开关；仓库既有安全默认值仍保持 `serial_enabled=false`、`dry_run=true`、`allow_fire=false`、`fire_command=0`。
+它不发布 `/Robot_ctrl_data` 或任何其他 topic，不设置 ROS 参数，不打开相机、海康 SDK 或串口，也不对输入消息做修改。节点采用最小 `rclcpp` 接口构造，不创建 rosout、参数事件、参数服务或客户端；ROS graph 中只有上述三个订阅。它没有 `serial_enabled`、`dry_run`、`allow_fire` 或 `fire_command` 开关；仓库既有安全默认值仍保持 `serial_enabled=false`、`dry_run=true`、`allow_fire=false`、`fire_command=0`。
 
 ## 构建与测试
 
@@ -30,7 +30,7 @@ ament_xmllint src/auto_aim_tools/package.xml
 git diff --check
 ```
 
-`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式与边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并确认测试图中没有 `/Robot_ctrl_data` publisher。测试不连接硬件。
+`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式、typed encoding 算术溢出与其他边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并检查节点图只有三个输入订阅。`process_contract_test.cpp` 启动真实可执行程序，用标准 JSON parser 解析报告，并验证正常、FAIL、SIGINT 的退出码以及 `ros2 run` 的失败路径。当前 ROS Humble 验证包含 31 个 GTest case，`colcon test-result` 汇总为 34 项、0 error、0 failure、0 skipped；测试不连接硬件。
 
 ## Orin 与实车前执行
 
@@ -62,8 +62,11 @@ ros2 run auto_aim_tools ros_input_preflight \
   --duration 10 \
   --timeout 1.0 \
   --vehicle-profile dog_leg \
-  --format json > /tmp/ros_input_preflight.json
+  --format json \
+  --output /tmp/ros_input_preflight.json
 ```
+
+机器读取时必须使用 `--output`，不要把 `ros2 run` 的 stdout 直接重定向为 JSON。预检失败会保留退出码 `2`，而 `ros2run` 会在 stdout 追加失败提示；`--output` 将报告直接写入指定文件，因此该文件仍是单个合法 JSON 文档。写文件失败同样返回 `2`，不会留下被当作成功报告的 stdout JSON。
 
 默认不比较 Image 与 Vision 的 Header 时间戳，并报告“时间基准未确认”。只有硬件/ROS 负责人已经明确二者使用同一时钟域时，才允许执行：
 

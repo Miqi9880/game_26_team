@@ -105,6 +105,39 @@ TEST(PreflightAnalyzerTest, EmptyImageAndBadStepFailWithoutException)
   EXPECT_EQ(finding(report, "image.data_length")->status, Status::Fail);
 }
 
+TEST(PreflightAnalyzerTest, TypedEncodingRowWidthOverflowFailsClosed)
+{
+  PreflightAnalyzer analyzer({}, 0.0);
+  auto sample = image();
+  sample.encoding = "64UC1152921504606846976";
+  sample.width = 2U;
+  sample.height = 1U;
+  sample.step = 1U;
+  sample.data_size = 1U;
+  EXPECT_NO_THROW(analyzer.observe_image(sample, 0.1));
+
+  const auto report = analyzer.build_report(0.2);
+  EXPECT_EQ(finding(report, "image.encoding")->status, Status::Pass);
+  EXPECT_EQ(finding(report, "image.step")->status, Status::Fail);
+  EXPECT_EQ(finding(report, "image.data_length")->status, Status::Fail);
+  EXPECT_NE(
+    finding(report, "image.step")->reason.find("cannot be represented"),
+    std::string::npos);
+}
+
+TEST(PreflightAnalyzerTest, TypedEncodingNumericOverflowFailsClosed)
+{
+  PreflightAnalyzer analyzer({}, 0.0);
+  auto sample = image();
+  sample.encoding = "64UC999999999999999999999999999999999999999999999999";
+  EXPECT_NO_THROW(analyzer.observe_image(sample, 0.1));
+
+  const auto report = analyzer.build_report(0.2);
+  EXPECT_EQ(finding(report, "image.encoding")->status, Status::Fail);
+  EXPECT_EQ(finding(report, "image.step")->status, Status::Fail);
+  EXPECT_EQ(finding(report, "image.data_length")->status, Status::Fail);
+}
+
 TEST(PreflightAnalyzerTest, NonFiniteCameraMatrixFails)
 {
   PreflightAnalyzer analyzer({}, 0.0);

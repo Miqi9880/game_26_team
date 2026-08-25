@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -30,6 +31,7 @@ struct Arguments
   double duration_s{5.0};
   double timeout_s{1.0};
   std::string format{"text"};
+  std::string output_path;
   std::string vehicle_profile{"unselected"};
   bool shared_clock_domain{false};
   double sync_tolerance_ms{50.0};
@@ -64,6 +66,7 @@ void print_usage(std::ostream & stream)
     "  --duration SECONDS              observation duration (default: 5)\n"
     "  --timeout SECONDS               Image/Vision timeout (default: 1)\n"
     "  --format text|json              report format (default: text)\n"
+    "  --output PATH                   write only the report to PATH\n"
     "  --vehicle-profile PROFILE       unselected|new_turtle|dog_leg\n"
     "  --assume-shared-clock-domain    explicitly allow cross-topic comparison\n"
     "  --sync-tolerance-ms MILLISECONDS diagnostic delta tolerance (default: 50)\n";
@@ -85,6 +88,11 @@ Arguments parse_arguments(const std::vector<std::string> & arguments)
       result.format = next_value(arguments, &index, option);
       if (result.format != "text" && result.format != "json") {
         throw std::invalid_argument("--format must be text or json");
+      }
+    } else if (option == "--output") {
+      result.output_path = next_value(arguments, &index, option);
+      if (result.output_path.empty()) {
+        throw std::invalid_argument("--output path must not be empty");
       }
     } else if (option == "--vehicle-profile") {
       result.vehicle_profile = next_value(arguments, &index, option);
@@ -127,7 +135,7 @@ int main(int argc, char ** argv)
       start_s);
     auto node = std::make_shared<auto_aim_tools::RosInputPreflightNode>(analyzer);
     rclcpp::executors::SingleThreadedExecutor executor;
-    executor.add_node(node);
+    executor.add_node(node->get_node_base_interface());
     const double deadline_s = start_s + arguments.duration_s;
     while (
       rclcpp::ok() && caught_signal == 0 &&
@@ -138,10 +146,20 @@ int main(int argc, char ** argv)
     }
 
     const auto report = analyzer->build_report(auto_aim_tools::monotonic_seconds());
-    std::cout << (arguments.format == "json" ?
-    auto_aim_tools::format_report_json(report) :
-    auto_aim_tools::format_report_text(report));
-    executor.remove_node(node);
+    const auto rendered = arguments.format == "json" ?
+      auto_aim_tools::format_report_json(report) :
+      auto_aim_tools::format_report_text(report);
+    if (arguments.output_path.empty()) {
+      std::cout << rendered;
+    } else {
+      std::ofstream output(arguments.output_path, std::ios::binary | std::ios::trunc);
+      output << rendered;
+      output.close();
+      if (!output) {
+        throw std::runtime_error("failed to write report to " + arguments.output_path);
+      }
+    }
+    executor.remove_node(node->get_node_base_interface());
     node.reset();
     if (rclcpp::ok()) {
       rclcpp::shutdown();

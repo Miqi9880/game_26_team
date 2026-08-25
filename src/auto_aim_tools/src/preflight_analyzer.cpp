@@ -123,6 +123,78 @@ bool timed_topic(const std::string & topic)
   return topic == kImageTopic || topic == kVisionTopic;
 }
 
+enum class EncodingWidthStatus : std::uint8_t
+{
+  Known,
+  Unknown,
+  Invalid,
+};
+
+struct EncodingWidth
+{
+  EncodingWidthStatus status{EncodingWidthStatus::Unknown};
+  std::optional<std::size_t> bytes;
+  std::string reason;
+};
+
+std::optional<std::size_t> parse_size(const std::string & digits)
+{
+  std::size_t value = 0U;
+  for (const char character : digits) {
+    const auto digit = static_cast<std::size_t>(character - '0');
+    if (value > (std::numeric_limits<std::size_t>::max() - digit) / 10U) {
+      return std::nullopt;
+    }
+    value = value * 10U + digit;
+  }
+  return value;
+}
+
+EncodingWidth encoding_width(const std::string & encoding)
+{
+  static const std::map<std::string, std::size_t> fixed_encodings{
+    {"mono8", 1U}, {"mono16", 2U}, {"bgr8", 3U}, {"rgb8", 3U},
+    {"bgra8", 4U}, {"rgba8", 4U}, {"bayer_rggb8", 1U},
+    {"bayer_bggr8", 1U}, {"bayer_gbrg8", 1U}, {"bayer_grbg8", 1U},
+    {"bayer_rggb16", 2U}, {"bayer_bggr16", 2U}, {"bayer_gbrg16", 2U},
+    {"bayer_grbg16", 2U}, {"yuv422", 2U}, {"yuyv", 2U}, {"uyvy", 2U},
+  };
+  const auto fixed = fixed_encodings.find(lowercase(encoding));
+  if (fixed != fixed_encodings.end()) {
+    return EncodingWidth{EncodingWidthStatus::Known, fixed->second, ""};
+  }
+
+  static const std::regex typed_encoding(R"(^([0-9]+)(U|S|F)C([1-9][0-9]*)$)");
+  std::smatch match;
+  const auto canonical = uppercase(encoding);
+  if (!std::regex_match(canonical, match, typed_encoding)) {
+    return EncodingWidth{
+      EncodingWidthStatus::Unknown, std::nullopt,
+      "Encoding is not in the known byte-width table"};
+  }
+
+  const auto bits = parse_size(match[1].str());
+  const auto channels = parse_size(match[3].str());
+  if (!bits.has_value() || !channels.has_value()) {
+    return EncodingWidth{
+      EncodingWidthStatus::Invalid, std::nullopt,
+      "Typed encoding numeric component exceeds size_t"};
+  }
+  if (*bits != 8U && *bits != 16U && *bits != 32U && *bits != 64U) {
+    return EncodingWidth{
+      EncodingWidthStatus::Invalid, std::nullopt,
+      "Typed encoding bit depth must be 8, 16, 32, or 64"};
+  }
+  const std::size_t channel_bytes = *bits / 8U;
+  if (*channels > std::numeric_limits<std::size_t>::max() / channel_bytes) {
+    return EncodingWidth{
+      EncodingWidthStatus::Invalid, std::nullopt,
+      "Typed encoding bytes per pixel overflows size_t"};
+  }
+  return EncodingWidth{
+    EncodingWidthStatus::Known, *channels * channel_bytes, ""};
+}
+
 }  // namespace
 
 const char * status_name(Status status) noexcept
@@ -137,32 +209,7 @@ const char * status_name(Status status) noexcept
 
 std::optional<std::size_t> bytes_per_pixel(const std::string & encoding)
 {
-  static const std::map<std::string, std::size_t> fixed_encodings{
-    {"mono8", 1U}, {"mono16", 2U}, {"bgr8", 3U}, {"rgb8", 3U},
-    {"bgra8", 4U}, {"rgba8", 4U}, {"bayer_rggb8", 1U},
-    {"bayer_bggr8", 1U}, {"bayer_gbrg8", 1U}, {"bayer_grbg8", 1U},
-    {"bayer_rggb16", 2U}, {"bayer_bggr16", 2U}, {"bayer_gbrg16", 2U},
-    {"bayer_grbg16", 2U}, {"yuv422", 2U}, {"yuyv", 2U}, {"uyvy", 2U},
-  };
-  const auto fixed = fixed_encodings.find(lowercase(encoding));
-  if (fixed != fixed_encodings.end()) {
-    return fixed->second;
-  }
-
-  static const std::regex typed_encoding(R"(^([0-9]+)(U|S|F)C([1-9][0-9]*)$)");
-  std::smatch match;
-  const auto canonical = uppercase(encoding);
-  if (!std::regex_match(canonical, match, typed_encoding)) {
-    return std::nullopt;
-  }
-  const auto bits = std::stoul(match[1].str());
-  const auto channels = std::stoul(match[3].str());
-  if ((bits != 8U && bits != 16U && bits != 32U && bits != 64U) ||
-    channels > std::numeric_limits<std::size_t>::max() / (bits / 8U))
-  {
-    return std::nullopt;
-  }
-  return channels * (bits / 8U);
+  return encoding_width(encoding).bytes;
 }
 
 PreflightAnalyzer::PreflightAnalyzer(PreflightConfig config, double start_s)
@@ -245,11 +292,16 @@ void PreflightAnalyzer::observe_image(const ImageSample & sample, double arrival
     latest_image_size_ = std::array<std::uint32_t, 2>{{sample.width, sample.height}};
   }
 
-  const auto pixel_bytes = bytes_per_pixel(sample.encoding);
+  const auto encoding = encoding_width(sample.encoding);
+  const auto pixel_bytes = encoding.bytes;
   if (sample.encoding.empty()) {
     record(
       "image.encoding", Status::Fail, "image.encoding", kImageTopic,
       "Image encoding is empty");
+  } else if (encoding.status == EncodingWidthStatus::Invalid) {
+    record(
+      "image.encoding", Status::Fail, "image.encoding", kImageTopic,
+      encoding.reason, {{"encoding", sample.encoding}});
   } else if (!pixel_bytes.has_value()) {
     record(
       "image.encoding", Status::Warn, "image.encoding", kImageTopic,
@@ -262,25 +314,39 @@ void PreflightAnalyzer::observe_image(const ImageSample & sample, double arrival
       {{"encoding", sample.encoding}, {"bytes_per_pixel", size_value(*pixel_bytes)}});
   }
 
-  bool step_valid = sample.step > 0U;
+  bool row_width_representable = true;
+  bool step_valid = sample.step > 0U && encoding.status != EncodingWidthStatus::Invalid;
   std::uint64_t minimum_step = 0U;
   if (pixel_bytes.has_value() && sample.width > 0U) {
-    minimum_step = static_cast<std::uint64_t>(sample.width) * *pixel_bytes;
-    step_valid = step_valid && sample.step >= minimum_step;
+    if (*pixel_bytes >
+      std::numeric_limits<std::uint64_t>::max() /
+      static_cast<std::uint64_t>(sample.width))
+    {
+      row_width_representable = false;
+    } else {
+      minimum_step = static_cast<std::uint64_t>(sample.width) * *pixel_bytes;
+      row_width_representable =
+        minimum_step <= std::numeric_limits<std::uint32_t>::max();
+    }
+    step_valid = step_valid && row_width_representable && sample.step >= minimum_step;
   }
+  const std::string step_reason = !row_width_representable ?
+    "Encoded row width cannot be represented by sensor_msgs/Image step" :
+    "Image step must be positive and cover one encoded row";
   record(
     "image.step", step_valid ? Status::Pass : Status::Fail, "image.step", kImageTopic,
     step_valid ? "Image step is structurally valid" :
-    "Image step must be positive and cover one encoded row",
+    step_reason,
     {{"step", std::to_string(sample.step)}, {"minimum_step", integer(minimum_step)}});
 
   const auto expected = static_cast<std::uint64_t>(sample.step) * sample.height;
-  const bool length_valid = expected > 0U && sample.data_size == expected;
+  const bool length_valid = step_valid && expected > 0U && sample.data_size == expected;
   record(
     "image.data_length", length_valid ? Status::Pass : Status::Fail,
     "image.data_length", kImageTopic,
     length_valid ? "Image data length matches step times height" :
-    "Image data must be non-empty and equal step times height",
+    (!step_valid ? "Image step is invalid, so the data layout cannot pass" :
+    "Image data must be non-empty and equal step times height"),
     {{"data_length", size_value(sample.data_size)}, {"expected_length", integer(expected)}});
 }
 

@@ -126,7 +126,7 @@ Report run_scenario(
   auto publisher = std::make_shared<FakeInputPublisher>(
     publish_image, publish_info, publish_vision);
   rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(preflight);
+  executor.add_node(preflight->get_node_base_interface());
   executor.add_node(publisher);
   spin_for(&executor, 100ms);
 
@@ -146,9 +146,11 @@ Report run_scenario(
   }
 
   const auto report = analyzer->build_report(monotonic_seconds());
-  EXPECT_TRUE(preflight->get_publishers_info_by_topic("/Robot_ctrl_data").empty());
+  EXPECT_TRUE(
+    preflight->get_node_graph_interface()->get_publishers_info_by_topic(
+      "/Robot_ctrl_data").empty());
   executor.remove_node(publisher);
-  executor.remove_node(preflight);
+  executor.remove_node(preflight->get_node_base_interface());
   return report;
 }
 
@@ -178,6 +180,30 @@ TEST_F(FakeRosPublishersTest, NormalInputIsAccepted)
   EXPECT_EQ(finding(report, "camera_info.K")->status, Status::Pass);
   EXPECT_EQ(finding(report, "vision.yaw_range")->status, Status::Pass);
   EXPECT_EQ(finding(report, "vision.acceleration_finite")->status, Status::Warn);
+}
+
+TEST_F(FakeRosPublishersTest, NodeGraphContainsOnlyThreeInputSubscriptions)
+{
+  auto analyzer = std::make_shared<PreflightAnalyzer>();
+  auto preflight = std::make_shared<RosInputPreflightNode>(analyzer);
+  const auto graph = preflight->get_node_graph_interface();
+
+  const auto publishers = graph->get_publisher_names_and_types_by_node(
+    "ros_input_preflight", "/");
+  const auto subscriptions = graph->get_subscriber_names_and_types_by_node(
+    "ros_input_preflight", "/");
+  const auto services = graph->get_service_names_and_types_by_node(
+    "ros_input_preflight", "/");
+  const auto clients = graph->get_client_names_and_types_by_node(
+    "ros_input_preflight", "/");
+
+  EXPECT_TRUE(publishers.empty());
+  EXPECT_TRUE(services.empty());
+  EXPECT_TRUE(clients.empty());
+  EXPECT_EQ(subscriptions.size(), 3U);
+  EXPECT_EQ(subscriptions.count(kImageTopic), 1U);
+  EXPECT_EQ(subscriptions.count(kCameraInfoTopic), 1U);
+  EXPECT_EQ(subscriptions.count(kVisionTopic), 1U);
 }
 
 TEST_F(FakeRosPublishersTest, MissingTopicFails)

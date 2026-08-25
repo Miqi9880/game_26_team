@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import sys
 from collections import Counter, OrderedDict
@@ -371,10 +372,13 @@ def _validate_sequence_and_frames(analysis: Analysis) -> None:
         if current < previous:
             analysis.error("frame_rollback", f"frame number rolled back from {previous} to {current}", value=current)
 
-    track_ids = [row.values.get("track_id") for row in analysis.records if isinstance(row.values.get("track_id"), int)]
-    for previous, current in zip(track_ids, track_ids[1:]):
-        if current < previous:
-            analysis.error("track_id_rollback", f"track_id rolled back from {previous} to {current}", value=current)
+    # ``auto_aim_offline`` writes one row per detection, preserving detector
+    # order rather than sorting rows by track ID.  Consequently a valid
+    # multi-target frame can contain IDs such as ``[2, 1]`` (and detector
+    # order may change again on the next frame).  Track IDs are identifiers,
+    # not a frame-level sequence, so a global monotonicity check here would
+    # reject valid evidence.  Track IDs still contribute to distinct-ID and
+    # selected-track summaries below, but no row-order continuity is inferred.
 
     # Missing frame IDs are useful evidence of dropped/filtered frames but are
     # a warning rather than a malformed CSV.  Keep the complete list bounded
@@ -873,17 +877,86 @@ def markdown_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+class ReportPathCollisionError(OSError):
+    """Raised when a requested report path aliases a protected output."""
+
+
+def _paths_alias(left: Union[str, Path], right: Union[str, Path]) -> bool:
+    """Return whether two paths identify the same filesystem object/path.
+
+    ``resolve(strict=False)`` catches lexical aliases and symlinked parent or
+    output paths, including paths that do not exist yet.  ``samefile`` adds
+    inode identity for existing hardlinks (and is also authoritative for
+    existing symlinks).  All filesystem errors are treated as inconclusive so
+    the caller can still report the eventual write error normally.
+    """
+
+    left_path = Path(left)
+    right_path = Path(right)
+    try:
+        if os.path.samefile(left_path, right_path):
+            return True
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        pass
+    try:
+        return left_path.resolve(strict=False) == right_path.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        try:
+            return Path(os.path.abspath(os.fspath(left_path))) == Path(os.path.abspath(os.fspath(right_path)))
+        except (OSError, TypeError, ValueError):
+            return False
+
+
+def _validate_report_paths(
+    input_path: Optional[Union[str, Path]],
+    json_path: Optional[Union[str, Path]],
+    markdown_path: Optional[Union[str, Path]],
+) -> None:
+    """Reject report paths that would overwrite input or each other."""
+
+    outputs: list[tuple[str, Path]] = []
+    if json_path:
+        outputs.append(("JSON", Path(json_path)))
+    if markdown_path:
+        outputs.append(("Markdown", Path(markdown_path)))
+
+    if input_path is not None:
+        protected = Path(input_path)
+        for label, output in outputs:
+            if _paths_alias(protected, output):
+                raise ReportPathCollisionError(
+                    f"refusing to overwrite input CSV with {label} report: {output}"
+                )
+
+    if len(outputs) == 2 and _paths_alias(outputs[0][1], outputs[1][1]):
+        raise ReportPathCollisionError(
+            f"refusing to write JSON and Markdown reports to the same path: {outputs[0][1]}"
+        )
+
+
+def _write_json_report(report: Mapping[str, Any], path_value: Union[str, Path]) -> None:
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def write_reports(
     report: Mapping[str, Any],
     json_path: Optional[Union[str, Path]] = None,
     markdown_path: Optional[Union[str, Path]] = None,
+    *,
+    input_path: Optional[Union[str, Path]] = None,
 ) -> None:
-    """Write JSON/Markdown reports, creating parent directories if needed."""
+    """Write JSON/Markdown reports, creating parent directories if needed.
 
+    Pass the source CSV as ``input_path`` (as the CLI does) so exact paths,
+    symlink aliases, and hardlink aliases are rejected before any output is
+    opened.  JSON and Markdown outputs are also required to be distinct.
+    """
+
+    _validate_report_paths(input_path, json_path, markdown_path)
     if json_path:
-        path = Path(json_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(report, json_path)
     if markdown_path:
         path = Path(markdown_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -919,16 +992,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         analysis.error("metadata_error", metadata_error)
     report = build_report(analysis)
     try:
-        write_reports(report, args.json_report, args.markdown_report)
+        write_reports(report, args.json_report, args.markdown_report, input_path=args.input_csv)
+    except ReportPathCollisionError as exc:
+        # A collision is rejected before any output is opened.  In particular,
+        # do not use the generic write-error fallback below, which could turn a
+        # protected input alias back into an overwrite.
+        report.setdefault("errors", []).append({"code": "report_path_collision", "message": str(exc)})
+        report["status"] = report["report_status"] = "FAIL"
     except OSError as exc:
         # The input diagnostics are still useful, but a failed requested
         # output is a report failure and should produce the FAIL exit status.
         report.setdefault("errors", []).append({"code": "report_write_error", "message": str(exc)})
         report["status"] = report["report_status"] = "FAIL"
-        if args.json_report:
+        # Preserve the historical best-effort JSON fallback only when it is
+        # still safe: never write an input alias or a path shared with the
+        # Markdown output after a failed write.
+        fallback_safe = bool(args.json_report)
+        if fallback_safe:
             try:
-                Path(args.json_report).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            except OSError:
+                _validate_report_paths(args.input_csv, args.json_report, args.markdown_report)
+                _write_json_report(report, args.json_report)
+            except (OSError, TypeError, ValueError):
                 pass
     if not args.json_report and not args.markdown_report:
         sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")

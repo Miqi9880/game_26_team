@@ -1,5 +1,7 @@
 import csv
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -98,6 +100,20 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertEqual(report["tracker_target"]["target_lock_49_frames"], 2)
         self.assertEqual(report["coverage"]["duplicate_frame_rows"], 1)
 
+    def test_multi_target_detection_order_does_not_trigger_track_id_rollback(self):
+        """Track IDs are identifiers; detector row order is not an ID order."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multi_target_order.csv"
+            write_csv(path, [
+                [0, 10, "tracking", 1, 49, 0, 1, 2, 2, 1, "", 0.1, 2],
+                [0, 10, "tracking", 0, 49, 0, 1, 2, 2, 1, "", 0.2, 1],
+            ])
+            report = report_for(path)
+
+        self.assertEqual(report["report_status"], "PASS")
+        self.assertFalse(any(item["code"] == "track_id_rollback" for item in report["errors"]))
+
     def test_tracking_distribution_and_switches(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "states.csv"
@@ -150,6 +166,85 @@ class EvidenceReportTests(unittest.TestCase):
             self.assertTrue(json_path.exists())
             self.assertTrue(md_path.exists())
             self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["report_status"], "FAIL")
+
+    def _assert_input_alias_rejected(self, output_kind, alias_kind):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "input.csv"
+            shutil.copyfile(FIXTURES / "normal.csv", input_path)
+            original = input_path.read_bytes()
+            if alias_kind == "same":
+                output_path = input_path
+            elif alias_kind == "symlink":
+                output_path = root / f"{output_kind}-symlink.out"
+                try:
+                    output_path.symlink_to(input_path)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlink unavailable: {exc}")
+            elif alias_kind == "hardlink":
+                output_path = root / f"{output_kind}-hardlink.out"
+                try:
+                    os.link(input_path, output_path)
+                except OSError as exc:
+                    self.skipTest(f"hardlink unavailable: {exc}")
+            else:
+                raise AssertionError(f"unknown alias kind: {alias_kind}")
+
+            option = "--json-report" if output_kind == "json" else "--markdown-report"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--input-csv", str(input_path), option, str(output_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("status=FAIL", result.stdout)
+            self.assertEqual(input_path.read_bytes(), original)
+
+    def test_cli_rejects_json_path_equal_to_input(self):
+        self._assert_input_alias_rejected("json", "same")
+
+    def test_cli_rejects_markdown_path_equal_to_input(self):
+        self._assert_input_alias_rejected("markdown", "same")
+
+    def test_cli_rejects_json_symlink_to_input(self):
+        self._assert_input_alias_rejected("json", "symlink")
+
+    def test_cli_rejects_markdown_symlink_to_input(self):
+        self._assert_input_alias_rejected("markdown", "symlink")
+
+    def test_cli_rejects_json_hardlink_to_input(self):
+        self._assert_input_alias_rejected("json", "hardlink")
+
+    def test_cli_rejects_markdown_hardlink_to_input(self):
+        self._assert_input_alias_rejected("markdown", "hardlink")
+
+    def test_cli_rejects_json_and_markdown_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "input.csv"
+            shutil.copyfile(FIXTURES / "normal.csv", input_path)
+            original = input_path.read_bytes()
+            report_path = root / "same-report.out"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--input-csv",
+                    str(input_path),
+                    "--json-report",
+                    str(report_path),
+                    "--markdown-report",
+                    str(report_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("status=FAIL", result.stdout)
+            self.assertFalse(report_path.exists())
+            self.assertEqual(input_path.read_bytes(), original)
 
 
 if __name__ == "__main__":

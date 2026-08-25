@@ -27,7 +27,7 @@ python3 tools/offline_evidence_report/auto_aim_evidence_report.py \
 - 算法内部角加速度：`rad/s²`
 - `fire_command` 基线：`0`
 
-工具只引用 CSV 已有字段，不改单位、不覆盖原数据、不生成 `RobotCtrl`。
+工具只引用 CSV 已有字段，不改单位、不覆盖原数据、不生成 `RobotCtrl`。报告写入前会拒绝与输入 CSV 相同或别名的 JSON/Markdown 路径（包括符号链接和硬链接），也拒绝 JSON 与 Markdown 彼此别名。
 
 ## 可选元数据
 

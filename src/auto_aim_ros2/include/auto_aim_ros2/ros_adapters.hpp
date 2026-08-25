@@ -127,7 +127,10 @@ inline auto to_ros_with_profile(
   message.pitch_vel = 0.0F;
   message.pitch_acc = 0.0F;
   message.target_lock = command.target_lock;
-  message.fire_command = command.fire_command;
+  // This is the production-facing ROS control boundary.  No reviewed fire
+  // authorization or MCU pulse/level contract exists yet, so an otherwise
+  // valid internal request must never become RobotCtrlData fire=1/2.
+  message.fire_command = pipeline::kFireNone;
   result.valid_command = true;
   return result;
 }

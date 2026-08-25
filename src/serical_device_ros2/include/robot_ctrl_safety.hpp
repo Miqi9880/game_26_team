@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -53,26 +52,13 @@ struct ControlConstraintResult
   }
 };
 
-// Convert a parameterized output frequency to a precise timer period.  The
-// default is 100 Hz, while measured rates in the hundreds remain representable
-// without truncating the period to whole milliseconds.
+// Compatibility wrapper for callers in this package.  The implementation is
+// shared with AutoAimNode so both publishers round parameterized Hz values in
+// exactly the same way.
 inline std::optional<std::chrono::nanoseconds> control_period_from_hz(
   double output_hz) noexcept
 {
-  if (!std::isfinite(output_hz) || output_hz <= 0.0) {
-    return std::nullopt;
-  }
-  const double period_ns = 1'000'000'000.0 / output_hz;
-  if (!std::isfinite(period_ns) || period_ns < 1.0 ||
-    period_ns > static_cast<double>(std::numeric_limits<std::int64_t>::max()))
-  {
-    return std::nullopt;
-  }
-  const auto count = static_cast<std::int64_t>(std::llround(period_ns));
-  if (count <= 0) {
-    return std::nullopt;
-  }
-  return std::chrono::nanoseconds(count);
+  return auto_aim_interfaces::control::control_period_from_hz(output_hz);
 }
 
 /**

@@ -31,9 +31,10 @@ Yaw 在输出边界归一化到闭区间 `[-180, 180]` degree。NaN、Inf、非�
 
 - 外部速度/加速度单位已经确认，但 MCU 对四个前馈字段的控制语义仍未确认，因此 ROS/串口真实控制路径始终发送 `yaw_vel=yaw_acc=pitch_vel=pitch_acc=0`。
 - 当前控制接口阶段无论上游请求什么，安全层都将 `fire_command` 固定为 `0`；`1`/`2` 的脉冲、电平、保持时间和停止规则仍待确认。
+- `AutoAimNode` 在启动时拒绝 `allow_fire=true`；`RobotCtrlSub` 即使收到该参数或直接 ROS 输入，也会在最终安全边界抑制开火。当前不存在可审核的 production fire profile。
 - 默认 `dry_run=true`、`serial_enabled=false`、`allow_fire=false`。dry-run、离线测试和 ROS 集成测试不连接真实串口，不运动云台，不发射。
 - `protocol_new.hpp` 的字段、packed 布局、CRC、命令号、端序和帧解析不在本约束层修改。
 
 ## 仍待确认
 
-波特率、真实 golden frame、MCU/Orin 端序和 FP32 ABI、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序仍不得猜测。
+`115200` 仅是现有串口路径的历史兼容默认值，不是已确认的实车波特率。固定 CRC8/CRC16 测试向量只提供软件回归证据，也不代替真实 golden frame 或硬件 CRC 权威实现。真实 golden frame、MCU/Orin 端序和 FP32 ABI、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序仍不得猜测。

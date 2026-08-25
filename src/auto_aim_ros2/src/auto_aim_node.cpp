@@ -82,7 +82,16 @@ public:
   : Node("auto_aim", options)
   {
     dry_run_ = declare_parameter<bool>("dry_run", true);
-    allow_fire_ = declare_parameter<bool>("allow_fire", false);
+    const auto allow_fire_requested = declare_parameter<bool>("allow_fire", false);
+    // There is no reviewed production fire profile or confirmed MCU fire
+    // timing contract in this repository.  Reject the request at startup
+    // rather than treating allow_fire as an advisory dry-run flag.
+    if (allow_fire_requested) {
+      throw std::invalid_argument(
+              "allow_fire requires a reviewed production fire authorization; "
+              "it must remain false in the current control interface");
+    }
+    allow_fire_ = false;
     serial_enabled_ = declare_parameter<bool>("serial_enabled", false);
     require_camera_info_ = declare_parameter<bool>("require_camera_info", true);
     backend_name_ = declare_parameter<std::string>("backend", "null");
@@ -142,13 +151,11 @@ public:
     if (!std::isfinite(test_zero_yaw_degree) || !std::isfinite(test_zero_pitch_degree)) {
       throw std::invalid_argument("test zero angles must be finite");
     }
-    if (output_hz_ <= 0.0 || input_timeout_ms_ <= 0) {
-      throw std::invalid_argument("output_hz and input_timeout_ms must be positive");
-    }
-    const auto period_ms = static_cast<std::int64_t>(
-      std::llround(1000.0 / output_hz_));
-    if (period_ms <= 0) {
-      throw std::invalid_argument("output_hz is too high for a millisecond ROS timer");
+    const auto control_period = auto_aim_interfaces::control::control_period_from_hz(output_hz_);
+    if (!control_period.has_value() || input_timeout_ms_ <= 0) {
+      throw std::invalid_argument(
+              "output_hz must produce a positive nanosecond timer period and "
+              "input_timeout_ms must be positive");
     }
     if (serial_enabled_) {
       throw std::invalid_argument(
@@ -234,7 +241,7 @@ public:
       "/Robot_ctrl_data", 10);
 
     timer_ = create_wall_timer(
-      std::chrono::milliseconds(period_ms), std::bind(&AutoAimNode::publish_control, this));
+      *control_period, std::bind(&AutoAimNode::publish_control, this));
     RCLCPP_INFO(
       get_logger(),
       "AutoAimNode started: backend=%s calibration=%s test_only=%s dry_run=%s "

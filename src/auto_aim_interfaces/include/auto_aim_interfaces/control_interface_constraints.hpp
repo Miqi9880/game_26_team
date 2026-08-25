@@ -2,8 +2,10 @@
 #define AUTO_AIM_INTERFACES__CONTROL_INTERFACE_CONSTRAINTS_HPP_
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -122,6 +124,31 @@ inline constexpr const char * constraint_status_name(ConstraintStatus status) no
       return "non_finite_input";
   }
   return "non_finite_input";
+}
+
+// Both the vision publisher and the RobotCtrl serial bridge use this one
+// conversion.  It preserves the conservative 100 Hz default while avoiding
+// different millisecond-vs-nanosecond rounding behaviour at higher measured
+// rates.  It does not make any latency or MCU watchdog claim.
+inline std::optional<std::chrono::nanoseconds> control_period_from_hz(
+  double output_hz) noexcept
+{
+  if (!std::isfinite(output_hz) || output_hz <= 0.0) {
+    return std::nullopt;
+  }
+  const double period_ns = 1'000'000'000.0 / output_hz;
+  // int64_t max rounds to 2^63 as a double.  Reject equality as well, so the
+  // following llround/cast cannot produce an out-of-range nanosecond count.
+  if (!std::isfinite(period_ns) || period_ns < 1.0 ||
+    period_ns >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+  {
+    return std::nullopt;
+  }
+  const auto count = static_cast<std::int64_t>(std::llround(period_ns));
+  if (count <= 0) {
+    return std::nullopt;
+  }
+  return std::chrono::nanoseconds(count);
 }
 
 // Canonical range is inclusive [-180, 180].  Exact +/-180 values keep their

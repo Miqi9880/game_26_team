@@ -141,6 +141,23 @@ TEST(RosAdapter, ConvertsRadiansToDegreesAndZerosMotionUntilMcuSemanticsAreConfi
   EXPECT_EQ(message.fire_command, command.fire_command);
 }
 
+TEST(RosAdapter, SuppressesNonzeroFireAtRobotCtrlBoundary)
+{
+  AimCommand command{};
+  command.yaw_rad = 0.25F;
+  command.pitch_rad = -0.1F;
+  command.target_lock = kTargetLocked;
+
+  for (const auto requested_fire : {kFireBurst, kFireSingle}) {
+    command.fire_command = requested_fire;
+    const auto result = rm_auto_aim::ros_adapters::to_ros_with_profile(
+      command, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+    ASSERT_TRUE(result.accepted());
+    EXPECT_EQ(result.message.target_lock, kTargetLocked);
+    EXPECT_EQ(result.message.fire_command, kFireNone);
+  }
+}
+
 TEST(RosAdapter, InvalidAimCommandFailsClosedAtRobotCtrlBoundary)
 {
   using rm_auto_aim::pipeline::AimCommand;

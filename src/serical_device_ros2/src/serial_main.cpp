@@ -53,7 +53,10 @@ bool SerialMain::CommInit()
 		return true;
 	}
 	
-	device_ptr_ = std::make_shared<SerialDevice>(device_path_, 115200); // 比特率115200
+	// Historical compatibility/default baud rate from the existing serial path.
+	// The actual vehicle baud rate is not confirmed by the current electrical
+	// control contract; this value is not production validation.
+	device_ptr_ = std::make_shared<SerialDevice>(device_path_, 115200);
 	
 	if (!device_ptr_->Init())
 	{

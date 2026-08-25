@@ -259,7 +259,19 @@ TEST(RobotCtrlSafety, ControlPeriodSupportsParameterizedHundredsOfHertz)
   ASSERT_TRUE(period_250.has_value());
   EXPECT_EQ(period_250->count(), 4'000'000);
 
+  const auto shared_period_333 =
+    auto_aim_interfaces::control::control_period_from_hz(333.0);
+  const auto bridge_period_333 = rm_auto_aim::safety::control_period_from_hz(333.0);
+  ASSERT_TRUE(shared_period_333.has_value());
+  ASSERT_TRUE(bridge_period_333.has_value());
+  EXPECT_EQ(shared_period_333->count(), 3'003'003);
+  EXPECT_EQ(*shared_period_333, *bridge_period_333);
+
   EXPECT_FALSE(rm_auto_aim::safety::control_period_from_hz(0.0).has_value());
+  const auto too_slow_hz = 1'000'000'000.0 /
+    static_cast<double>(std::numeric_limits<std::int64_t>::max());
+  EXPECT_FALSE(auto_aim_interfaces::control::control_period_from_hz(too_slow_hz).has_value());
+  EXPECT_FALSE(rm_auto_aim::safety::control_period_from_hz(too_slow_hz).has_value());
   EXPECT_FALSE(rm_auto_aim::safety::control_period_from_hz(
     std::numeric_limits<double>::quiet_NaN()).has_value());
 }

@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "crc.h"
 #include "protocol_new.hpp"
 #include "serial_frame_parser.h"
 #include "serial_main.h"
@@ -138,6 +139,29 @@ TEST(SerialProtocolLayout, PackedOffsetsAndFrameLengths)
 
   EXPECT_EQ(sizeof(io::VisionData) + kFrameOverhead, 58U);
   EXPECT_EQ(sizeof(io::RobotCtrlData) + kFrameOverhead, 37U);
+}
+
+TEST(SerialCrc, KnownVectorsAndCrc16LittleEndianWireOrder)
+{
+  // These are fixed regression vectors for the deployed reflected lookup
+  // tables (CRC-8 init 0xff and CRC-16 init 0xffff).  They are not a claim
+  // that a vehicle golden frame or hardware CRC contract has been confirmed.
+  std::array<std::uint8_t, 1> one_byte_zero{{0x00U}};
+  std::array<std::uint8_t, 1> one_byte_one{{0x01U}};
+  std::array<std::uint8_t, 4> payload{{0x01U, 0x02U, 0x03U, 0x04U}};
+
+  EXPECT_EQ(Get_CRC8_Check_Sum(one_byte_zero.data(), one_byte_zero.size(), 0xffU), 0x35U);
+  EXPECT_EQ(Get_CRC16_Check_Sum(one_byte_zero.data(), one_byte_zero.size(), 0xffffU), 0x0f87U);
+  EXPECT_EQ(Get_CRC8_Check_Sum(one_byte_one.data(), one_byte_one.size(), 0xffU), 0x6bU);
+  EXPECT_EQ(Get_CRC16_Check_Sum(one_byte_one.data(), one_byte_one.size(), 0xffffU), 0x1e0eU);
+  EXPECT_EQ(Get_CRC8_Check_Sum(payload.data(), payload.size(), 0xffU), 0x1fU);
+  EXPECT_EQ(Get_CRC16_Check_Sum(payload.data(), payload.size(), 0xffffU), 0xc66eU);
+
+  std::array<std::uint8_t, 6> framed_payload{{0x01U, 0x02U, 0x03U, 0x04U, 0x00U, 0x00U}};
+  Append_CRC16_Check_Sum(framed_payload.data(), framed_payload.size());
+  EXPECT_EQ(framed_payload[4], 0x6eU);
+  EXPECT_EQ(framed_payload[5], 0xc6U);
+  EXPECT_TRUE(Verify_CRC16_Check_Sum(framed_payload.data(), framed_payload.size()));
 }
 
 TEST(SerialRosFieldMapping, VisionFieldsAreForwardedWithoutUnitConversion)

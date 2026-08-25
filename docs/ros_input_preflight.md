@@ -30,7 +30,7 @@ ament_xmllint src/auto_aim_tools/package.xml
 git diff --check
 ```
 
-`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式、typed encoding 算术溢出与其他边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并检查节点图只有三个输入订阅。`process_contract_test.cpp` 启动真实可执行程序，用标准 JSON parser 解析报告，并验证正常、FAIL、SIGINT 的退出码以及 `ros2 run` 的失败路径。当前 ROS Humble 验证包含 31 个 GTest case，`colcon test-result` 汇总为 34 项、0 error、0 failure、0 skipped；测试不连接硬件。
+`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式、typed encoding 算术溢出与其他边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并检查节点图只有三个输入订阅。`process_contract_test.cpp` 启动真实可执行程序，用标准 JSON parser 解析报告，并验证正常、FAIL、SIGINT 的退出码、`ros2 run` 的失败路径，以及异常 Image、CameraInfo、Vision 的 `overall`、finding 状态和原因。当前 ROS Humble 验证包含 34 个 GTest case，`colcon test-result` 汇总为 37 项、0 error、0 failure、0 skipped；测试不连接硬件。
 
 ## Orin 与实车前执行
 

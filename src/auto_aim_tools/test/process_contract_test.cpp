@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -106,6 +107,31 @@ bool parses_as_json(const std::string & path)
   return parser > 0 && wait_for_process(parser) == 0;
 }
 
+bool json_has_overall(const std::string & path, const std::string & status)
+{
+  const pid_t parser = launch_process(
+    {"python3", "-c",
+      "import json,sys; data=json.load(open(sys.argv[1], encoding='utf-8')); "
+      "assert data['overall'] == sys.argv[2]",
+      path, status},
+    "/dev/null");
+  return parser > 0 && wait_for_process(parser) == 0;
+}
+
+bool json_has_failing_finding(
+  const std::string & path, const std::string & check,
+  const std::string & reason_fragment)
+{
+  const pid_t parser = launch_process(
+    {"python3", "-c",
+      "import json,sys; data=json.load(open(sys.argv[1], encoding='utf-8')); "
+      "assert any(item.get('check') == sys.argv[2] and item.get('status') == 'FAIL' "
+      "and sys.argv[3] in item.get('reason', '') for item in data['findings'])",
+      path, check, reason_fragment},
+    "/dev/null");
+  return parser > 0 && wait_for_process(parser) == 0;
+}
+
 std::vector<std::string> direct_arguments(
   const std::string & output, const std::string & duration)
 {
@@ -116,11 +142,19 @@ std::vector<std::string> direct_arguments(
   };
 }
 
+enum class InputScenario : std::uint8_t
+{
+  Valid,
+  InvalidImage,
+  InvalidCameraInfo,
+  InvalidVision,
+};
+
 class ContractPublisher final : public rclcpp::Node
 {
 public:
-  ContractPublisher()
-  : Node("preflight_process_contract_publisher")
+  explicit ContractPublisher(InputScenario scenario)
+  : Node("preflight_process_contract_publisher"), scenario_(scenario)
   {
     image_ = create_publisher<sensor_msgs::msg::Image>("/image_raw", rclcpp::SensorDataQoS());
     camera_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
@@ -138,6 +172,12 @@ public:
     image.encoding = "bgr8";
     image.step = 6U;
     image.data.resize(12U);
+    if (scenario_ == InputScenario::InvalidImage) {
+      image.height = 1U;
+      image.encoding = "64UC1152921504606846976";
+      image.step = 1U;
+      image.data.resize(1U);
+    }
     image_->publish(image);
 
     sensor_msgs::msg::CameraInfo info;
@@ -147,6 +187,9 @@ public:
     info.distortion_model = "plumb_bob";
     info.d.assign(5U, 0.0);
     info.k = {{100.0, 0.0, 1.0, 0.0, 100.0, 1.0, 0.0, 0.0, 1.0}};
+    if (scenario_ == InputScenario::InvalidCameraInfo) {
+      info.k[0] = std::numeric_limits<double>::quiet_NaN();
+    }
     camera_info_->publish(info);
 
     auto_aim_interfaces::msg::Vision vision;
@@ -158,14 +201,85 @@ public:
     vision.roll = 0.0F;
     vision.quaternion = {{1.0F, 0.0F, 0.0F, 0.0F}};
     vision.shoot_speed = 20.0F;
+    if (scenario_ == InputScenario::InvalidVision) {
+      vision.yaw = 181.0F;
+    }
     vision_->publish(vision);
   }
 
 private:
+  InputScenario scenario_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_;
   rclcpp::Publisher<auto_aim_interfaces::msg::Vision>::SharedPtr vision_;
 };
+
+int run_with_publishers(
+  InputScenario scenario, const std::string & output_path, bool verify_graph = false)
+{
+  static int domain_id = 187;
+  const std::string domain = std::to_string(domain_id++);
+  if (setenv("ROS_DOMAIN_ID", domain.c_str(), 1) != 0) {
+    return -1;
+  }
+  const pid_t process = launch_process(direct_arguments(output_path, "1.2"));
+  if (process <= 0) {
+    return -1;
+  }
+
+  int argc = 0;
+  rclcpp::init(argc, nullptr);
+  auto publisher = std::make_shared<ContractPublisher>(scenario);
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(publisher);
+
+  bool graph_checked = !verify_graph;
+  std::int32_t stamp = 1;
+  int status = 0;
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline &&
+    waitpid(process, &status, WNOHANG) == 0)
+  {
+    publisher->publish(stamp++);
+    executor.spin_some();
+    if (verify_graph) {
+      try {
+        const auto subscriptions = publisher->get_node_graph_interface()->
+          get_subscriber_names_and_types_by_node("ros_input_preflight", "/");
+        if (subscriptions.size() > 3U) {
+          ADD_FAILURE() << "preflight node exposed more than three subscriptions";
+        } else if (subscriptions.size() == 3U) {
+          EXPECT_EQ(subscriptions.count("/image_raw"), 1U);
+          EXPECT_EQ(subscriptions.count("/camera_info"), 1U);
+          EXPECT_EQ(subscriptions.count("/Vision_data"), 1U);
+          EXPECT_TRUE(
+            publisher->get_node_graph_interface()->get_publisher_names_and_types_by_node(
+              "ros_input_preflight", "/").empty());
+          EXPECT_TRUE(
+            publisher->get_node_graph_interface()->get_service_names_and_types_by_node(
+              "ros_input_preflight", "/").empty());
+          EXPECT_TRUE(
+            publisher->get_node_graph_interface()->get_client_names_and_types_by_node(
+              "ros_input_preflight", "/").empty());
+          graph_checked = true;
+        }
+      } catch (const rclcpp::exceptions::RCLError &) {
+        // DDS discovery can briefly change while the child node is starting.
+      }
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  executor.remove_node(publisher);
+  rclcpp::shutdown();
+
+  EXPECT_TRUE(graph_checked);
+  if (!WIFEXITED(status)) {
+    kill(process, SIGKILL);
+    waitpid(process, &status, 0);
+    return -1;
+  }
+  return WEXITSTATUS(status);
+}
 
 TEST(ProcessContractTest, DirectExecutableFailIsValidJsonAndReturnsTwo)
 {
@@ -174,6 +288,11 @@ TEST(ProcessContractTest, DirectExecutableFailIsValidJsonAndReturnsTwo)
   ASSERT_GT(process, 0);
   EXPECT_EQ(wait_for_process(process), 2);
   EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
+  EXPECT_TRUE(
+    json_has_failing_finding(
+      output.path(), "topic.received",
+      "No messages were received"));
 }
 
 TEST(ProcessContractTest, Ros2RunFailKeepsOutputFileAsValidJson)
@@ -187,6 +306,7 @@ TEST(ProcessContractTest, Ros2RunFailKeepsOutputFileAsValidJson)
   ASSERT_GT(process, 0);
   EXPECT_EQ(wait_for_process(process), 2);
   EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
 }
 
 TEST(ProcessContractTest, SigintReturnsOneThirtyAndStillWritesJson)
@@ -203,56 +323,39 @@ TEST(ProcessContractTest, SigintReturnsOneThirtyAndStillWritesJson)
 TEST(ProcessContractTest, ValidPublishersReturnZeroAndGraphHasOnlyThreeSubscriptions)
 {
   TemporaryFile output("pass");
-  ASSERT_EQ(setenv("ROS_DOMAIN_ID", "187", 1), 0);
-  const pid_t process = launch_process(direct_arguments(output.path(), "1.2"));
-  ASSERT_GT(process, 0);
-
-  int argc = 0;
-  rclcpp::init(argc, nullptr);
-  auto publisher = std::make_shared<ContractPublisher>();
-  rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(publisher);
-
-  bool graph_checked = false;
-  std::int32_t stamp = 1;
-  int status = 0;
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
-  while (std::chrono::steady_clock::now() < deadline &&
-    waitpid(process, &status, WNOHANG) == 0)
-  {
-    publisher->publish(stamp++);
-    executor.spin_some();
-    try {
-      const auto subscriptions = publisher->get_node_graph_interface()->
-        get_subscriber_names_and_types_by_node("ros_input_preflight", "/");
-      if (!subscriptions.empty()) {
-        EXPECT_EQ(subscriptions.size(), 3U);
-        EXPECT_EQ(subscriptions.count("/image_raw"), 1U);
-        EXPECT_EQ(subscriptions.count("/camera_info"), 1U);
-        EXPECT_EQ(subscriptions.count("/Vision_data"), 1U);
-        EXPECT_TRUE(
-          publisher->get_node_graph_interface()->get_publisher_names_and_types_by_node(
-            "ros_input_preflight", "/").empty());
-        EXPECT_TRUE(
-          publisher->get_node_graph_interface()->get_service_names_and_types_by_node(
-            "ros_input_preflight", "/").empty());
-        EXPECT_TRUE(
-          publisher->get_node_graph_interface()->get_client_names_and_types_by_node(
-            "ros_input_preflight", "/").empty());
-        graph_checked = true;
-      }
-    } catch (const rclcpp::exceptions::RCLError &) {
-      // DDS discovery can briefly change while the child node is starting.
-    }
-    std::this_thread::sleep_for(20ms);
-  }
-  executor.remove_node(publisher);
-  rclcpp::shutdown();
-
-  ASSERT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(WEXITSTATUS(status), 0);
-  EXPECT_TRUE(graph_checked);
+  EXPECT_EQ(run_with_publishers(InputScenario::Valid, output.path(), true), 0);
   EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "WARN"));
+}
+
+TEST(ProcessContractTest, InvalidImageFailsThroughExecutable)
+{
+  TemporaryFile output("invalid_image");
+  EXPECT_EQ(run_with_publishers(InputScenario::InvalidImage, output.path()), 2);
+  EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
+  EXPECT_TRUE(
+    json_has_failing_finding(output.path(), "image.step", "cannot be represented"));
+}
+
+TEST(ProcessContractTest, InvalidCameraInfoFailsThroughExecutable)
+{
+  TemporaryFile output("invalid_camera_info");
+  EXPECT_EQ(run_with_publishers(InputScenario::InvalidCameraInfo, output.path()), 2);
+  EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
+  EXPECT_TRUE(
+    json_has_failing_finding(output.path(), "camera_info.K", "must have 9 finite entries"));
+}
+
+TEST(ProcessContractTest, InvalidVisionFailsThroughExecutable)
+{
+  TemporaryFile output("invalid_vision");
+  EXPECT_EQ(run_with_publishers(InputScenario::InvalidVision, output.path()), 2);
+  EXPECT_TRUE(parses_as_json(output.path()));
+  EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
+  EXPECT_TRUE(
+    json_has_failing_finding(output.path(), "vision.yaw_range", "outside inclusive"));
 }
 
 }  // namespace

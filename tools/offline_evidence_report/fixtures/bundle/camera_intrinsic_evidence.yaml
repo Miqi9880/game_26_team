@@ -1,0 +1,4 @@
+schema_version: 1
+profile: evidence_only
+production_ready: false
+source: synthetic_test_fixture

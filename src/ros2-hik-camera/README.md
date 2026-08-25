@@ -17,14 +17,16 @@ For the complete Orin, SDK, calibration, topic and safe dry-run checklist, see
 source /opt/ros/humble/setup.bash
 source /path/to/game_26_dev/install/setup.bash
 ros2 launch hik_camera hik_camera.launch.py \
+  camera_serial:=CAMERA_SERIAL \
   use_sensor_data_qos:=true \
   camera_info_url:=file:///absolute/path/to/verified_camera_info.yaml
 ```
 
-The node enumerates USB cameras and currently opens the first entry. Connect
-only the intended camera during initial bring-up; do not rely on enumeration
-order when multiple devices are attached. Verify `/image_raw` and
-`/camera_info` before starting any detector:
+The node allows implicit selection only when exactly one USB camera is found.
+When multiple cameras are attached, set `camera_serial` to an exact serial
+number; startup is rejected if the requested serial is missing or duplicated.
+The default is an empty string, and no production serial number is checked in.
+Verify `/image_raw` and `/camera_info` before starting any detector:
 
 ```bash
 ros2 topic info /image_raw -v
@@ -55,6 +57,7 @@ camera rotation, extrinsics, coordinate transforms, or control.
 - exposure_time
 - gain
 
-`camera_name`, `camera_info_url`, `use_sensor_data_qos`, and the white-balance
-parameters are also accepted. See `config/camera_params.yaml` and the root
-bring-up document for units, calibration provenance and stop conditions.
+`camera_serial`, `camera_name`, `camera_info_url`, `use_sensor_data_qos`, and
+the white-balance parameters are also accepted. See
+`config/camera_params.yaml` and the root bring-up document for units,
+calibration provenance and stop conditions.

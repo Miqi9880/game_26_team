@@ -7,15 +7,15 @@
   <maintainer email="hj@todo.todo">hj</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>auto_aim_interfaces</exec_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>auto_aim_interfaces</depend>
 
-  <test_depend>python3-pytest</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
-    <build_type>ament_python</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

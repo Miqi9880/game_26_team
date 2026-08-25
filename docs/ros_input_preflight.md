@@ -1,6 +1,6 @@
 # ROS 2 自瞄输入预检工具
 
-`auto_aim_tools/ros_input_preflight` 是接入 Orin、真实相机或实车前使用的独立只读诊断工具。它只订阅：
+`auto_aim_tools/ros_input_preflight` 是 C++17 与 `rclcpp` 实现的独立只读诊断工具，用于接入 Orin、真实相机或实车前检查输入。它只订阅：
 
 - `/image_raw`（`sensor_msgs/msg/Image`）
 - `/camera_info`（`sensor_msgs/msg/CameraInfo`）
@@ -25,10 +25,12 @@ colcon test \
   --event-handlers console_direct+
 
 colcon test-result --verbose
+ament_uncrustify src/auto_aim_tools/include src/auto_aim_tools/src src/auto_aim_tools/test
+ament_xmllint src/auto_aim_tools/package.xml
 git diff --check
 ```
 
-`test_fake_ros_publishers.py` 使用 fake ROS publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并确认测试图中没有 `/Robot_ctrl_data` publisher。测试不连接硬件。
+`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式与边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并确认测试图中没有 `/Robot_ctrl_data` publisher。测试不连接硬件。
 
 ## Orin 与实车前执行
 
@@ -90,9 +92,9 @@ ros2 run auto_aim_tools ros_input_preflight \
 
 ```text
 ROS 2 INPUT PREFLIGHT: WARN
-[PASS] /image_raw image.encoding: Encoding has a known byte width | {"bytes_per_pixel": 3, "encoding": "bgr8"}
-[PASS] /camera_info camera_info.K: K has 9 finite entries with positive fx/fy and non-zero K[8] | {"length": 9}
-[PASS] /Vision_data vision.yaw_range: yaw is within inclusive [-180 degree, 180 degree] | {"yaw_degree": 12.5}
+[PASS] /image_raw image.encoding: Encoding has a known byte width | bytes_per_pixel=3, encoding=bgr8
+[PASS] /camera_info camera_info.K: K has 9 finite entries with positive fx/fy and non-zero K[8] | length=9
+[PASS] /Vision_data vision.yaw_range: yaw is within inclusive [-180 degree, 180 degree] | yaw=12.5 degree
 [WARN] /Vision_data vision.acceleration_finite: Installed Vision interface has no acceleration field; degree/s^2 check is unavailable
 [WARN] cross_topic image_vision.clock_domain: Shared clock domain was not explicitly declared: 时间基准未确认; timestamps were not compared
 summary: PASS=18, WARN=2, FAIL=0

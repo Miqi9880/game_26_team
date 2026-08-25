@@ -210,10 +210,17 @@ uint16_t SerialMain::SenderPackSolve(uint8_t *data, uint16_t data_length,
 	
 	memcpy(send_buf + index, data, data_length);//assign data
 	
+	// The MCU-confirmed upper-computer -> lower-computer 0x0102 control
+	// frame ends immediately after CRC16.  Other packet layouts retain their
+	// existing tail so the Vision receive protocol remains unchanged.
 	Append_CRC16_Check_Sum(send_buf, data_length + 9);
 
-	const io::MsgEndInfo frame_end{};
-	memcpy(send_buf + data_length + 9, &frame_end, sizeof(frame_end));
-	
-	return data_length + 9 + sizeof(frame_end);
+	if (cmd_id != io::CHASSIS_CTRL_CMD_ID)
+	{
+		const io::MsgEndInfo frame_end{};
+		memcpy(send_buf + data_length + 9, &frame_end, sizeof(frame_end));
+		return data_length + 9 + sizeof(frame_end);
+	}
+
+	return data_length + 9;
 }

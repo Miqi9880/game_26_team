@@ -15,8 +15,12 @@
 namespace
 {
 
-constexpr std::size_t kFrameOverhead =
-  sizeof(io::FrameHeader) + sizeof(std::uint16_t) + sizeof(std::uint16_t) + sizeof(io::MsgEndInfo);
+constexpr std::size_t kFramePrefixAndCrcOverhead =
+  sizeof(io::FrameHeader) + sizeof(std::uint16_t) + sizeof(std::uint16_t);
+constexpr std::size_t kVisionFrameOverhead =
+  kFramePrefixAndCrcOverhead + sizeof(io::MsgEndInfo);
+constexpr std::size_t kRobotCtrlFrameOverhead = kFramePrefixAndCrcOverhead;
+constexpr std::uint8_t kUntouchedByte = 0x5aU;
 
 std::uint8_t reference_crc8(const std::uint8_t * data, std::size_t length)
 {
@@ -89,11 +93,11 @@ std::uint16_t pack(
     reinterpret_cast<std::uint8_t *>(&payload), sizeof(T), command, frame.data());
 }
 
-void expect_common_frame(
+void expect_tail_framed_packet(
   std::array<std::uint8_t, 512> & frame, std::uint16_t length, std::uint16_t payload_length,
   std::uint16_t command, const void * payload)
 {
-  ASSERT_EQ(length, payload_length + kFrameOverhead);
+  ASSERT_EQ(length, payload_length + kVisionFrameOverhead);
 
   io::FrameHeader header{};
   std::memcpy(&header, frame.data(), sizeof(header));
@@ -137,8 +141,8 @@ TEST(SerialProtocolLayout, PackedOffsetsAndFrameLengths)
   EXPECT_EQ(offsetof(io::RobotCtrlData, target_lock), 24U);
   EXPECT_EQ(offsetof(io::RobotCtrlData, fire_command), 25U);
 
-  EXPECT_EQ(sizeof(io::VisionData) + kFrameOverhead, 58U);
-  EXPECT_EQ(sizeof(io::RobotCtrlData) + kFrameOverhead, 37U);
+  EXPECT_EQ(sizeof(io::VisionData) + kVisionFrameOverhead, 58U);
+  EXPECT_EQ(sizeof(io::RobotCtrlData) + kRobotCtrlFrameOverhead, 35U);
 }
 
 TEST(SerialCrc, KnownVectorsAndCrc16LittleEndianWireOrder)
@@ -214,10 +218,11 @@ TEST(SerialProtocolLoopback, VisionPackAndReceiveRoundTrip)
   std::array<std::uint8_t, 512> frame{};
 
   const auto length = pack(sender, input, io::VISION_ID, frame);
-  expect_common_frame(frame, length, sizeof(input), io::VISION_ID, &input);
+  expect_tail_framed_packet(frame, length, sizeof(input), io::VISION_ID, &input);
 
   SerialMain receiver;
-  EXPECT_EQ(receiver.ReceiveDataSolve(frame.data()), sizeof(io::VisionData) + kFrameOverhead);
+  EXPECT_EQ(
+    receiver.ReceiveDataSolve(frame.data()), sizeof(io::VisionData) + kVisionFrameOverhead);
   EXPECT_EQ(std::memcmp(&receiver.vision_msg_, &input, sizeof(input)), 0);
 }
 
@@ -226,9 +231,40 @@ TEST(SerialProtocolLoopback, RobotControlPack)
   const auto input = make_control();
   SerialMain sender;
   std::array<std::uint8_t, 512> frame{};
+  frame.fill(kUntouchedByte);
 
   const auto length = pack(sender, input, io::CHASSIS_CTRL_CMD_ID, frame);
-  expect_common_frame(frame, length, sizeof(input), io::CHASSIS_CTRL_CMD_ID, &input);
+  ASSERT_EQ(length, sizeof(input) + kRobotCtrlFrameOverhead);
+  EXPECT_EQ(length, 35U);
+
+  io::FrameHeader header{};
+  std::memcpy(&header, frame.data(), sizeof(header));
+  EXPECT_EQ(header.sof, io::HEADER_SOF);
+  EXPECT_EQ(header.data_length, sizeof(input));
+  EXPECT_EQ(header.seq, 1);
+  EXPECT_EQ(header.crc8, reference_crc8(frame.data(), sizeof(io::FrameHeader) - 1));
+  EXPECT_TRUE(Verify_CRC8_Check_Sum(frame.data(), sizeof(io::FrameHeader)));
+
+  std::uint16_t encoded_command = 0;
+  std::memcpy(
+    &encoded_command, frame.data() + sizeof(io::FrameHeader), sizeof(encoded_command));
+  EXPECT_EQ(encoded_command, io::CHASSIS_CTRL_CMD_ID);
+
+  const auto payload_offset = sizeof(io::FrameHeader) + sizeof(encoded_command);
+  EXPECT_EQ(std::memcmp(frame.data() + payload_offset, &input, sizeof(input)), 0);
+
+  const auto crc16_offset = payload_offset + sizeof(input);
+  ASSERT_EQ(crc16_offset, 33U);
+  EXPECT_EQ(crc16_offset + sizeof(std::uint16_t), length);
+  const auto expected_crc16 = reference_crc16(frame.data(), crc16_offset);
+  EXPECT_EQ(frame[crc16_offset], static_cast<std::uint8_t>(expected_crc16 & 0xffU));
+  EXPECT_EQ(frame[crc16_offset + 1], static_cast<std::uint8_t>((expected_crc16 >> 8U) & 0xffU));
+  EXPECT_TRUE(Verify_CRC16_Check_Sum(frame.data(), length));
+
+  // The two bytes after the transmitted 35-byte range remain untouched;
+  // 0x0102 must not append MsgEndInfo{0D, 0A} after its CRC16.
+  EXPECT_EQ(frame[length], kUntouchedByte);
+  EXPECT_EQ(frame[length + 1], kUntouchedByte);
 }
 
 TEST(SerialProtocolLoopback, RejectsCorruptedFramesAndInvalidInputs)

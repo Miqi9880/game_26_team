@@ -3,8 +3,10 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -18,6 +20,52 @@ class QualificationTests(unittest.TestCase):
         self.pnp_config = ROOT / "src/auto_aim_ros2/test/data/pnp_test_config.yaml"
         self.csv = ROOT / "tools/offline_evidence_report/fixtures/normal.csv"
         self.metadata = ROOT / "tools/offline_evidence_report/fixtures/bundle/normal_metadata.json"
+
+    def _schema_v2_profile(
+        self,
+        root: Path,
+        xml: Path,
+        binary: Path,
+        *,
+        profile_kind: str = "test_only",
+        xml_digest: object | None = None,
+        bin_digest: object | None = None,
+    ) -> Path:
+        """Build a reviewed two-member IR manifest around temporary bytes."""
+
+        import yaml
+
+        value = yaml.safe_load(self.model_profile.read_text(encoding="utf-8"))
+        value["schema_version"] = 2
+        value["profile"] = profile_kind
+        model = value["model"]
+        model.pop("path", None)
+        for key in ("sha256", "sha256sum", "artifact_sha256", "hash"):
+            model.pop(key, None)
+        model.update(
+            {
+                "id": "reviewed_openvino_ir",
+                "source": "reviewed-model-source",
+                "version": "reviewed-v2",
+                "format": "openvino_ir",
+                "artifacts": {
+                    "xml": {
+                        "path": str(xml),
+                        "sha256": hashlib.sha256(xml.read_bytes()).hexdigest() if xml_digest is None else xml_digest,
+                    },
+                    "bin": {
+                        "path": str(binary),
+                        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if bin_digest is None else bin_digest,
+                    },
+                },
+            }
+        )
+        if profile_kind == "production":
+            value["semantics"]["color_id_to_name"] = [f"color_{index}" for index in range(4)]
+            value["semantics"]["armor_class_names"] = [f"armor_{index}" for index in range(9)]
+        profile = root / "profile-v2.yaml"
+        profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+        return profile
 
     def test_test_only_requires_explicit_opt_in(self):
         result = audit_model_profile(self.model_profile)
@@ -57,23 +105,354 @@ class QualificationTests(unittest.TestCase):
     def test_model_hash_and_runtime_path_are_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            xml = root / "model.xml"
+            binary = root / "model.bin"
+            xml.write_text("MODEL_XML", encoding="utf-8")
+            binary.write_bytes(b"MODEL_BIN")
+            profile = self._schema_v2_profile(root, xml, binary, profile_kind="production")
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ):
+                result = audit_model_profile(profile, model_path=xml, model_bin_path=binary, mode="strict")
+            codes = {item.code for item in result.findings}
+            self.assertNotIn("model_xml_path_mismatch", codes)
+            self.assertNotIn("model_bin_path_mismatch", codes)
+            self.assertNotIn("model_xml_hash_mismatch", codes)
+            self.assertNotIn("model_bin_hash_mismatch", codes)
+
+            binary.write_bytes(b"CHANGED_BIN")
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ) as inspect:
+                changed = audit_model_profile(profile, model_path=xml, model_bin_path=binary, mode="strict")
+            self.assertIn("model_bin_hash_mismatch", {item.code for item in changed.findings})
+            self.assertIn("model_artifact_unverified", {item.code for item in changed.findings})
+            self.assertEqual(changed.values["runtime_contract"]["status"], "model_artifact_unverified")
+            inspect.assert_not_called()
+
+    def _artifact_profile(self, root: Path, artifact: Path) -> Path:
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        profile = root / "profile.yaml"
+        profile.write_text(
+            self.model_profile.read_text(encoding="utf-8")
+            .replace("model:\n", "model:\n  sha256: " + digest + "\n")
+            .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+            encoding="utf-8",
+        )
+        return profile
+
+    def test_missing_artifact_and_openvino_runtime_are_explicitly_unavailable(self):
+        missing = Path(tempfile.gettempdir()) / "game26-does-not-exist-model.xml"
+        result = audit_model_profile(self.model_profile, model_path=missing, allow_test_only=True)
+        codes = {item.code for item in result.findings}
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("model_artifact_unavailable", codes)
+        self.assertEqual(result.values["runtime_contract"]["status"], "model_artifact_unavailable")
+        self.assertFalse(result.values["model_artifact_exists"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             artifact = root / "model.xml"
-            artifact.write_text("MODEL_BYTES", encoding="utf-8")
-            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            profile = root / "profile.yaml"
-            profile.write_text(
-                self.model_profile.read_text(encoding="utf-8").replace("profile: test_only", "profile: production")
-                .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}")
-                .replace("version: legacy-reference-v1", "version: reviewed-v1")
-                .replace("source: sp_vision_25_assets_yolov5_xml", "source: reviewed-model-source\n  sha256: " + digest),
-                encoding="utf-8",
+            artifact.write_bytes(b"not-an-openvino-model")
+            profile = self._artifact_profile(root, artifact)
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ):
+                runtime_result = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
+            self.assertEqual(runtime_result.status, "WARN")
+            self.assertIn("runtime_unavailable", {item.code for item in runtime_result.findings})
+            self.assertEqual(runtime_result.values["runtime_contract"]["status"], "unavailable")
+            self.assertEqual(runtime_result.values["runtime_contract"]["reason"], "ImportError")
+
+    def test_schema_v2_xml_bin_manifest_is_audited_and_passed_to_openvino(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "reviewed.xml"
+            binary = root / "reviewed.bin"
+            xml.write_bytes(b"REVIEWED_XML")
+            binary.write_bytes(b"REVIEWED_BIN")
+            profile = self._schema_v2_profile(root, xml, binary)
+            unavailable = {"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"}
+
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value=unavailable,
+            ) as inspect:
+                result = audit_model_profile(
+                    profile,
+                    model_path=xml,
+                    model_bin_path=binary,
+                    allow_test_only=True,
+                )
+            inspect.assert_called_once_with(xml, binary)
+            self.assertEqual(result.status, "WARN")
+            artifacts = result.values["model_artifacts"]
+            self.assertEqual(set(artifacts), {"xml", "bin"})
+            self.assertTrue(artifacts["xml"]["exists"])
+            self.assertTrue(artifacts["bin"]["exists"])
+            self.assertTrue(artifacts["xml"]["sha256_matches_profile"])
+            self.assertTrue(artifacts["bin"]["sha256_matches_profile"])
+            self.assertEqual(artifacts["xml"]["runtime_path"], xml.name)
+            self.assertEqual(artifacts["bin"]["runtime_path"], binary.name)
+
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value=unavailable,
+            ):
+                report = qualify_offline(
+                    model_profile=profile,
+                    model=xml,
+                    model_bin=binary,
+                    pnp_config=self.pnp_config,
+                    input_csv=self.csv,
+                    allow_test_only=True,
+                )
+            self.assertEqual(report["model_artifacts"]["xml"]["actual_sha256"], hashlib.sha256(xml.read_bytes()).hexdigest())
+            self.assertEqual(report["model_artifacts"]["bin"]["actual_sha256"], hashlib.sha256(binary.read_bytes()).hexdigest())
+            self.assertEqual(report["model_bin_file"], binary.name)
+            self.assertEqual(report["model_bin_sha256"], hashlib.sha256(binary.read_bytes()).hexdigest())
+            markdown = render_markdown(report)
+            self.assertIn("- XML artifact:", markdown)
+            self.assertIn("- BIN artifact:", markdown)
+
+    def test_openvino_runtime_reads_schema_v2_with_explicit_xml_and_bin(self):
+        """Do not regress to OpenVINO's implicit same-stem BIN discovery."""
+
+        from tools.auto_aim_qualification import model_profile_audit
+
+        calls: list[tuple[str, ...]] = []
+
+        class FakeModel:
+            inputs: list[object] = []
+            outputs: list[object] = []
+
+        class FakeCore:
+            def read_model(self, *paths: str) -> FakeModel:
+                calls.append(paths)
+                return FakeModel()
+
+        fake_openvino = types.ModuleType("openvino")
+        fake_openvino.Core = FakeCore
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "reviewed.xml"
+            binary = root / "reviewed.bin"
+            xml.write_bytes(b"XML")
+            binary.write_bytes(b"BIN")
+            with mock.patch.dict(sys.modules, {"openvino": fake_openvino}):
+                observed = model_profile_audit._inspect_openvino_runtime(xml, binary)
+        self.assertEqual(observed["status"], "checked")
+        self.assertEqual(calls, [(str(xml), str(binary))])
+
+    def test_schema_v2_missing_bin_is_explicit_for_test_only_and_production(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "reviewed.xml"
+            missing_binary = root / "missing.bin"
+            xml.write_bytes(b"REVIEWED_XML")
+            profile = self._schema_v2_profile(
+                root,
+                xml,
+                missing_binary,
+                bin_digest=hashlib.sha256(b"EXPECTED_BIN").hexdigest(),
             )
-            result = audit_model_profile(profile, model_path=artifact, mode="strict")
-            self.assertNotIn("model_path_mismatch", {item.code for item in result.findings})
-            self.assertNotIn("model_hash_mismatch", {item.code for item in result.findings})
-            artifact.write_text("CHANGED", encoding="utf-8")
-            changed = audit_model_profile(profile, model_path=artifact, mode="strict")
-            self.assertIn("model_hash_mismatch", {item.code for item in changed.findings})
+            test_only = audit_model_profile(
+                profile,
+                model_path=xml,
+                model_bin_path=missing_binary,
+                allow_test_only=True,
+            )
+            self.assertEqual(test_only.status, "WARN")
+            test_codes = {item.code for item in test_only.findings}
+            self.assertIn("model_bin_artifact_unavailable", test_codes)
+            self.assertIn("model_artifact_unavailable", test_codes)
+
+            strict_test_only = audit_model_profile(
+                profile,
+                model_path=xml,
+                model_bin_path=missing_binary,
+                mode="strict",
+                allow_test_only=True,
+            )
+            self.assertEqual(strict_test_only.status, "FAIL")
+            self.assertIn("model_bin_artifact_unavailable", {item.code for item in strict_test_only.findings})
+
+            production_profile = self._schema_v2_profile(
+                root,
+                xml,
+                missing_binary,
+                profile_kind="production",
+                bin_digest=hashlib.sha256(b"EXPECTED_BIN").hexdigest(),
+            )
+            production = audit_model_profile(
+                production_profile,
+                model_path=xml,
+                model_bin_path=missing_binary,
+            )
+            self.assertEqual(production.status, "FAIL")
+            production_codes = {item.code for item in production.findings}
+            self.assertIn("model_bin_artifact_unavailable", production_codes)
+            self.assertIn("model_artifact_unavailable", production_codes)
+
+    def test_schema_v2_bin_digest_and_paths_fail_closed(self):
+        import yaml
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "reviewed.xml"
+            binary = root / "reviewed.bin"
+            alternate_xml = root / "alternate.xml"
+            alternate_binary = root / "alternate.bin"
+            xml.write_bytes(b"REVIEWED_XML")
+            binary.write_bytes(b"REVIEWED_BIN")
+            alternate_xml.write_bytes(xml.read_bytes())
+            alternate_binary.write_bytes(binary.read_bytes())
+            profile = self._schema_v2_profile(root, xml, binary, profile_kind="production")
+
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ):
+                mismatch = audit_model_profile(
+                    profile,
+                    model_path=alternate_xml,
+                    model_bin_path=alternate_binary,
+                )
+            mismatch_codes = {item.code for item in mismatch.findings}
+            self.assertIn("model_xml_path_mismatch", mismatch_codes)
+            self.assertIn("model_bin_path_mismatch", mismatch_codes)
+
+            external_bin_hash = "0" * 64
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ):
+                external_mismatch = audit_model_profile(
+                    profile,
+                    model_path=xml,
+                    model_bin_path=binary,
+                    expected_model_bin_sha256=external_bin_hash,
+                )
+            external_codes = {item.code for item in external_mismatch.findings}
+            self.assertIn("model_bin_hash_declaration_mismatch", external_codes)
+            self.assertIn("model_bin_hash_mismatch", external_codes)
+
+            value = yaml.safe_load(profile.read_text(encoding="utf-8"))
+            value["model"]["artifacts"]["bin"].pop("sha256")
+            profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+            missing_digest = audit_model_profile(profile, model_path=xml, model_bin_path=binary, allow_test_only=True)
+            self.assertIn("model_bin_hash_missing", {item.code for item in missing_digest.findings})
+
+            value["model"]["artifacts"]["bin"]["sha256"] = "not-a-sha256"
+            profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+            invalid_digest = audit_model_profile(profile, model_path=xml, model_bin_path=binary, allow_test_only=True)
+            self.assertIn("model_bin_hash_invalid", {item.code for item in invalid_digest.findings})
+
+    def test_schema_v1_production_is_rejected(self):
+        import yaml
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "legacy-production.yaml"
+            value = yaml.safe_load(self.model_profile.read_text(encoding="utf-8"))
+            value["profile"] = "production"
+            profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+            result = audit_model_profile(profile)
+            self.assertIn("production_schema_v1", {item.code for item in result.findings})
+
+    def test_schema_v1_cannot_silently_accept_bin_inputs(self):
+        result = audit_model_profile(
+            self.model_profile,
+            model_bin_path=Path(tempfile.gettempdir()) / "unexpected.bin",
+            expected_model_bin_sha256="",
+            allow_test_only=True,
+        )
+        codes = {item.code for item in result.findings}
+        self.assertIn("model_bin_undeclared", codes)
+        self.assertIn("model_bin_hash_external_invalid", codes)
+
+    def test_runtime_shape_type_and_dynamic_contract_mismatches_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"test-only-artifact")
+            profile = self._artifact_profile(root, artifact)
+            cases = (
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": [1, 3, 320, 320], "input_shape_error": None,
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f32",
+                        "input_layout": "NCHW", "output_layout": "NRC",
+                    },
+                    "runtime_input_shape_mismatch",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": None, "input_shape_error": "dynamic",
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f16",
+                        "input_layout": "NCHW", "output_layout": "NRC",
+                    },
+                    "runtime_dynamic_shape",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 2, "output_count": 1,
+                    },
+                    "runtime_input_count",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": [1, 3, 640, 640], "input_shape_error": None,
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f32",
+                        "input_layout": "NHWC", "output_layout": "NRC",
+                    },
+                    "runtime_input_layout_mismatch",
+                ),
+            )
+            for observed, expected in cases:
+                with self.subTest(expected=expected):
+                    with mock.patch(
+                        "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                        return_value=observed,
+                    ):
+                        result = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
+                    self.assertEqual(result.status, "FAIL")
+                    self.assertIn(expected, {item.code for item in result.findings})
+
+    def test_report_contains_runtime_contract_preprocessing_and_effective_test_only(self):
+        report = qualify_offline(
+            model_profile=self.model_profile,
+            pnp_config=self.pnp_config,
+            input_csv=self.csv,
+            metadata_json=self.metadata,
+            allow_test_only=True,
+        )
+        self.assertTrue(report["test_only"])
+        self.assertTrue(report["effective_test_only"])
+        self.assertFalse(report["model_file_exists"])
+        self.assertEqual(report["runtime_status"], "model_artifact_unavailable")
+        self.assertEqual(report["preprocessing_contract"]["source_color_order"], "BGR")
+        self.assertEqual(report["preprocessing_contract"]["model_color_order"], "RGB")
+        self.assertEqual(report["preprocessing_contract"]["normalization"], "divide_255")
+        self.assertEqual(report["preprocessing_contract"]["layout"], "NCHW")
+        self.assertEqual(report["keypoint_order"], [0, 3, 2, 1])
+        self.assertTrue(report["software_preprocessing_evidence"]["software_evidence_only"])
+        self.assertFalse(report["software_preprocessing_evidence"]["mcu_raw_hex_fixture"])
+        markdown = render_markdown(report)
+        self.assertIn("## Model contract evidence", markdown)
+        self.assertIn("preprocessing golden: status=`PASS`, software-only=`true`", markdown)
 
     def test_external_model_hash_cannot_override_profile_hash(self):
         """Both profile and metadata/CLI hash assertions must be checked."""
@@ -188,6 +567,30 @@ class QualificationTests(unittest.TestCase):
                         any(item["code"] == "model_hash_invalid" for item in result["diagnostics"]["errors"])
                     )
 
+    def test_malformed_metadata_bin_hash_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "model.xml"
+            binary = root / "model.bin"
+            xml.write_bytes(b"MODEL_XML")
+            binary.write_bytes(b"MODEL_BIN")
+            profile = self._schema_v2_profile(root, xml, binary)
+
+            for malformed in ({"nested": "value"}, ["hash"], float("inf"), 123, True, None):
+                with self.subTest(value=malformed):
+                    result = qualify_offline(
+                        model_profile=profile,
+                        model=xml,
+                        model_bin=binary,
+                        pnp_config=self.pnp_config,
+                        allow_test_only=True,
+                        metadata={"model_bin_sha256": malformed},
+                    )
+                    self.assertEqual(result["status"], "FAIL")
+                    self.assertTrue(
+                        any(item["code"] == "model_bin_hash_invalid" for item in result["diagnostics"]["errors"])
+                    )
+
     def test_cli_empty_model_hash_is_not_silently_ignored(self):
         """An explicitly empty --model-sha256 remains an external assertion."""
 
@@ -222,6 +625,37 @@ class QualificationTests(unittest.TestCase):
             self.assertIn("status=FAIL", result.stdout)
             report = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertTrue(any(item["code"] == "model_hash_external_invalid" for item in report["diagnostics"]["errors"]))
+
+    def test_cli_empty_model_bin_hash_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "model.xml"
+            binary = root / "model.bin"
+            xml.write_bytes(b"MODEL_XML")
+            binary.write_bytes(b"MODEL_BIN")
+            profile = self._schema_v2_profile(root, xml, binary)
+            output_json = root / "qualification.json"
+            output_markdown = root / "qualification.md"
+            command = [
+                sys.executable,
+                str(ROOT / "tools/auto_aim_qualification/auto_aim_qualification.py"),
+                "--allow-test-only",
+                "--model-profile", str(profile),
+                "--model", str(xml),
+                "--model-bin", str(binary),
+                "--pnp-config", str(self.pnp_config),
+                "--model-bin-sha256", "",
+                "--output-json", str(output_json),
+                "--output-markdown", str(output_markdown),
+            ]
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("status=FAIL", result.stdout)
+            report = json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertTrue(
+                any(item["code"] == "model_bin_hash_external_invalid" for item in report["diagnostics"]["errors"])
+            )
 
     def test_pnp_resolution_and_corner_order_fail(self):
         import yaml

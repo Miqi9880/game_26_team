@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from .preprocess_contract import software_preprocessing_evidence
+
 try:  # PyYAML is present in the project environment; keep import optional.
     import yaml  # type: ignore
 except Exception:  # pragma: no cover - exercised only on minimal hosts.
@@ -67,6 +69,11 @@ def _redact_value(value: Any) -> Any:
         if normalized.startswith("/") or re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("//"):
             return "<path>/" + _safe_name(value)
         return value
+    if isinstance(value, float) and not math.isfinite(value):
+        # Python's default JSON encoder writes NaN/Infinity tokens, which are
+        # not valid JSON.  Keep the evidence serializable while making the
+        # rejected non-finite value explicit.
+        return "<nonfinite>"
     return value
 
 
@@ -83,6 +90,12 @@ def _looks_unreviewed(text: Any) -> bool:
 
 def _finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _strict_int(value: Any) -> bool:
+    """Return true only for a YAML/JSON integer, excluding boolean aliases."""
+
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
@@ -112,10 +125,7 @@ class Finding:
         if self.field is not None:
             result["field"] = self.field
         if self.value is not None:
-            if isinstance(self.value, (str, int, float, bool)) or self.value is None:
-                result["value"] = _redact_value(self.value)
-            else:
-                result["value"] = str(self.value)
+            result["value"] = _redact_value(self.value)
         return result
 
 
@@ -168,6 +178,25 @@ class AuditResult:
             "findings": [finding.as_dict() for finding in self.findings],
         }
         return result
+
+
+@dataclass(frozen=True)
+class _ArtifactDeclaration:
+    """One explicitly named model artifact from a reviewed profile.
+
+    Schema v1's single ``model.path`` is represented as the XML member for
+    backwards-compatible test-only fixtures.  Schema v2 names XML and BIN
+    separately so a graph digest can never be misreported as a binding of the
+    OpenVINO weights file.
+    """
+
+    name: str
+    path: Optional[str]
+    sha256: Any
+    path_field: str
+    sha256_field: str
+    required: bool
+    legacy_v1: bool = False
 
 
 def _load_yaml(path: Path, result: AuditResult) -> Optional[Mapping[str, Any]]:
@@ -270,16 +299,319 @@ def _expected_hash(model: Mapping[str, Any]) -> Any:
     return None
 
 
+def _artifact_hash_code(artifact: _ArtifactDeclaration, suffix: str) -> str:
+    """Keep legacy XML diagnostics stable while naming v2 members clearly."""
+
+    if artifact.legacy_v1 and artifact.name == "xml":
+        return f"model_hash_{suffix}"
+    return f"model_{artifact.name}_hash_{suffix}"
+
+
+def _artifact_path_code(artifact: _ArtifactDeclaration, suffix: str) -> str:
+    """Keep the old v1 XML path diagnostic stable for existing evidence."""
+
+    if artifact.legacy_v1 and artifact.name == "xml":
+        return f"model_{suffix}"
+    return f"model_{artifact.name}_{suffix}"
+
+
+def _artifact_value(value: Any) -> Any:
+    """Preserve malformed declarations for fail-closed JSON evidence."""
+
+    return value.strip() if isinstance(value, str) else value
+
+
+def _hash_evidence(value: Any) -> Optional[str]:
+    """Return a report-safe digest value without echoing malformed input."""
+
+    normalized = _artifact_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, str) and _SHA256_RE.fullmatch(normalized):
+        return normalized.lower()
+    return "<invalid>"
+
+
+def _digest_matches(actual_digest: Optional[str], declared_digest: Any) -> Optional[bool]:
+    """Compare a readable artifact digest only to a syntactically valid one."""
+
+    normalized = _artifact_value(declared_digest)
+    if actual_digest is None or not isinstance(normalized, str) or not _SHA256_RE.fullmatch(normalized):
+        return None
+    return actual_digest.lower() == normalized.lower()
+
+
+def _runtime_contract_unavailable(status: str = "model_artifact_unavailable") -> dict[str, Any]:
+    """Return the stable no-runtime record without inventing actual ports."""
+
+    return {
+        "runtime": "openvino",
+        "status": status,
+        "available": False,
+        "actual_input_shape": None,
+        "actual_output_shape": None,
+        "actual_input_element_type": None,
+        "actual_output_element_type": None,
+        "actual_input_layout": None,
+        "actual_output_layout": None,
+    }
+
+
+def _runtime_unavailable_finding(
+    result: AuditResult,
+    *,
+    profile_kind: Optional[str],
+    mode: str,
+    code: str,
+    message: str,
+    field: str = "model.path",
+) -> None:
+    """Record an unavailable dependency without ever allowing a false PASS.
+
+    Evidence-only test fixtures may remain ``WARN`` when no model/runtime is
+    present, because the report makes no detector-execution claim.  Production
+    and strict qualification require the real artifact/runtime and therefore
+    fail closed.
+    """
+
+    add = result.fail if mode == "strict" or profile_kind == "production" else result.warn
+    add(code, message, field=field)
+
+
+def _runtime_element_type(port: Any) -> str:
+    """Normalize the OpenVINO port element-type spelling used by C++."""
+
+    value = port.get_element_type()
+    get_name = getattr(value, "get_type_name", None)
+    if callable(get_name):
+        value = get_name()
+    text = str(value).strip().lower()
+    # OpenVINO Python releases have used both ``f32`` and ``float32`` for the
+    # same type.  Normalize spelling only; never coerce a different type.
+    return {"float32": "f32", "fp32": "f32", "float16": "f16", "fp16": "f16"}.get(text, text)
+
+
+def _runtime_layout(port: Any) -> Optional[str]:
+    """Read an explicitly assigned OpenVINO layout, if the API exposes it."""
+
+    getter = getattr(port, "get_layout", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    text = str(value).strip()
+    if not text or text in {"[]", "?", "{?}"}:
+        return None
+    # Layout's string representation can be ``[N,C,H,W]`` in some releases.
+    text = text.strip("[]").replace(",", "").replace(" ", "")
+    return text.upper() or None
+
+
+def _runtime_static_shape(port: Any) -> tuple[Optional[list[int]], Optional[str]]:
+    """Extract one static OpenVINO port shape without compiling or inferring."""
+
+    partial = port.get_partial_shape()
+    static = getattr(partial, "is_static", None)
+    try:
+        is_static = bool(static() if callable(static) else static)
+    except Exception:
+        return None, "partial_shape_invalid"
+    if not is_static:
+        return None, "dynamic"
+    try:
+        raw_shape = partial.to_shape()
+        shape = [int(item) for item in raw_shape]
+    except Exception:
+        return None, "shape_unreadable"
+    if not shape or any(item <= 0 for item in shape):
+        return None, "shape_invalid"
+    return shape, None
+
+
+def _inspect_openvino_runtime(model_path: Path, model_bin_path: Path | None = None) -> dict[str, Any]:
+    """Read an OpenVINO IR contract only; never compile or run inference.
+
+    It is deliberately a small, patchable seam for unit tests.  The CLI does
+    not provide an override: an installed OpenVINO Python runtime is the only
+    source for ``actual_*`` values in a real report.
+    """
+
+    try:
+        try:
+            from openvino import Core  # type: ignore
+        except ImportError:
+            from openvino.runtime import Core  # type: ignore
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "runtime": "openvino",
+            "available": False,
+            "reason": type(exc).__name__,
+        }
+    try:
+        core = Core()
+        # Schema-v2 profiles bind the XML graph and BIN weights separately.
+        # Pass both paths to OpenVINO rather than relying on sibling-file
+        # discovery, so the runtime contract is tied to the audited manifest.
+        model = (
+            core.read_model(str(model_path), str(model_bin_path))
+            if model_bin_path is not None
+            else core.read_model(str(model_path))
+        )
+        inputs = list(model.inputs)
+        outputs = list(model.outputs)
+    except Exception as exc:
+        return {
+            "status": "read_failed",
+            "runtime": "openvino",
+            "available": True,
+            "reason": type(exc).__name__,
+        }
+    result: dict[str, Any] = {
+        "status": "checked",
+        "runtime": "openvino",
+        "available": True,
+        "input_count": len(inputs),
+        "output_count": len(outputs),
+    }
+    if len(inputs) == 1:
+        shape, shape_error = _runtime_static_shape(inputs[0])
+        result["input_shape"] = shape
+        result["input_shape_error"] = shape_error
+        try:
+            result["input_element_type"] = _runtime_element_type(inputs[0])
+        except Exception:
+            result["input_element_type"] = None
+            result["input_element_type_error"] = "element_type_unreadable"
+        result["input_layout"] = _runtime_layout(inputs[0])
+    if len(outputs) == 1:
+        shape, shape_error = _runtime_static_shape(outputs[0])
+        result["output_shape"] = shape
+        result["output_shape_error"] = shape_error
+        try:
+            result["output_element_type"] = _runtime_element_type(outputs[0])
+        except Exception:
+            result["output_element_type"] = None
+            result["output_element_type_error"] = "element_type_unreadable"
+        result["output_layout"] = _runtime_layout(outputs[0])
+    return result
+
+
+def _audit_runtime_contract(
+    result: AuditResult,
+    runtime: Path,
+    *,
+    runtime_bin: Path | None = None,
+    input_node: Optional[Mapping[str, Any]],
+    output_node: Optional[Mapping[str, Any]],
+    profile_kind: Optional[str],
+    mode: str,
+) -> None:
+    """Compare the actual static OpenVINO ports with the reviewed profile."""
+
+    observed = _inspect_openvino_runtime(runtime, runtime_bin)
+    status = observed.get("status")
+    runtime_record = {
+        "runtime": observed.get("runtime", "openvino"),
+        "status": status if isinstance(status, str) else "invalid",
+        "available": observed.get("available") is True,
+        "reason": observed.get("reason"),
+        "actual_input_shape": observed.get("input_shape"),
+        "actual_output_shape": observed.get("output_shape"),
+        "actual_input_element_type": observed.get("input_element_type"),
+        "actual_output_element_type": observed.get("output_element_type"),
+        "actual_input_layout": observed.get("input_layout"),
+        "actual_output_layout": observed.get("output_layout"),
+        "input_count": observed.get("input_count"),
+        "output_count": observed.get("output_count"),
+    }
+    result.values["runtime_contract"] = runtime_record
+    if status == "unavailable":
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="runtime_unavailable",
+            message="OpenVINO runtime is unavailable; actual model contract was not claimed",
+        )
+        return
+    if status != "checked":
+        result.fail(
+            "runtime_model_read_failed",
+            "OpenVINO could not read the model artifact; actual contract is unavailable",
+            field="model.path",
+        )
+        return
+
+    if observed.get("input_count") != 1:
+        result.fail("runtime_input_count", "OpenVINO model must expose exactly one input", field="input")
+    if observed.get("output_count") != 1:
+        result.fail("runtime_output_count", "OpenVINO model must expose exactly one output", field="output")
+    for label, expected_node in (("input", input_node), ("output", output_node)):
+        if (observed.get(f"{label}_count") if label == "input" else observed.get("output_count")) != 1:
+            continue
+        actual_shape = observed.get(f"{label}_shape")
+        shape_error = observed.get(f"{label}_shape_error")
+        actual_type = observed.get(f"{label}_element_type")
+        type_error = observed.get(f"{label}_element_type_error")
+        actual_layout = observed.get(f"{label}_layout")
+        if shape_error is not None:
+            code = "runtime_dynamic_shape" if shape_error == "dynamic" else "runtime_shape_unavailable"
+            result.fail(code, f"OpenVINO {label} shape must be static and readable", field=f"{label}.shape")
+        elif not isinstance(actual_shape, list) or not all(_strict_int(item) and item > 0 for item in actual_shape):
+            result.fail("runtime_shape_unavailable", f"OpenVINO {label} shape is unavailable", field=f"{label}.shape")
+        elif expected_node is not None and actual_shape != expected_node.get("shape"):
+            result.fail(
+                f"runtime_{label}_shape_mismatch",
+                f"OpenVINO {label} shape does not match the reviewed profile",
+                field=f"{label}.shape",
+            )
+        if type_error is not None or not isinstance(actual_type, str) or not actual_type:
+            result.fail("runtime_element_type_unavailable", f"OpenVINO {label} element type is unavailable", field=f"{label}.element_type")
+        elif expected_node is not None and actual_type != expected_node.get("element_type"):
+            result.fail(
+                f"runtime_{label}_element_type_mismatch",
+                f"OpenVINO {label} element type does not match the reviewed profile",
+                field=f"{label}.element_type",
+                value=actual_type,
+            )
+        expected_layout = expected_node.get("layout") if expected_node is not None else None
+        if not isinstance(actual_layout, str) or not actual_layout:
+            # OpenVINO IR ports often carry no layout metadata at all.  Do
+            # not invent one from dimensions: report that gap and let only a
+            # reviewed profile provide the explicit NCHW/NRC interpretation.
+            add = result.fail if mode == "strict" or profile_kind == "production" else result.warn
+            add("runtime_layout_unavailable", f"OpenVINO {label} layout is unavailable", field=f"{label}.layout")
+        elif expected_layout is not None and actual_layout != str(expected_layout).upper():
+            result.fail(
+                f"runtime_{label}_layout_mismatch",
+                f"OpenVINO {label} layout does not match the reviewed profile",
+                field=f"{label}.layout",
+                value=actual_layout,
+            )
+
+
 def _check_common_profile_header(
     root: Mapping[str, Any],
     result: AuditResult,
     *,
     mode: str,
     allow_test_only: bool,
-) -> tuple[Optional[Mapping[str, Any]], Optional[str]]:
+) -> tuple[Optional[str], Optional[int]]:
     schema_version = root.get("schema_version")
-    if schema_version != 1:
-        result.fail("schema_version", "schema_version must be exactly 1", field="schema_version", value=schema_version)
+    if not _strict_int(schema_version) or schema_version not in {1, 2}:
+        result.fail(
+            "schema_version",
+            "schema_version must be 1 (legacy test_only) or 2 (OpenVINO IR manifest)",
+            field="schema_version",
+            value=schema_version,
+        )
+        parsed_schema_version: Optional[int] = None
+    else:
+        parsed_schema_version = int(schema_version)
+        result.values["model_profile_schema_version"] = parsed_schema_version
     profile = root.get("profile")
     if profile not in {"test_only", "production"}:
         result.fail("profile_kind", "profile must be test_only or production", field="profile", value=profile)
@@ -292,7 +624,134 @@ def _check_common_profile_header(
             result.warn("test_only_profile", "test_only profile is permitted only for evidence; never production-ready")
         if mode == "strict":
             result.fail("strict_test_only", "strict mode cannot qualify a test_only profile")
-    return _require_map(root, "model", result), str(profile) if profile is not None else None
+    return str(profile) if profile is not None else None, parsed_schema_version
+
+
+def _profile_artifact_declarations(
+    model: Mapping[str, Any],
+    result: AuditResult,
+    *,
+    profile_kind: Optional[str],
+    schema_version: Optional[int],
+) -> tuple[_ArtifactDeclaration, ...]:
+    """Parse only explicit model artifact fields; never infer a sibling BIN.
+
+    Version 1 remains a compatibility format for the checked-in test-only
+    fixture.  Version 2 is the only production-admissible representation and
+    names both OpenVINO IR members independently.
+    """
+
+    if schema_version == 1:
+        path = _require_string(model, "path", result, "model")
+        if profile_kind == "production":
+            result.fail(
+                "production_schema_v1",
+                "production model profiles require schema_version 2 XML/BIN artifact manifests",
+                field="schema_version",
+            )
+        declaration = _ArtifactDeclaration(
+            "xml",
+            path,
+            _expected_hash(model),
+            "model.path",
+            "model.sha256",
+            True,
+            legacy_v1=True,
+        )
+        result.values["model_format"] = "legacy_single_path"
+        result.values["model_artifact_manifest"] = {
+            "schema_version": 1,
+            "format": "legacy_single_path",
+            "xml": {
+                "declared_path": _safe_name(path) if path else None,
+                "declared_sha256": _hash_evidence(declaration.sha256),
+                "required": True,
+            },
+            "bin": {"declared_path": None, "declared_sha256": None, "required": False},
+        }
+        return (declaration,)
+
+    if schema_version != 2:
+        return ()
+
+    model_format = _require_string(model, "format", result, "model")
+    if model_format != "openvino_ir":
+        result.fail("model_format", "schema_version 2 model.format must be exactly openvino_ir", field="model.format", value=model_format)
+    artifacts_node = model.get("artifacts")
+    if not isinstance(artifacts_node, Mapping):
+        result.fail("model_artifact_manifest", "model.artifacts must be an XML/BIN map", field="model.artifacts")
+        return ()
+
+    declarations: list[_ArtifactDeclaration] = []
+    for name in ("xml", "bin"):
+        node = artifacts_node.get(name)
+        path_field = f"model.artifacts.{name}.path"
+        sha_field = f"model.artifacts.{name}.sha256"
+        if not isinstance(node, Mapping):
+            result.fail("model_artifact_manifest", f"model.artifacts.{name} must be a map", field=f"model.artifacts.{name}")
+            declaration = _ArtifactDeclaration(name, None, None, path_field, sha_field, True)
+        else:
+            path = _require_string(node, "path", result, f"model.artifacts.{name}")
+            declared_hash = _artifact_value(node.get("sha256")) if "sha256" in node else None
+            declaration = _ArtifactDeclaration(name, path, declared_hash, path_field, sha_field, True)
+        declarations.append(declaration)
+
+    xml, bin_artifact = declarations
+    for artifact in declarations:
+        if artifact.path is None:
+            result.fail(
+                _artifact_path_code(artifact, "path_missing"),
+                f"schema_version 2 requires a declared {artifact.name.upper()} artifact path",
+                field=artifact.path_field,
+            )
+        if artifact.sha256 is None:
+            # Schema v2 is a manifest, not a best-effort reference.  Require
+            # both member digests even for a test-only profile, so a future
+            # caller cannot mistake an unbound BIN for reviewed evidence.
+            result.fail(
+                _artifact_hash_code(artifact, "missing"),
+                f"schema_version 2 requires a declared {artifact.name.upper()} artifact SHA-256",
+                field=artifact.sha256_field,
+            )
+    if profile_kind == "production":
+        for artifact in declarations:
+            if artifact.path and (_is_uri(artifact.path) or not Path(artifact.path).is_absolute()):
+                result.fail(
+                    "production_model_artifact_path",
+                    f"production {artifact.name.upper()} artifact path must be an absolute local path",
+                    field=artifact.path_field,
+                )
+        if xml.path and bin_artifact.path and _same_path(Path(xml.path), Path(bin_artifact.path)):
+            result.fail(
+                "model_artifact_path_alias",
+                "production XML and BIN artifact paths must be distinct",
+                field="model.artifacts",
+            )
+
+    for artifact in declarations:
+        if artifact.sha256 is not None and (
+            not isinstance(artifact.sha256, str) or not _SHA256_RE.fullmatch(artifact.sha256)
+        ):
+            result.fail(
+                _artifact_hash_code(artifact, "invalid"),
+                f"{artifact.name.upper()} artifact SHA-256 is not 64 hexadecimal characters",
+                field=artifact.sha256_field,
+            )
+
+    result.values["model_format"] = model_format
+    result.values["model_artifact_manifest"] = {
+        "schema_version": 2,
+        "format": model_format,
+        **{
+            artifact.name: {
+                "declared_path": _safe_name(artifact.path) if artifact.path else None,
+                "declared_sha256": _hash_evidence(artifact.sha256),
+                "required": artifact.required,
+            }
+            for artifact in declarations
+        },
+    }
+    return tuple(declarations)
 
 
 def _audit_model_contract(
@@ -301,25 +760,29 @@ def _audit_model_contract(
     *,
     profile_kind: Optional[str],
     mode: str,
-) -> Optional[Mapping[str, Any]]:
+    schema_version: Optional[int],
+) -> tuple[_ArtifactDeclaration, ...]:
     model = _require_map(root, "model", result)
     if model is None:
-        return None
+        return ()
     result.profile_id = _require_string(model, "id", result, "model")
     result.profile_version = _require_string(model, "version", result, "model")
     source = _require_string(model, "source", result, "model")
-    model_path = _require_string(model, "path", result, "model")
-    result.model_path = model_path
+    artifacts = _profile_artifact_declarations(
+        model, result, profile_kind=profile_kind, schema_version=schema_version
+    )
+    xml_artifact = next((artifact for artifact in artifacts if artifact.name == "xml"), None)
+    result.model_path = xml_artifact.path if xml_artifact is not None else None
     result.values["model_source"] = source
-    if profile_kind == "production" and model_path and (_is_uri(model_path) or not Path(model_path).is_absolute()):
-        result.fail("production_model_path", "production model.path must be an absolute local path", field="model.path")
-    if profile_kind == "test_only" and model_path and _is_uri(model_path):
-        result.values["external_fixture_identifier"] = _safe_name(model_path)
+    if profile_kind == "test_only" and xml_artifact is not None and xml_artifact.path and _is_uri(xml_artifact.path):
+        result.values["external_fixture_identifier"] = _safe_name(xml_artifact.path)
     if source and profile_kind == "test_only":
         lowered = source.lower()
         if "synthetic" in lowered or "legacy" in lowered or "fixture" in lowered:
             result.values["fixture_marker"] = "test_only/synthetic_fixture/not_competition_evidence"
-    if profile_kind == "production" and any(_looks_unreviewed(item) for item in (source, result.profile_id, result.profile_version, model_path)):
+    provenance_values = [source, result.profile_id, result.profile_version]
+    provenance_values.extend(artifact.path for artifact in artifacts)
+    if profile_kind == "production" and any(_looks_unreviewed(item) for item in provenance_values):
         result.fail(
             "unreviewed_production_provenance",
             "production profile provenance contains a legacy/demo/synthetic/unconfirmed marker",
@@ -440,18 +903,166 @@ def _audit_model_contract(
             if isinstance(armor_count, int) and set(normalized) != set(range(armor_count)):
                 result.fail("class_mapping_incomplete", "class_to_armor_type must map every armor class exactly once", field="semantics.class_to_armor_type")
             result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized.items())}
-    return model
+
+    # Keep the human-readable contract distinct from the small software golden
+    # fixture.  The latter proves only deterministic preprocessing mechanics;
+    # it is never a model inference or an MCU/hardware frame claim.
+    if input_node is not None:
+        preprocessing_evidence = software_preprocessing_evidence(input_node)
+        result.values["preprocessing_contract"] = preprocessing_evidence.get("contract") or {
+            "input_shape": input_node.get("shape"),
+            "layout": input_node.get("layout"),
+            "element_type": input_node.get("element_type"),
+            "source_color_order": input_node.get("source_color_order"),
+            "model_color_order": input_node.get("model_color_order"),
+            "normalization": input_node.get("normalization"),
+            "resize_mode": input_node.get("resize_mode"),
+        }
+        result.values["software_preprocessing_evidence"] = preprocessing_evidence
+        for finding in preprocessing_evidence.get("findings", []):
+            if not isinstance(finding, Mapping):
+                result.fail("preprocess_evidence_invalid", "preprocessing evidence returned an invalid finding")
+                continue
+            code = str(finding.get("code", "preprocess_evidence_failure"))
+            message = str(finding.get("message", "preprocessing evidence failed"))
+            field = finding.get("field")
+            if code == "preprocess_runtime_unavailable":
+                _runtime_unavailable_finding(
+                    result,
+                    profile_kind=profile_kind,
+                    mode=mode,
+                    code=code,
+                    message=message,
+                )
+            else:
+                result.fail(code, message, field=str(field) if field else None)
+    if output_node is not None:
+        result.values["output_contract"] = {
+            "shape": output_node.get("shape"),
+            "layout": output_node.get("layout"),
+            "element_type": output_node.get("element_type"),
+            "keypoint_count": output_node.get("keypoint_count"),
+            "objectness_index": output_node.get("objectness_index"),
+            "color_logits_offset": output_node.get("color_logits_offset"),
+            "color_class_count": output_node.get("color_class_count"),
+            "armor_logits_offset": output_node.get("armor_logits_offset"),
+            "armor_class_count": output_node.get("armor_class_count"),
+        }
+    if postprocess is not None:
+        result.values["postprocess_contract"] = {
+            "objectness_threshold": postprocess.get("objectness_threshold"),
+            "nms_threshold": postprocess.get("nms_threshold"),
+            "keypoint_order": postprocess.get("keypoint_order"),
+        }
+    if semantics is not None:
+        result.values["semantic_contract"] = {
+            "color_id_to_name": semantics.get("color_id_to_name"),
+            "armor_class_names": semantics.get("armor_class_names"),
+            "class_to_armor_type": result.values.get("class_to_armor_type", {}),
+        }
+    return artifacts
+
+
+def _runtime_artifact_path(
+    artifact: _ArtifactDeclaration,
+    supplied_path: str | Path | None,
+) -> Optional[Path]:
+    """Choose only an explicit supplied path or a reviewed local path."""
+
+    if supplied_path is not None:
+        return Path(supplied_path)
+    if artifact.path and not _is_uri(artifact.path):
+        return Path(artifact.path)
+    return None
+
+
+def _artifact_io_state(path: Optional[Path]) -> tuple[bool, bool, bool]:
+    """Return exists/readable/unsafe_alias without dereferencing on error."""
+
+    try:
+        exists = path is not None and path.is_file()
+        readable = bool(exists and os.access(path, os.R_OK))
+        unsafe_alias = bool(readable and _unsafe_file_alias(path))
+    except OSError:
+        return False, False, True
+    return bool(exists), readable, unsafe_alias
+
+
+def _audit_artifact_hash(
+    result: AuditResult,
+    artifact: _ArtifactDeclaration,
+    *,
+    actual_digest: Optional[str],
+    expected_hash: Any,
+    profile_kind: Optional[str],
+    mode: str,
+) -> None:
+    """Check profile/external digest declarations independently for one file."""
+
+    external_supplied = expected_hash is not _MISSING_HASH
+    external_hash = _artifact_value(expected_hash) if external_supplied else _MISSING_HASH
+    profile_hash = artifact.sha256
+    profile_declared = profile_hash is not None
+    missing_required = mode == "strict" or profile_kind == "production" or external_supplied
+
+    # A reviewed declaration is never replaced by metadata/CLI input.  Compare
+    # the two assertions even when the artifact is unavailable.
+    if profile_declared and external_supplied and (
+        not isinstance(profile_hash, str)
+        or not isinstance(external_hash, str)
+        or profile_hash.strip().lower() != external_hash.strip().lower()
+    ):
+        result.fail(
+            _artifact_hash_code(artifact, "declaration_mismatch"),
+            f"external {artifact.name.upper()} SHA-256 does not match the reviewed profile declaration",
+            field=artifact.sha256_field,
+        )
+    if not profile_declared and missing_required:
+        result.fail(
+            _artifact_hash_code(artifact, "missing"),
+            f"{artifact.name.upper()} artifact SHA-256 is not declared in the reviewed profile",
+            field=artifact.sha256_field,
+        )
+    if external_supplied and (not isinstance(external_hash, str) or not external_hash):
+        result.fail(
+            _artifact_hash_code(artifact, "external_invalid"),
+            f"external expected {artifact.name.upper()} SHA-256 must be a non-empty string",
+            field="--model-sha256" if artifact.name == "xml" else "--model-bin-sha256",
+        )
+
+    declarations: list[tuple[str, Any]] = []
+    if profile_declared:
+        declarations.append(("profile", profile_hash))
+    if external_supplied:
+        declarations.append(("external", external_hash))
+    for source, declared_hash in declarations:
+        if not isinstance(declared_hash, str) or not _SHA256_RE.fullmatch(declared_hash):
+            # Schema-v2 declaration syntax is also checked while parsing.  It
+            # remains checked here for v1 compatibility and untrusted callers.
+            result.fail(
+                _artifact_hash_code(artifact, "invalid"),
+                f"{source} {artifact.name.upper()} SHA-256 is not 64 hexadecimal characters",
+                field=artifact.sha256_field,
+            )
+        elif actual_digest is not None and actual_digest.lower() != declared_hash.lower():
+            result.fail(
+                _artifact_hash_code(artifact, "mismatch"),
+                f"{artifact.name.upper()} artifact SHA-256 does not match the {source} declaration",
+                field=artifact.sha256_field,
+            )
 
 
 def audit_model_profile(
     profile_path: str | Path,
     *,
     model_path: str | Path | None = None,
+    model_bin_path: str | Path | None = None,
     mode: str = "evidence_only",
     allow_test_only: bool = False,
     expected_model_sha256: Any = _MISSING_HASH,
+    expected_model_bin_sha256: Any = _MISSING_HASH,
 ) -> AuditResult:
-    """Audit a detector ``model_profile.yaml`` and optional runtime artifact."""
+    """Audit a detector profile and its explicitly named OpenVINO artifacts."""
 
     path = Path(profile_path)
     result = AuditResult(kind="model_profile", path=str(path))
@@ -463,88 +1074,271 @@ def audit_model_profile(
     root = _load_yaml(path, result)
     if root is None:
         return result
-    model, profile_kind = _check_common_profile_header(root, result, mode=mode, allow_test_only=allow_test_only)
-    if model is None:
-        return result
-    model = _audit_model_contract(root, result, profile_kind=profile_kind, mode=mode) or model
-    declared_path = model.get("path") if isinstance(model, Mapping) else None
-    runtime = Path(model_path) if model_path is not None else None
-    if runtime is None and isinstance(declared_path, str) and declared_path and not _is_uri(declared_path):
-        runtime = Path(declared_path)
-    if model_path is not None and declared_path and isinstance(declared_path, str) and not _is_uri(declared_path):
-        if not _same_path(runtime, Path(declared_path)):
-            result.fail("model_path_mismatch", "runtime model path does not match profile model.path", field="model.path")
+    profile_kind, schema_version = _check_common_profile_header(
+        root, result, mode=mode, allow_test_only=allow_test_only
+    )
+    artifacts = _audit_model_contract(
+        root,
+        result,
+        profile_kind=profile_kind,
+        mode=mode,
+        schema_version=schema_version,
+    )
+    artifact_by_name = {artifact.name: artifact for artifact in artifacts}
+    xml_artifact = artifact_by_name.get("xml")
     if profile_kind == "production" and model_path is None:
-        result.fail("runtime_model_path_missing", "production audit requires the actual runtime model path", field="--model")
-    if runtime is None:
-        (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-            "model_artifact_unavailable", "model artifact path is external/unavailable; pipeline execution unavailable", field="model.path"
+        result.fail(
+            "runtime_model_path_missing",
+            "production audit requires the actual runtime XML model path",
+            field="--model",
         )
-    elif not runtime.is_file() or not os.access(runtime, os.R_OK):
-        (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-            "model_artifact_missing", "model file does not exist or is not readable; pipeline execution unavailable", field="model.path"
+
+    supplied_paths: dict[str, str | Path | None] = {
+        "xml": model_path,
+        "bin": model_bin_path,
+    }
+    expected_hashes: dict[str, Any] = {
+        "xml": expected_model_sha256,
+        "bin": expected_model_bin_sha256,
+    }
+    # An explicit XML/BIN input or external digest cannot be silently ignored
+    # merely because the profile omitted that artifact member.  This matters
+    # for schema-v1, whose lone XML reference must never be mistaken for a
+    # binding of a separately supplied BIN file.
+    for name in ("xml", "bin"):
+        if name in artifact_by_name:
+            continue
+        if supplied_paths[name] is not None:
+            result.fail(
+                f"model_{name}_undeclared",
+                f"the reviewed profile does not declare a {name.upper()} artifact",
+                field="--model" if name == "xml" else "--model-bin",
+            )
+        if expected_hashes[name] is not _MISSING_HASH:
+            external_hash = _artifact_value(expected_hashes[name])
+            if not isinstance(external_hash, str) or not external_hash:
+                result.fail(
+                    f"model_{name}_hash_external_invalid",
+                    f"external expected {name.upper()} SHA-256 must be a non-empty string",
+                    field="--model-sha256" if name == "xml" else "--model-bin-sha256",
+                )
+            else:
+                result.fail(
+                    f"model_{name}_hash_undeclared",
+                    f"the reviewed profile does not declare a {name.upper()} artifact SHA-256",
+                    field="model.artifacts",
+                )
+    runtime_paths: dict[str, Optional[Path]] = {}
+    artifact_records: dict[str, dict[str, Any]] = {}
+    states: dict[str, tuple[bool, bool, bool]] = {}
+    for artifact in artifacts:
+        runtime_path = _runtime_artifact_path(artifact, supplied_paths.get(artifact.name))
+        runtime_paths[artifact.name] = runtime_path
+        path_match: Optional[bool] = None
+        if artifact.path and not _is_uri(artifact.path) and runtime_path is not None:
+            path_match = _same_path(runtime_path, Path(artifact.path))
+            if profile_kind == "production" and not path_match:
+                result.fail(
+                    _artifact_path_code(artifact, "path_mismatch"),
+                    f"runtime {artifact.name.upper()} path does not match the reviewed profile declaration",
+                    field=artifact.path_field,
+                )
+        exists, readable, unsafe_alias = _artifact_io_state(runtime_path)
+        states[artifact.name] = (exists, readable, unsafe_alias)
+        artifact_records[artifact.name] = {
+            "required": artifact.required,
+            "declared_path": _safe_name(artifact.path) if artifact.path else None,
+            "declared_sha256": _hash_evidence(artifact.sha256),
+            "runtime_path": _safe_name(runtime_path) if runtime_path is not None else None,
+            "runtime_path_matches_profile": path_match,
+            "exists": exists,
+            "readable": readable,
+            "actual_sha256": None,
+            "sha256_matches_profile": None,
+            "sha256_matches_external": None,
+        }
+    for name, status in (
+        ("xml", "not_declared_or_invalid_manifest"),
+        ("bin", "not_declared_legacy_schema_v1"),
+    ):
+        artifact_records.setdefault(
+            name,
+            {
+                "required": False,
+                "declared_path": None,
+                "declared_sha256": None,
+                "runtime_path": None,
+                "runtime_path_matches_profile": None,
+                "exists": False,
+                "readable": False,
+                "actual_sha256": None,
+                "sha256_matches_profile": None,
+                "sha256_matches_external": None,
+                "status": status,
+            },
+        )
+    result.values["model_artifacts"] = artifact_records
+    result.values["test_only"] = profile_kind == "test_only"
+    xml_record = artifact_records.get("xml", {})
+    bin_record = artifact_records.get("bin", {})
+    result.values["declared_model_path"] = xml_record.get("declared_path")
+    result.values["runtime_model_path"] = xml_record.get("runtime_path")
+    result.values["runtime_path_matches_profile"] = xml_record.get("runtime_path_matches_profile")
+    result.values["model_artifact_exists"] = xml_record.get("exists") is True
+    result.values["model_artifact_readable"] = xml_record.get("readable") is True
+    result.values["declared_model_sha256"] = xml_record.get("declared_sha256")
+    result.values["declared_model_bin_path"] = bin_record.get("declared_path")
+    result.values["runtime_model_bin_path"] = bin_record.get("runtime_path")
+    result.values["runtime_model_bin_path_matches_profile"] = bin_record.get("runtime_path_matches_profile")
+    result.values["model_bin_artifact_exists"] = bin_record.get("exists") is True
+    result.values["model_bin_artifact_readable"] = bin_record.get("readable") is True
+    result.values["declared_model_bin_sha256"] = bin_record.get("declared_sha256")
+
+    unavailable_artifacts: list[_ArtifactDeclaration] = []
+    alias_artifacts: list[_ArtifactDeclaration] = []
+    for artifact in artifacts:
+        _, readable, unsafe_alias = states[artifact.name]
+        if not readable:
+            unavailable_artifacts.append(artifact)
+            _runtime_unavailable_finding(
+                result,
+                profile_kind=profile_kind,
+                mode=mode,
+                code=_artifact_path_code(artifact, "artifact_unavailable"),
+                message=(
+                    f"{artifact.name.upper()} artifact path is external, missing, or unreadable; "
+                    "pipeline execution was not claimed"
+                ),
+                field=artifact.path_field,
+            )
+        elif unsafe_alias:
+            alias_artifacts.append(artifact)
+            result.fail(
+                _artifact_path_code(artifact, "artifact_alias"),
+                f"{artifact.name.upper()} artifact must not be a symlink or hardlink alias",
+                field=artifact.path_field,
+            )
+    if unavailable_artifacts and not (
+        len(unavailable_artifacts) == 1 and unavailable_artifacts[0].legacy_v1
+    ):
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="model_artifact_unavailable",
+            message="one or more required XML/BIN model artifacts are unavailable; pipeline execution was not claimed",
+            field="model.artifacts",
+        )
+
+    hash_unavailable_artifacts: list[_ArtifactDeclaration] = []
+    for artifact in artifacts:
+        _, readable, unsafe_alias = states[artifact.name]
+        actual_digest: Optional[str] = None
+        if readable and not unsafe_alias:
+            runtime_path = runtime_paths[artifact.name]
+            try:
+                assert runtime_path is not None
+                actual_digest = _sha256(runtime_path)
+                artifact_records[artifact.name]["actual_sha256"] = actual_digest
+                artifact_records[artifact.name]["sha256_matches_profile"] = _digest_matches(
+                    actual_digest, artifact.sha256
+                )
+                if expected_hashes[artifact.name] is not _MISSING_HASH:
+                    artifact_records[artifact.name]["sha256_matches_external"] = _digest_matches(
+                        actual_digest, expected_hashes[artifact.name]
+                    )
+                if artifact.name == "xml":
+                    result.model_sha256 = actual_digest
+                    result.values["model_artifact_sha256"] = actual_digest
+                else:
+                    result.values["model_artifact_bin_sha256"] = actual_digest
+            except OSError:
+                hash_unavailable_artifacts.append(artifact)
+                artifact_records[artifact.name]["readable"] = False
+                _runtime_unavailable_finding(
+                    result,
+                    profile_kind=profile_kind,
+                    mode=mode,
+                    code=_artifact_hash_code(artifact, "unreadable"),
+                    message=f"{artifact.name.upper()} artifact could not be hashed",
+                    field=artifact.path_field,
+                )
+        if (
+            actual_digest is not None
+            or expected_hashes[artifact.name] is not _MISSING_HASH
+            or mode == "strict"
+            or profile_kind == "production"
+        ):
+            _audit_artifact_hash(
+                result,
+                artifact,
+                actual_digest=actual_digest,
+                expected_hash=expected_hashes[artifact.name],
+                profile_kind=profile_kind,
+                mode=mode,
+            )
+
+    # A schema-v2 IR is eligible for an OpenVINO inspection only after every
+    # required member has been cryptographically bound.  In particular, do
+    # not read XML with a substituted/missing BIN merely to collect shape
+    # evidence: that would reintroduce the same implicit-weight gap that this
+    # manifest closes.  The legacy v1 test-only XML fixture remains a separate
+    # compatibility path and cannot become production-admissible.
+    unverified_manifest_artifacts = [
+        artifact
+        for artifact in artifacts
+        if not artifact.legacy_v1
+        and artifact.required
+        and (
+            artifact_records[artifact.name]["sha256_matches_profile"] is not True
+            or (
+                expected_hashes[artifact.name] is not _MISSING_HASH
+                and artifact_records[artifact.name]["sha256_matches_external"] is not True
+            )
+        )
+    ]
+    if unavailable_artifacts or hash_unavailable_artifacts:
+        result.values["runtime_contract"] = _runtime_contract_unavailable()
+    elif alias_artifacts:
+        result.values["runtime_contract"] = _runtime_contract_unavailable("model_artifact_alias")
+    elif unverified_manifest_artifacts:
+        result.values["runtime_contract"] = _runtime_contract_unavailable("model_artifact_unverified")
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="model_artifact_unverified",
+            message=(
+                "required XML/BIN artifact digest verification did not complete; "
+                "OpenVINO model reading was not attempted"
+            ),
+            field="model.artifacts",
+        )
+    elif xml_artifact is None:
+        result.values["runtime_contract"] = _runtime_contract_unavailable()
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="model_artifact_unavailable",
+            message="no readable XML artifact was declared; runtime contract was not claimed",
+            field="model.artifacts.xml.path",
         )
     else:
-        try:
-            if _unsafe_file_alias(runtime):
-                (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-                    "model_artifact_alias", "model artifact must not be a symlink or hardlink alias", field="model.path"
-                )
-            digest = _sha256(runtime)
-            result.model_sha256 = digest
-            profile_hash = _expected_hash(model)
-            external_supplied = expected_model_sha256 is not _MISSING_HASH
-            # Preserve a non-string value as an invalid declaration instead of
-            # silently treating it as absent.  The public type is ``str`` but
-            # metadata/third-party callers can still pass malformed values.
-            external_hash = expected_model_sha256.strip() if isinstance(expected_model_sha256, str) else expected_model_sha256
-            # A caller-supplied/metadata hash is an additional assertion, never
-            # an override for the hash recorded in the reviewed profile.  Check
-            # every declaration independently so a correct external value cannot
-            # mask a tampered profile value.
-            profile_declared = profile_hash is not None
-            declarations: list[tuple[str, Any]] = []
-            if profile_declared:
-                declarations.append(("profile", profile_hash))
-            if external_supplied:
-                declarations.append(("external", external_hash))
-            if profile_declared and external_supplied and str(profile_hash).strip().lower() != str(external_hash).strip().lower():
-                result.fail(
-                    "model_hash_declaration_mismatch",
-                    "external model SHA-256 does not match the reviewed profile declaration",
-                    field="model.sha256",
-                )
-            if not profile_declared:
-                # A profile declaration is mandatory whenever an external
-                # expectation is supplied (and in strict/production mode).
-                missing_status = result.fail if external_supplied or mode == "strict" or profile_kind == "production" else result.warn
-                missing_status(
-                    "model_hash_missing", "model artifact SHA-256 is not declared in the reviewed profile", field="model.sha256"
-                )
-            if external_supplied and (not isinstance(external_hash, str) or not external_hash):
-                result.fail(
-                    "model_hash_external_invalid",
-                    "external expected model SHA-256 must be a non-empty string",
-                    field="--model-sha256",
-                )
-            for source, declared_hash in declarations:
-                if not isinstance(declared_hash, str) or not _SHA256_RE.fullmatch(declared_hash):
-                    result.fail(
-                        "model_hash_invalid",
-                        f"{source} model SHA-256 is not 64 hexadecimal characters",
-                        field="model.sha256",
-                    )
-                elif digest.lower() != str(declared_hash).lower():
-                    result.fail(
-                        "model_hash_mismatch",
-                        f"model artifact SHA-256 does not match the {source} declaration",
-                        field="model.sha256",
-                    )
-        except OSError:
-            (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-                "model_hash_unreadable", "model artifact could not be hashed", field="model.path"
+        runtime_xml = runtime_paths.get("xml")
+        runtime_bin = runtime_paths.get("bin") if "bin" in artifact_by_name else None
+        if runtime_xml is None:
+            result.values["runtime_contract"] = _runtime_contract_unavailable()
+        else:
+            _audit_runtime_contract(
+                result,
+                runtime_xml,
+                runtime_bin=runtime_bin,
+                input_node=_mapping(root.get("input")),
+                output_node=_mapping(root.get("output")),
+                profile_kind=profile_kind,
+                mode=mode,
             )
-    result.values["runtime_model_path"] = _safe_name(runtime) if runtime is not None else None
     result.values["schema_source"] = "docs/model_profile_schema.md + C++ loader contract"
     return result
 

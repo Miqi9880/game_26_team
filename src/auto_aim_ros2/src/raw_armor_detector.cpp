@@ -1,8 +1,11 @@
 #include "auto_aim_ros2/raw_armor_detector.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <set>
@@ -16,6 +19,10 @@
 
 #ifdef AUTO_AIM_HAS_OPENVINO
 #include <openvino/openvino.hpp>
+#endif
+
+#ifdef AUTO_AIM_HAS_OPENSSL
+#include <openssl/evp.h>
 #endif
 
 namespace rm_auto_aim::detector
@@ -49,6 +56,91 @@ bool same_model_path(const std::string & left, const std::string & right)
   }
   return std::filesystem::absolute(left).lexically_normal() ==
     std::filesystem::absolute(right).lexically_normal();
+}
+
+bool valid_sha256_digest(const std::string & value)
+{
+  return value.size() == 64 && std::all_of(
+    value.begin(), value.end(), [](const unsigned char character) {
+      return std::isxdigit(character) != 0;
+    });
+}
+
+std::optional<std::string> validate_artifact_sha256(
+  const std::string & artifact_path,
+  const std::string & expected_digest,
+  const std::string & artifact_label)
+{
+  if (artifact_path.empty()) {
+    return artifact_label + " path must not be empty for SHA-256 verification";
+  }
+  if (!valid_sha256_digest(expected_digest)) {
+    return "reviewed " + artifact_label + " SHA-256 must contain exactly 64 hexadecimal characters";
+  }
+#ifndef AUTO_AIM_HAS_OPENSSL
+  return "SHA-256 verification is unavailable in this build";
+#else
+  std::ifstream artifact(artifact_path, std::ios::binary);
+  if (!artifact) {
+    return "cannot read " + artifact_label + " for SHA-256 verification";
+  }
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(
+    EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+    return "SHA-256 verifier initialization failed";
+  }
+  std::array<char, 8192> buffer{};
+  while (artifact) {
+    artifact.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const auto read_count = artifact.gcount();
+    if (read_count > 0 && EVP_DigestUpdate(
+        context.get(), buffer.data(), static_cast<std::size_t>(read_count)) != 1)
+    {
+      return "SHA-256 verifier update failed";
+    }
+  }
+  if (!artifact.eof()) {
+    return "cannot read " + artifact_label + " for SHA-256 verification";
+  }
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int digest_size = 0;
+  if (EVP_DigestFinal_ex(context.get(), digest.data(), &digest_size) != 1 || digest_size != 32U) {
+    return "SHA-256 verifier finalization failed";
+  }
+  std::ostringstream actual;
+  actual << std::hex << std::setfill('0');
+  for (unsigned int index = 0; index < digest_size; ++index) {
+    actual << std::setw(2) << static_cast<unsigned int>(digest[index]);
+  }
+  std::string expected = expected_digest;
+  std::transform(expected.begin(), expected.end(), expected.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  if (actual.str() != expected) {
+    return artifact_label + " SHA-256 does not match the reviewed profile declaration";
+  }
+  return std::nullopt;
+#endif
+}
+
+std::optional<std::string> validate_model_manifest_sha256(const DetectorConfig & config)
+{
+  if (!config.require_model_hash_match) {
+    return std::nullopt;
+  }
+  if (const auto error = validate_artifact_sha256(
+      config.model_path, config.reviewed_model_sha256, "model XML artifact");
+    error.has_value())
+  {
+    return error;
+  }
+  if (const auto error = validate_artifact_sha256(
+      config.model_bin_path, config.reviewed_model_bin_sha256, "model BIN artifact");
+    error.has_value())
+  {
+    return error;
+  }
+  return std::nullopt;
 }
 
 int argmax(const float * values, std::size_t count)
@@ -109,6 +201,20 @@ std::string required_profile_string(
       throw std::runtime_error(profile_context(path, key));
     }
     return value;
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(profile_context(path, key));
+  }
+}
+
+std::optional<std::string> optional_profile_string(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  const auto node = parent[key];
+  if (!node || node.IsNull()) {
+    return std::nullopt;
+  }
+  try {
+    return node.as<std::string>();
   } catch (const YAML::Exception &) {
     throw std::runtime_error(profile_context(path, key));
   }
@@ -278,17 +384,52 @@ std::optional<RawArmorDetection> make_raw_armor_detection(
 
 std::optional<std::string> ModelProfile::validate() const
 {
-  if (schema_version != 1) {
-    return "unsupported schema_version; expected 1";
+  if (schema_version != 1 && schema_version != 2) {
+    return "unsupported schema_version; expected 1 (legacy test_only) or 2";
   }
-  if (model_id.empty() || model_path.empty() || source.empty() || version.empty()) {
-    return "model_id, model_path, source, and version are required";
+  if (model_id.empty() || model_artifacts.xml.path.empty() || source.empty() || version.empty()) {
+    return "model_id, model.artifacts.xml.path, source, and version are required";
+  }
+  if (schema_version == 2 && model_format != "openvino_ir") {
+    return "schema_version 2 model.format must be openvino_ir";
+  }
+  if (schema_version == 2 && model_artifacts.bin.path.empty()) {
+    return "schema_version 2 model.artifacts.bin.path is required";
+  }
+  if (schema_version == 1 && !test_only) {
+    return "production model profiles require schema_version 2 XML/BIN artifact manifests";
   }
   if (!test_only) {
-    const std::filesystem::path artifact_path(model_path);
-    if (!artifact_path.is_absolute() || model_path.find("://") != std::string::npos) {
-      return "production model.path must be an absolute local artifact path";
+    if (model_format != "openvino_ir") {
+      return "production model.format must be openvino_ir";
     }
+    const std::filesystem::path xml_path(model_artifacts.xml.path);
+    const std::filesystem::path bin_path(model_artifacts.bin.path);
+    if (!xml_path.is_absolute() || model_artifacts.xml.path.find("://") != std::string::npos) {
+      return "production model.artifacts.xml.path must be an absolute local artifact path";
+    }
+    if (!bin_path.is_absolute() || model_artifacts.bin.path.find("://") != std::string::npos) {
+      return "production model.artifacts.bin.path must be an absolute local artifact path";
+    }
+    if (same_model_path(model_artifacts.xml.path, model_artifacts.bin.path)) {
+      return "production XML and BIN artifact paths must be distinct";
+    }
+    if (!model_artifacts.xml.sha256.has_value()) {
+      return "production model.artifacts.xml.sha256 must be declared";
+    }
+    if (!model_artifacts.bin.sha256.has_value()) {
+      return "production model.artifacts.bin.sha256 must be declared";
+    }
+  }
+  if (model_artifacts.xml.sha256.has_value() &&
+    !valid_sha256_digest(*model_artifacts.xml.sha256))
+  {
+    return "model.artifacts.xml.sha256 must contain exactly 64 hexadecimal characters";
+  }
+  if (model_artifacts.bin.sha256.has_value() &&
+    !valid_sha256_digest(*model_artifacts.bin.sha256))
+  {
+    return "model.artifacts.bin.sha256 must contain exactly 64 hexadecimal characters";
   }
   if (input_shape[0] != 1 || input_shape[1] != 3 || input_shape[2] == 0 || input_shape[3] == 0 ||
     input_shape[2] > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -299,8 +440,8 @@ std::optional<std::string> ModelProfile::validate() const
   if (input_layout != "NCHW") {
     return "input_layout must be NCHW";
   }
-  if (input_element_type.empty() || source_color_order != "BGR" || model_color_order != "RGB") {
-    return "input element/color contract must declare model type and BGR source to RGB model order";
+  if (input_element_type != "f32" || source_color_order != "BGR" || model_color_order != "RGB") {
+    return "input contract must declare FP32 BGR source to RGB model order";
   }
   if (normalization != "divide_255") {
     return "normalization must be divide_255";
@@ -421,7 +562,34 @@ ModelProfile load_model_profile(const std::string & yaml_path, ModelProfileLoadO
     throw std::runtime_error("model must be a map");
   }
   result.model_id = required_profile_string(model_node, "id", "model");
-  result.model_path = required_profile_string(model_node, "path", "model");
+  if (result.schema_version == 1) {
+    // Schema v1 is retained strictly for checked-in test-only fixtures.  Its
+    // single historical path is represented as the XML graph member, with no
+    // inferred sibling BIN artifact and no route to production admission.
+    result.model_format = "legacy_single_path";
+    result.model_artifacts.xml.path = required_profile_string(model_node, "path", "model");
+    result.model_artifacts.xml.sha256 = optional_profile_string(model_node, "sha256", "model");
+  } else if (result.schema_version == 2) {
+    result.model_format = required_profile_string(model_node, "format", "model");
+    const auto artifacts_node = required_profile_node(model_node, "artifacts", "model");
+    if (!artifacts_node.IsMap()) {
+      throw std::runtime_error("model.artifacts must be a map");
+    }
+    const auto load_artifact = [&artifacts_node](
+      const std::string & name, ModelArtifact & artifact) {
+        const auto artifact_node = required_profile_node(
+          artifacts_node, name, "model.artifacts");
+        if (!artifact_node.IsMap()) {
+          throw std::runtime_error("model.artifacts." + name + " must be a map");
+        }
+        artifact.path = required_profile_string(
+          artifact_node, "path", "model.artifacts." + name);
+        artifact.sha256 = optional_profile_string(
+          artifact_node, "sha256", "model.artifacts." + name);
+      };
+    load_artifact("xml", result.model_artifacts.xml);
+    load_artifact("bin", result.model_artifacts.bin);
+  }
   result.source = required_profile_string(model_node, "source", "model");
   result.version = required_profile_string(model_node, "version", "model");
 
@@ -534,23 +702,40 @@ ModelProfile load_model_profile(const std::string & yaml_path, ModelProfileLoadO
 }
 
 DetectorConfig detector_config_from_model_profile(
-  const ModelProfile & profile, std::string model_path, std::string device)
+  const ModelProfile & profile,
+  std::string model_path,
+  std::string device,
+  std::string model_bin_path)
 {
   if (const auto error = profile.validate(); error.has_value()) {
     throw std::invalid_argument("invalid model profile: " + *error);
   }
   if (model_path.empty()) {
-    model_path = profile.model_path;
+    model_path = profile.model_artifacts.xml.path;
   }
-  if (!profile.test_only && !same_model_path(model_path, profile.model_path)) {
+  if (model_bin_path.empty()) {
+    model_bin_path = profile.model_artifacts.bin.path;
+  }
+  if (!profile.test_only && !same_model_path(model_path, profile.model_artifacts.xml.path)) {
     throw std::invalid_argument(
-            "production model artifact path does not match model profile path: profile=" +
-            profile.model_path + " runtime=" + model_path);
+            "production model XML artifact path does not match model profile path: profile=" +
+            profile.model_artifacts.xml.path + " runtime=" + model_path);
+  }
+  if (!profile.test_only && !same_model_path(model_bin_path, profile.model_artifacts.bin.path)) {
+    throw std::invalid_argument(
+            "production model BIN artifact path does not match model profile path: profile=" +
+            profile.model_artifacts.bin.path + " runtime=" + model_bin_path);
   }
   DetectorConfig result{};
   result.model_path = std::move(model_path);
+  result.model_bin_path = std::move(model_bin_path);
   result.require_model_path_match = !profile.test_only;
-  result.reviewed_model_path = profile.model_path;
+  result.reviewed_model_path = profile.model_artifacts.xml.path;
+  result.require_model_bin_path_match = !profile.test_only;
+  result.reviewed_model_bin_path = profile.model_artifacts.bin.path;
+  result.require_model_hash_match = !profile.test_only;
+  result.reviewed_model_sha256 = profile.model_artifacts.xml.sha256.value_or("");
+  result.reviewed_model_bin_sha256 = profile.model_artifacts.bin.sha256.value_or("");
   result.device = std::move(device);
   result.expected_input_element_type = profile.input_element_type;
   result.expected_output_element_type = profile.output_element_type;
@@ -647,8 +832,53 @@ std::optional<LetterboxResult> make_letterbox(
   cv::resize(bgr_image, resized, cv::Size(resized_width, resized_height), 0.0, 0.0, cv::INTER_LINEAR);
   resized.copyTo(result.image(cv::Rect(pad_x, pad_y, resized_width, resized_height)));
   result.scale = scale;
+  result.scale_x = static_cast<float>(resized_width) / static_cast<float>(bgr_image.cols);
+  result.scale_y = static_cast<float>(resized_height) / static_cast<float>(bgr_image.rows);
+  if (!std::isfinite(result.scale_x) || !std::isfinite(result.scale_y) || result.scale_x <= 0.0F ||
+    result.scale_y <= 0.0F)
+  {
+    return std::nullopt;
+  }
+  result.resized_width = resized_width;
+  result.resized_height = resized_height;
   result.pad_x = pad_x;
   result.pad_y = pad_y;
+  return result;
+}
+
+std::optional<PreprocessedTensor> make_preprocessed_tensor(
+  const cv::Mat & bgr_image,
+  const DetectorConfig & config)
+{
+  const auto letterbox = make_letterbox(bgr_image, config);
+  if (!letterbox.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto width = static_cast<std::size_t>(letterbox->image.cols);
+  const auto height = static_cast<std::size_t>(letterbox->image.rows);
+  if (width == 0 || height == 0 || width > std::numeric_limits<std::size_t>::max() / height ||
+    width * height > std::numeric_limits<std::size_t>::max() / 3U)
+  {
+    return std::nullopt;
+  }
+
+  const std::size_t plane_size = width * height;
+  PreprocessedTensor result{};
+  result.letterbox = *letterbox;
+  result.nchw_rgb_f32.resize(plane_size * 3U);
+  constexpr float kInv255 = 1.0F / 255.0F;
+  for (int row = 0; row < result.letterbox.image.rows; ++row) {
+    const auto * pixels = result.letterbox.image.ptr<cv::Vec3b>(row);
+    for (int column = 0; column < result.letterbox.image.cols; ++column) {
+      const std::size_t index = static_cast<std::size_t>(row) * width +
+        static_cast<std::size_t>(column);
+      const auto & bgr = pixels[column];
+      result.nchw_rgb_f32[index] = static_cast<float>(bgr[2]) * kInv255;
+      result.nchw_rgb_f32[plane_size + index] = static_cast<float>(bgr[1]) * kInv255;
+      result.nchw_rgb_f32[2U * plane_size + index] = static_cast<float>(bgr[0]) * kInv255;
+    }
+  }
   return result;
 }
 
@@ -656,13 +886,42 @@ std::optional<cv::Point2f> model_point_to_image(
   const cv::Point2f & model_point,
   const LetterboxResult & letterbox) noexcept
 {
-  if (!finite_point(model_point) || !std::isfinite(letterbox.scale) || letterbox.scale <= 0.0F) {
+  if (!finite_point(model_point) || !std::isfinite(letterbox.scale) || letterbox.scale <= 0.0F ||
+    !std::isfinite(letterbox.scale_x) || !std::isfinite(letterbox.scale_y) ||
+    letterbox.scale_x <= 0.0F || letterbox.scale_y <= 0.0F)
+  {
     return std::nullopt;
   }
   const cv::Point2f image_point{
-    (model_point.x - static_cast<float>(letterbox.pad_x)) / letterbox.scale,
-    (model_point.y - static_cast<float>(letterbox.pad_y)) / letterbox.scale};
+    (model_point.x - static_cast<float>(letterbox.pad_x)) / letterbox.scale_x,
+    (model_point.y - static_cast<float>(letterbox.pad_y)) / letterbox.scale_y};
   if (!finite_point(image_point)) {
+    return std::nullopt;
+  }
+  return image_point;
+}
+
+std::optional<cv::Point2f> model_point_to_image(
+  const cv::Point2f & model_point,
+  const LetterboxResult & letterbox,
+  const cv::Size & source_image_size) noexcept
+{
+  if (source_image_size.width <= 0 || source_image_size.height <= 0) {
+    return std::nullopt;
+  }
+  if (letterbox.resized_width <= 0 || letterbox.resized_height <= 0 ||
+    model_point.x < static_cast<float>(letterbox.pad_x) ||
+    model_point.y < static_cast<float>(letterbox.pad_y) ||
+    model_point.x >= static_cast<float>(letterbox.pad_x + letterbox.resized_width) ||
+    model_point.y >= static_cast<float>(letterbox.pad_y + letterbox.resized_height))
+  {
+    return std::nullopt;
+  }
+  const auto image_point = model_point_to_image(model_point, letterbox);
+  if (!image_point.has_value() || image_point->x < 0.0F || image_point->y < 0.0F ||
+    image_point->x >= static_cast<float>(source_image_size.width) ||
+    image_point->y >= static_cast<float>(source_image_size.height))
+  {
     return std::nullopt;
   }
   return image_point;
@@ -690,17 +949,40 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
     !same_model_path(impl_->config.model_path, impl_->config.reviewed_model_path))
   {
     throw std::invalid_argument(
-            "OpenVINO model artifact path does not match the reviewed model profile");
+            "OpenVINO model XML artifact path does not match the reviewed model profile");
+  }
+  if (impl_->config.require_model_bin_path_match &&
+    !same_model_path(impl_->config.model_bin_path, impl_->config.reviewed_model_bin_path))
+  {
+    throw std::invalid_argument(
+            "OpenVINO model BIN artifact path does not match the reviewed model profile");
   }
   if (!std::filesystem::exists(impl_->config.model_path)) {
-    throw std::runtime_error("OpenVINO model file does not exist: " + impl_->config.model_path);
+    throw std::runtime_error("OpenVINO model XML file does not exist: " + impl_->config.model_path);
+  }
+  if (!impl_->config.model_bin_path.empty() &&
+    !std::filesystem::exists(impl_->config.model_bin_path))
+  {
+    throw std::runtime_error(
+            "OpenVINO model BIN file does not exist: " + impl_->config.model_bin_path);
+  }
+  if (impl_->config.require_model_bin_path_match && impl_->config.model_bin_path.empty()) {
+    throw std::invalid_argument("OpenVINO model BIN path must not be empty for a reviewed manifest");
+  }
+  if (const auto error = validate_model_manifest_sha256(impl_->config); error.has_value()) {
+    throw std::runtime_error(*error);
   }
 #ifndef AUTO_AIM_HAS_OPENVINO
   throw std::runtime_error(
     "OpenVINO support is not built; configure OpenVINO_DIR before building auto_aim_ros2");
 #else
   try {
-    const auto model = impl_->core.read_model(impl_->config.model_path);
+    // A schema-v2 profile passes the reviewed XML and BIN explicitly.  The
+    // legacy/test-only path deliberately leaves the BIN empty and retains
+    // OpenVINO's compatibility auto-discovery behavior only for that case.
+    const auto model = impl_->config.model_bin_path.empty() ?
+      impl_->core.read_model(impl_->config.model_path) :
+      impl_->core.read_model(impl_->config.model_path, impl_->config.model_bin_path);
     if (model->inputs().size() != 1) {
       throw std::runtime_error(
         "expected one model input, got " + std::to_string(model->inputs().size()));
@@ -717,6 +999,13 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
     const auto output_shape = static_shape(model->output(), "model output");
     if (const auto error = validate_output_shape(output_shape, impl_->config); error.has_value()) {
       throw std::runtime_error(*error);
+    }
+    // The detector always supplies an explicitly constructed FP32 NCHW
+    // tensor.  Do not let an unprofiled/direct DetectorConfig clear its
+    // string expectation and defer a type mismatch until the first frame.
+    if (model->input().get_element_type() != ov::element::f32) {
+      throw std::runtime_error(
+        "expected FP32 model input, got " + model->input().get_element_type().to_string());
     }
     if (model->output().get_element_type() != ov::element::f32) {
       throw std::runtime_error(
@@ -744,23 +1033,8 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
     impl_->info.input_element_type = model->input().get_element_type().to_string();
     impl_->info.output_element_type = model->output().get_element_type().to_string();
 
-    ov::preprocess::PrePostProcessor preprocessor(model);
-    auto & input = preprocessor.input();
-    input.tensor()
-      .set_element_type(ov::element::u8)
-      .set_shape({1, static_cast<std::int64_t>(impl_->config.input_height),
-                  static_cast<std::int64_t>(impl_->config.input_width), 3})
-      .set_layout("NHWC")
-      .set_color_format(ov::preprocess::ColorFormat::BGR);
-    input.model().set_layout("NCHW");
-    input.preprocess()
-      .convert_element_type(ov::element::f32)
-      .convert_color(ov::preprocess::ColorFormat::RGB)
-      // OpenVINO's scale operation divides by the supplied value.
-      .scale(255.0);
-
     impl_->compiled_model = impl_->core.compile_model(
-      preprocessor.build(), impl_->config.device,
+      model, impl_->config.device,
       ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
   } catch (const std::exception & error) {
     throw std::runtime_error(
@@ -781,8 +1055,8 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
   if (!frame.has_pixels()) {
     return {};
   }
-  const auto letterbox = make_letterbox(frame.bgr_image, impl_->config);
-  if (!letterbox.has_value()) {
+  auto preprocessed = make_preprocessed_tensor(frame.bgr_image, impl_->config);
+  if (!preprocessed.has_value()) {
     return {};
   }
 #ifndef AUTO_AIM_HAS_OPENVINO
@@ -790,10 +1064,10 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
 #else
   auto request = impl_->compiled_model.create_infer_request();
   ov::Tensor input_tensor(
-    ov::element::u8,
-    {1, static_cast<std::size_t>(impl_->config.input_height),
-     static_cast<std::size_t>(impl_->config.input_width), 3},
-    letterbox->image.data);
+    ov::element::f32,
+    {1, 3, static_cast<std::size_t>(impl_->config.input_height),
+     static_cast<std::size_t>(impl_->config.input_width)},
+    preprocessed->nchw_rgb_f32.data());
   request.set_input_tensor(input_tensor);
   request.infer();
 
@@ -840,7 +1114,8 @@ std::vector<RawArmorDetection> OpenVinoYoloDetector::detect(const pipeline::Imag
       }
       const std::size_t raw_offset = static_cast<std::size_t>(raw_index) * 2;
       const auto image_point = model_point_to_image(
-        {current[raw_offset], current[raw_offset + 1]}, *letterbox);
+        {current[raw_offset], current[raw_offset + 1]}, preprocessed->letterbox,
+        frame.bgr_image.size());
       if (!image_point.has_value()) {
         finite_coordinates = false;
         break;

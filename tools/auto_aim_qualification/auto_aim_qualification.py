@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -66,13 +67,124 @@ def _validate_outputs(input_csv: str | None, json_path: str | None, markdown_pat
             if _same_or_alias(source, destination):
                 raise OSError("qualification output aliases the input CSV")
     for destination in paths:
-        if destination.exists() and (destination.is_symlink() or destination.stat().st_nlink > 1):
-            raise OSError("qualification output must not be a symlink or hardlink")
-        current = destination.parent
-        while current != current.parent:
-            if current.exists() and current.is_symlink():
+        _validate_output_destination(destination)
+
+
+def _validate_output_destination(destination: Path) -> None:
+    """Reject output paths that could redirect a write outside their parent.
+
+    ``Path.exists()`` follows symlinks and returns ``False`` for a dangling
+    link.  Checking the path with ``lstat`` instead makes both live and
+    dangling symlinks visible before any parent directory is created or file
+    is opened.  Existing hardlinks are rejected as well, since truncating one
+    would mutate every name for the inode.
+    """
+
+    destination = Path(destination)
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise OSError(f"qualification output cannot be inspected: {destination}") from exc
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError("qualification output must not be a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("qualification output must be a regular file")
+        if info.st_nlink > 1:
+            raise OSError("qualification output must not be a hardlink")
+
+    # Walk lexical parent components with lstat.  In particular, lstat sees a
+    # dangling parent symlink that ``exists()`` would incorrectly hide.
+    current = destination.parent
+    while True:
+        try:
+            parent_info = current.lstat()
+        except FileNotFoundError:
+            parent_info = None
+        except OSError as exc:
+            raise OSError(f"qualification output parent cannot be inspected: {current}") from exc
+        if parent_info is not None:
+            if stat.S_ISLNK(parent_info.st_mode):
                 raise OSError("qualification output parent must not be a symlink")
-            current = current.parent
+            if not stat.S_ISDIR(parent_info.st_mode):
+                raise OSError("qualification output parent must be a directory")
+        if current == current.parent:
+            break
+        current = current.parent
+
+
+def _ensure_output_parent(destination: Path) -> None:
+    """Create missing output parents one component at a time.
+
+    ``Path.mkdir(parents=True)`` may traverse a parent symlink that appears
+    after the initial validation.  Creating each lexical component separately
+    lets us reject a component immediately after a concurrent ``EEXIST`` or
+    other replacement, before the report file is opened.
+    """
+
+    parent = Path(destination).parent.absolute()
+    current = Path(parent.anchor) if parent.anchor else Path.cwd()
+    for part in parent.parts:
+        if part == parent.anchor:
+            continue
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+            except FileExistsError:
+                # A concurrent creator may have won the race.  Inspect the
+                # resulting entry below rather than trusting its type.
+                pass
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise OSError(f"qualification output parent cannot be inspected: {current}") from exc
+        except OSError as exc:
+            raise OSError(f"qualification output parent cannot be inspected: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError("qualification output parent must not be a symlink")
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("qualification output parent must be a directory")
+
+
+def _write_output_text(destination: Path, payload: str) -> None:
+    """Write one report without following a destination symlink.
+
+    The destination is validated immediately before opening it and, on
+    platforms that support it, ``O_NOFOLLOW`` closes the validation/write
+    race for a symlink swapped in between those operations.
+    """
+
+    destination = Path(destination)
+    # Validate before creating any missing parent components.  Calling
+    # ``mkdir(parents=True)`` first could follow a dangling symlink in an
+    # intermediate component and create directories in an external tree.
+    _validate_output_destination(destination)
+    _ensure_output_parent(destination)
+    _validate_output_destination(destination)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except OSError as exc:
+        raise OSError(f"qualification output could not be opened: {destination}") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except Exception:
+        # ``fdopen`` owns the descriptor after a successful call.  If it fails
+        # before ownership is transferred, avoid leaking the descriptor.
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,13 +207,18 @@ def main(argv: list[str] | None = None) -> int:
             producer_command_file=args.producer_command_file,
             expected_image_size=(args.image_width, args.image_height) if args.image_width and args.image_height else None,
             metadata={
-                key: value for key, value in {
-                    "dataset_id": args.dataset_id,
-                    "commit": args.commit,
-                    "run_id": args.run_id,
-                    "run_command": args.run_command,
-                    "model_sha256": args.model_sha256,
-                }.items() if value not in (None, "")
+                **{
+                    key: value for key, value in {
+                        "dataset_id": args.dataset_id,
+                        "commit": args.commit,
+                        "run_id": args.run_id,
+                        "run_command": args.run_command,
+                    }.items() if value not in (None, "")
+                },
+                # An explicitly supplied empty hash is still a declaration
+                # and must fail closed; do not let the generic optional-field
+                # filtering silently discard it.
+                **({"model_sha256": args.model_sha256} if args.model_sha256 is not None else {}),
             },
         )
     except Exception as exc:  # malformed input must still yield a report
@@ -125,8 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not path:
                     continue
                 destination = Path(path)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text(payload, encoding="utf-8")
+                _write_output_text(destination, payload)
         except OSError as exc:
             report.setdefault("diagnostics", {}).setdefault("errors", []).append({"status": "FAIL", "code": "qualification_output_error", "message": type(exc).__name__})
             report["status"] = "FAIL"

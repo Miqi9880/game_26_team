@@ -61,6 +61,7 @@ model:
   path: /absolute/path/to/model.xml  # production; external://... is test_only only
   source: model_provenance
   version: model_contract_version
+  sha256: 64_hex_digest              # required for production/strict qualification
 
 input:
   shape: [1, 3, 640, 640]     # N,C,H,W
@@ -124,9 +125,12 @@ test inputs and are not repository artifacts.  For `profile: production`,
 `model.path` must be an absolute local path to the reviewed artifact and the
 runtime model path must resolve to exactly the same path; supplying a
 same-shape or same-type model under another path is rejected before OpenVINO
-initialization.  The current schema does not claim a content hash, so replacing
-the file at that path still requires a new review/profile version and provenance
-record before production use.
+initialization.  A production/strict qualification profile must also declare a
+64-character hexadecimal `model.sha256`; the offline audit compares it with
+the actual artifact and independently checks any caller-supplied
+`--model-sha256`/metadata value.  An external value never overrides the
+reviewed profile declaration.  Replacing the file at that path requires a new
+review/profile version and provenance record before production use.
 
 ## Verification and bring-up order
 

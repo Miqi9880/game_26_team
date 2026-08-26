@@ -38,6 +38,8 @@ python3 tools/auto_aim_qualification/auto_aim_qualification.py \
 
 `--mode strict` 要求正式 model profile、实际模型文件、profile 中声明的模型 SHA-256、正式 PnP/K-D/装甲尺寸/camera→gimbal 外参、完整 metadata、PR #16 报告和 PR #17 manifest。任何 test-only、路径或 hash 不一致、CSV `fire_command != 0`、时间戳异常、报告/manifest 缺失都会 FAIL。工具不能生成正式 PnP、外参、绝对角零点、RobotCtrl 或开火参数。
 
+模型文件存在时，审计会独立校验 profile 内声明的 SHA-256 与实际文件，并在提供 `--model-sha256` 或 metadata 中的 `model_sha256` 时将其作为第二个断言；外部值不能覆盖 profile 值，任一声明缺失（在 strict/production 或外部值已提供的情况下）、格式非法、两项声明不一致或与实际文件不匹配都会 fail-closed。
+
 ## 固定安全边界
 
 所有报告始终包含：
@@ -59,6 +61,8 @@ pitch_acc: 0
 ```
 
 状态码沿用现有证据工具：`PASS=0`、`WARN=2`、`FAIL=1`。输出中的模型路径只保留 basename；metadata 和 producer command 不能包含 token、密码或个人目录。
+
+JSON/Markdown 输出在写入前使用 `lstat` 检查目标和每一级父目录，拒绝 live/dangling symlink、hardlink 和非普通文件；创建父目录后会再次检查，并在支持的平台使用 `O_NOFOLLOW` 安全打开。检测到不安全输出路径时返回 `FAIL`，不写入报告，也不跟随链接在输出目录外创建文件。
 
 ## 回退
 

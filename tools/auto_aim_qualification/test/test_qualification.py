@@ -75,6 +75,154 @@ class QualificationTests(unittest.TestCase):
             changed = audit_model_profile(profile, model_path=artifact, mode="strict")
             self.assertIn("model_hash_mismatch", {item.code for item in changed.findings})
 
+    def test_external_model_hash_cannot_override_profile_hash(self):
+        """Both profile and metadata/CLI hash assertions must be checked."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"MODEL_BYTES")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            profile = root / "profile.yaml"
+            profile.write_text(
+                self.model_profile.read_text(encoding="utf-8")
+                # Deliberately leave an all-zero digest unquoted.  PyYAML
+                # parses it as an integer; the audit must still reject it
+                # instead of dropping it and accepting the external hash.
+                .replace("model:\n", "model:\n  sha256: " + "0" * 64 + "\n")
+                .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+                encoding="utf-8",
+            )
+
+            result = audit_model_profile(
+                profile,
+                model_path=artifact,
+                expected_model_sha256=digest,
+                allow_test_only=True,
+            )
+            codes = {item.code for item in result.findings}
+            self.assertEqual(result.status, "FAIL")
+        self.assertIn("model_hash_declaration_mismatch", codes)
+        self.assertIn("model_hash_invalid", codes)
+
+    def test_validly_formatted_wrong_profile_hash_still_fails_with_correct_external_hash(self):
+        """A correctly formatted but stale profile digest cannot be overridden."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"MODEL_BYTES")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            profile = root / "profile.yaml"
+            profile.write_text(
+                self.model_profile.read_text(encoding="utf-8")
+                .replace("model:\n", "model:\n  sha256: " + "a" * 64 + "\n")
+                .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+                encoding="utf-8",
+            )
+
+            result = audit_model_profile(
+                profile,
+                model_path=artifact,
+                expected_model_sha256=digest,
+                allow_test_only=True,
+            )
+            codes = {item.code for item in result.findings}
+            self.assertEqual(result.status, "FAIL")
+            self.assertIn("model_hash_declaration_mismatch", codes)
+            self.assertIn("model_hash_mismatch", codes)
+
+    def test_missing_profile_hash_is_not_satisfied_by_external_hash(self):
+        """An external hash cannot supply a missing reviewed declaration."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"MODEL_BYTES")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            profile = root / "profile.yaml"
+            profile.write_text(
+                self.model_profile.read_text(encoding="utf-8").replace(
+                    "path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"
+                ),
+                encoding="utf-8",
+            )
+
+            result = audit_model_profile(
+                profile,
+                model_path=artifact,
+                expected_model_sha256=digest,
+                allow_test_only=True,
+            )
+            self.assertEqual(result.status, "FAIL")
+            self.assertIn("model_hash_missing", {item.code for item in result.findings})
+
+    def test_malformed_metadata_model_hash_is_not_silently_ignored(self):
+        """Structured/non-finite metadata hashes must fail closed."""
+
+        malformed_values = ({"nested": "value"}, ["hash"], float("nan"), 123, True, None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"MODEL_BYTES")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            profile = root / "profile.yaml"
+            profile.write_text(
+                self.model_profile.read_text(encoding="utf-8")
+                .replace("model:\n", "model:\n  sha256: " + digest + "\n")
+                .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+                encoding="utf-8",
+            )
+
+            for malformed in malformed_values:
+                with self.subTest(value=malformed):
+                    result = qualify_offline(
+                        model_profile=profile,
+                        pnp_config=self.pnp_config,
+                        model=artifact,
+                        allow_test_only=True,
+                        metadata={"model_sha256": malformed},
+                    )
+                    self.assertEqual(result["status"], "FAIL")
+                    self.assertTrue(
+                        any(item["code"] == "model_hash_invalid" for item in result["diagnostics"]["errors"])
+                    )
+
+    def test_cli_empty_model_hash_is_not_silently_ignored(self):
+        """An explicitly empty --model-sha256 remains an external assertion."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"MODEL_BYTES")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            profile = root / "profile.yaml"
+            profile.write_text(
+                self.model_profile.read_text(encoding="utf-8")
+                .replace("model:\n", "model:\n  sha256: " + digest + "\n")
+                .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+                encoding="utf-8",
+            )
+            output_json = root / "qualification.json"
+            output_markdown = root / "qualification.md"
+            command = [
+                sys.executable,
+                str(ROOT / "tools/auto_aim_qualification/auto_aim_qualification.py"),
+                "--allow-test-only",
+                "--model-profile", str(profile),
+                "--model", str(artifact),
+                "--pnp-config", str(self.pnp_config),
+                "--model-sha256", "",
+                "--output-json", str(output_json),
+                "--output-markdown", str(output_markdown),
+            ]
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("status=FAIL", result.stdout)
+            report = json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertTrue(any(item["code"] == "model_hash_external_invalid" for item in report["diagnostics"]["errors"]))
+
     def test_pnp_resolution_and_corner_order_fail(self):
         import yaml
 

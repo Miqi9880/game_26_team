@@ -250,11 +250,23 @@ def _unsafe_file_alias(path: Path) -> bool:
         return True
 
 
-def _expected_hash(model: Mapping[str, Any]) -> Optional[str]:
-    for key in ("sha256", "sha256sum", "artifact_sha256", "hash"):
-        value = model.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+_MODEL_HASH_KEYS = ("sha256", "sha256sum", "artifact_sha256", "hash")
+_MISSING_HASH = object()
+
+
+def _expected_hash(model: Mapping[str, Any]) -> Any:
+    """Return the first profile hash declaration, preserving malformed values.
+
+    Do not filter by type here.  YAML parses an unquoted all-numeric digest
+    (for example, ``64 * "0"``) as an integer; dropping that value would make
+    a tampered profile look as though it had no declaration and would let an
+    external hash silently replace it.
+    """
+
+    for key in _MODEL_HASH_KEYS:
+        if key in model:
+            value = model.get(key)
+            return value.strip() if isinstance(value, str) else value
     return None
 
 
@@ -437,7 +449,7 @@ def audit_model_profile(
     model_path: str | Path | None = None,
     mode: str = "evidence_only",
     allow_test_only: bool = False,
-    expected_model_sha256: Optional[str] = None,
+    expected_model_sha256: Any = _MISSING_HASH,
 ) -> AuditResult:
     """Audit a detector ``model_profile.yaml`` and optional runtime artifact."""
 
@@ -480,15 +492,54 @@ def audit_model_profile(
                 )
             digest = _sha256(runtime)
             result.model_sha256 = digest
-            declared_hash = expected_model_sha256 or _expected_hash(model)
-            if declared_hash is None:
-                (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
+            profile_hash = _expected_hash(model)
+            external_supplied = expected_model_sha256 is not _MISSING_HASH
+            # Preserve a non-string value as an invalid declaration instead of
+            # silently treating it as absent.  The public type is ``str`` but
+            # metadata/third-party callers can still pass malformed values.
+            external_hash = expected_model_sha256.strip() if isinstance(expected_model_sha256, str) else expected_model_sha256
+            # A caller-supplied/metadata hash is an additional assertion, never
+            # an override for the hash recorded in the reviewed profile.  Check
+            # every declaration independently so a correct external value cannot
+            # mask a tampered profile value.
+            profile_declared = profile_hash is not None
+            declarations: list[tuple[str, Any]] = []
+            if profile_declared:
+                declarations.append(("profile", profile_hash))
+            if external_supplied:
+                declarations.append(("external", external_hash))
+            if profile_declared and external_supplied and str(profile_hash).strip().lower() != str(external_hash).strip().lower():
+                result.fail(
+                    "model_hash_declaration_mismatch",
+                    "external model SHA-256 does not match the reviewed profile declaration",
+                    field="model.sha256",
+                )
+            if not profile_declared:
+                # A profile declaration is mandatory whenever an external
+                # expectation is supplied (and in strict/production mode).
+                missing_status = result.fail if external_supplied or mode == "strict" or profile_kind == "production" else result.warn
+                missing_status(
                     "model_hash_missing", "model artifact SHA-256 is not declared in the reviewed profile", field="model.sha256"
                 )
-            elif not _SHA256_RE.fullmatch(str(declared_hash)):
-                result.fail("model_hash_invalid", "declared model SHA-256 is not 64 hexadecimal characters", field="model.sha256")
-            elif digest.lower() != str(declared_hash).lower():
-                result.fail("model_hash_mismatch", "model artifact SHA-256 does not match the profile", field="model.sha256")
+            if external_supplied and (not isinstance(external_hash, str) or not external_hash):
+                result.fail(
+                    "model_hash_external_invalid",
+                    "external expected model SHA-256 must be a non-empty string",
+                    field="--model-sha256",
+                )
+            for source, declared_hash in declarations:
+                if not isinstance(declared_hash, str) or not _SHA256_RE.fullmatch(declared_hash):
+                    result.fail(
+                        "model_hash_invalid",
+                        f"{source} model SHA-256 is not 64 hexadecimal characters",
+                        field="model.sha256",
+                    )
+                elif digest.lower() != str(declared_hash).lower():
+                    result.fail(
+                        "model_hash_mismatch",
+                        f"model artifact SHA-256 does not match the {source} declaration",
+                        field="model.sha256",
+                    )
         except OSError:
             (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
                 "model_hash_unreadable", "model artifact could not be hashed", field="model.path"

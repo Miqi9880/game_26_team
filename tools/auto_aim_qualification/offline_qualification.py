@@ -68,13 +68,30 @@ def _safe_metadata(value: Optional[Mapping[str, Any]]) -> tuple[dict[str, Any], 
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} ignored"})
             continue
         if isinstance(raw, (dict, list, tuple)):
+            if key_text == "model_sha256":
+                # Keep a redacted invalid marker so the model audit rejects
+                # the external assertion instead of silently treating it as
+                # absent.  Do not preserve arbitrary nested content in the
+                # report, since it could contain paths or credentials.
+                result[key_text] = "<invalid>"
+                warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a scalar string"})
+                continue
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} must be scalar"})
             continue
         if isinstance(raw, float) and not math.isfinite(raw):
+            if key_text == "model_sha256":
+                result[key_text] = "<invalid>"
+                warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a finite string"})
+                continue
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} must be finite"})
             continue
         if isinstance(raw, str):
             result[key_text] = _redact_text(raw)
+        elif key_text == "model_sha256" and raw is None:
+            # JSON null is an explicit, invalid external assertion rather
+            # than an omitted field.
+            result[key_text] = "<invalid>"
+            warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a string"})
         else:
             result[key_text] = raw
     return result, warnings
@@ -180,13 +197,19 @@ def qualify_offline(
     if mode == "strict" and not metadata:
         findings.append(_finding_dict("metadata_empty", "strict mode requires non-empty metadata JSON"))
 
-    model_audit = audit_model_profile(
-        model_profile,
-        model_path=model,
-        mode=mode,
-        allow_test_only=allow_test_only,
-        expected_model_sha256=str(metadata.get("model_sha256")) if metadata.get("model_sha256") else None,
-    )
+    model_audit_kwargs: dict[str, Any] = {
+        "model_path": model,
+        "mode": mode,
+        "allow_test_only": allow_test_only,
+    }
+    # Preserve an explicitly supplied value, including null/zero/malformed
+    # metadata, so the model audit can reject it rather than treating it as
+    # absent and silently weakening the external hash assertion.  Omit the
+    # keyword entirely when no external assertion was supplied so the audit's
+    # missing-value sentinel remains distinguishable from an explicit null.
+    if "model_sha256" in metadata:
+        model_audit_kwargs["expected_model_sha256"] = metadata["model_sha256"]
+    model_audit = audit_model_profile(model_profile, **model_audit_kwargs)
     model_mapping = model_audit.values.get("class_to_armor_type")
     expected_mapping = None
     if isinstance(model_mapping, Mapping):
@@ -267,7 +290,9 @@ def qualify_offline(
             findings.append(_finding_dict("strict_requires_production_pnp", "strict mode requires production PnP/calibration"))
         if model is None:
             findings.append(_finding_dict("model_missing", "strict mode requires an actual model artifact"))
-        if not _model_hash_declared(model_profile) and not metadata.get("model_sha256"):
+        # The reviewed profile declaration is mandatory on its own; an
+        # external/metadata hash can never satisfy or replace it.
+        if not _model_hash_declared(model_profile):
             findings.append(_finding_dict("model_hash_missing", "strict mode requires a declared model SHA-256 in the profile"))
         if camera_intrinsic_report is None:
             findings.append(_finding_dict("camera_report_missing", "strict mode requires a camera intrinsic evidence report"))

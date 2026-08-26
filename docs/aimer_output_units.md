@@ -10,6 +10,8 @@
 | `command_yaw_degree` / `command_pitch_degree` | degree | 仅 CSV/标注诊断，来源是候选 rad 的转换 |
 | `yaw_vel_rad_s` / `pitch_vel_rad_s` | rad/s | 内部诊断有限差分，不自动发送 |
 | `yaw_acc_rad_s2` / `pitch_acc_rad_s2` | rad/s² | 当前为 0；不实现加速度模型 |
+| `predicted_relative_yaw_rad` / `predicted_relative_pitch_rad` | rad | `OfflinePredictor` 的 test-only 恒速诊断 |
+| `prediction_horizon_ms` | ms（CSV） | 内部由整数 `horizon_ns` 派生，默认关闭 |
 
 正式外部接口边界仍是：
 
@@ -47,6 +49,10 @@ yaw 环绕和车型 pitch 预限幅；离线 Aimer 的 relative 输出仍不能�
 - 当前轨迹为 `tracking` 且有有效 relative yaw/pitch。
 
 候选值为 `test_zero + relative`，并始终带 `test_only=true`。这里不解释 quaternion/world，不做 camera 与云台同轴假设，不做 yaw wrap、机械限位或弹道补偿。
+
+`OfflinePredictor` 在 Aimer 之后独立运行，预测值永远不会替换 Aimer 接收的实测 selected track，
+也不会把预测值写入 `AimCommand`。它只把 `current_relative + velocity_rad_s * horizon_s` 写入
+离线 CSV/标注诊断；`production_ready=false`，不产生正式 absolute command。
 
 ## 开火约束
 

@@ -39,6 +39,8 @@ struct Options
   AimerMode aimer_mode{AimerMode::RelativeDebug};
   std::optional<double> test_zero_yaw_degree;
   std::optional<double> test_zero_pitch_degree;
+  std::optional<double> prediction_horizon_ms;
+  std::optional<double> max_prediction_horizon_ms;
   rm_auto_aim::offline::TrackerConfig tracker_config{};
 };
 
@@ -60,6 +62,8 @@ void usage()
     "  --aimer-mode MODE         relative_debug or test_absolute_zero\n"
     "  --test-zero-yaw-degree D  test-only yaw zero for test_absolute_zero\n"
     "  --test-zero-pitch-degree D test-only pitch zero for test_absolute_zero\n"
+    "  --prediction-horizon-ms MS  enable test-only prediction (default disabled)\n"
+    "  --max-prediction-horizon-ms MS  explicit prediction horizon upper bound\n"
     "  --min-detect-count N      tracker lock threshold (default 2)\n"
     "  --max-temp-lost-ms MS     tracker temporary-loss window (default 100)\n"
     "  --max-position-jump-m M   tracker association gate (default 0.75)\n"
@@ -138,6 +142,12 @@ Options parse_options(int argc, char ** argv)
     } else if (argument == "--test-zero-pitch-degree") {
       result.test_zero_pitch_degree = parse_double(
         require_value("--test-zero-pitch-degree"), "--test-zero-pitch-degree");
+    } else if (argument == "--prediction-horizon-ms") {
+      result.prediction_horizon_ms = parse_double(
+        require_value("--prediction-horizon-ms"), "--prediction-horizon-ms");
+    } else if (argument == "--max-prediction-horizon-ms") {
+      result.max_prediction_horizon_ms = parse_double(
+        require_value("--max-prediction-horizon-ms"), "--max-prediction-horizon-ms");
     } else if (argument == "--min-detect-count") {
       result.tracker_config.min_detect_count = parse_int(
         require_value("--min-detect-count"), "--min-detect-count");
@@ -176,7 +186,30 @@ Options parse_options(int argc, char ** argv)
   if (result.test_zero_yaw_degree.has_value() != result.test_zero_pitch_degree.has_value()) {
     throw std::invalid_argument("test zero yaw and pitch must be provided together");
   }
+  if ((result.prediction_horizon_ms.has_value() && *result.prediction_horizon_ms < 0.0) ||
+    (result.max_prediction_horizon_ms.has_value() && *result.max_prediction_horizon_ms < 0.0))
+  {
+    throw std::invalid_argument(
+            "prediction horizon and maximum prediction horizon must not be negative");
+  }
   return result;
+}
+
+std::int64_t milliseconds_to_ns(double milliseconds, const char * name)
+{
+  if (!std::isfinite(milliseconds) || milliseconds < 0.0) {
+    throw std::invalid_argument(std::string(name) + " must be finite and non-negative");
+  }
+  constexpr long double kNanosecondsPerMillisecond = 1'000'000.0L;
+  const long double nanoseconds = static_cast<long double>(milliseconds) *
+    kNanosecondsPerMillisecond;
+  const long double rounded = std::round(nanoseconds);
+  const long double max_nanoseconds =
+    static_cast<long double>(std::numeric_limits<std::int64_t>::max());
+  if (!std::isfinite(nanoseconds) || rounded < 0.0L || rounded > max_nanoseconds) {
+    throw std::invalid_argument(std::string(name) + " is too large for int64 nanoseconds");
+  }
+  return static_cast<std::int64_t>(rounded);
 }
 
 std::int64_t frame_period_ns(const Options & options, double video_fps)
@@ -204,6 +237,52 @@ void write_optional(std::ofstream & csv, const std::optional<double> & value)
   }
 }
 
+void write_prediction_fields(
+  std::ofstream & csv,
+  const rm_auto_aim::offline::PredictionResult * prediction)
+{
+  // Keep the schema stable while making the default (no explicit horizon)
+  // visibly empty.  A disabled run must not manufacture a zero-horizon row.
+  if (prediction == nullptr) {
+    csv << 0;
+    // prediction_valid plus ten additional fields is the complete
+    // eleven-column prediction suffix.  The caller already emitted the
+    // separating comma, so ten commas terminate the remaining empty fields.
+    for (int index = 0; index < 10; ++index) {
+      csv << ',';
+    }
+    return;
+  }
+
+  csv << (prediction->valid ? 1 : 0) << ',' <<
+    rm_auto_aim::offline::prediction_failure_reason_name(prediction->failure_reason) << ',' <<
+    std::setprecision(10) <<
+    static_cast<double>(prediction->horizon_ns) / 1'000'000.0 << ',';
+  if (prediction->source_stamp_ns >= 0) {
+    csv << prediction->source_stamp_ns;
+  }
+  csv << ',';
+  if (prediction->predicted_stamp_ns >= 0) {
+    csv << prediction->predicted_stamp_ns;
+  }
+  csv << ',';
+  write_optional(csv, prediction->predicted_relative_yaw_rad);
+  csv << ',';
+  write_optional(csv, prediction->predicted_relative_pitch_rad);
+  csv << ',';
+  if (prediction->predicted_relative_yaw_rad.has_value()) {
+    csv << std::setprecision(10) << rm_auto_aim::units::radians_to_degrees(
+      static_cast<float>(*prediction->predicted_relative_yaw_rad));
+  }
+  csv << ',';
+  if (prediction->predicted_relative_pitch_rad.has_value()) {
+    csv << std::setprecision(10) << rm_auto_aim::units::radians_to_degrees(
+      static_cast<float>(*prediction->predicted_relative_pitch_rad));
+  }
+  csv << ',' << (prediction->test_only ? 1 : 0) << ',' <<
+    (prediction->production_ready ? 1 : 0);
+}
+
 const rm_auto_aim::offline::TrackedTarget * find_track(
   const rm_auto_aim::offline::TrackerUpdate & update,
   std::size_t detection_index,
@@ -226,7 +305,11 @@ void write_header(std::ofstream & csv)
     "pnp_valid,pnp_failure,reprojection_error_px,camera_x_m,camera_y_m,camera_z_m,"
     "gimbal_x_m,gimbal_y_m,gimbal_z_m,relative_yaw_rad,relative_pitch_rad,track_id,"
     "tracking_state,consecutive_valid,selected,target_lock,absolute_command_valid,"
-    "command_yaw_rad,command_pitch_rad,command_yaw_degree,command_pitch_degree,fire_command,test_only\n";
+    "command_yaw_rad,command_pitch_rad,command_yaw_degree,command_pitch_degree,fire_command,test_only,"
+    "prediction_valid,prediction_reason,prediction_horizon_ms,prediction_source_stamp_ns,"
+    "prediction_stamp_ns,predicted_relative_yaw_rad,predicted_relative_pitch_rad,"
+    "predicted_relative_yaw_degree,predicted_relative_pitch_degree,prediction_test_only,"
+    "prediction_production_ready\n";
 }
 
 void write_row(
@@ -239,7 +322,8 @@ void write_row(
   const rm_auto_aim::pnp::PoseObservation * pose,
   const rm_auto_aim::offline::TrackedTarget * track,
   bool selected,
-  const rm_auto_aim::offline::AimerOutput & aimed)
+  const rm_auto_aim::offline::AimerOutput & aimed,
+  const rm_auto_aim::offline::PredictionResult * prediction)
 {
   csv << frame_index << ',' << stamp_ns << ',' << detection_count << ',' << valid_pnp_count << ',';
   if (pose == nullptr) {
@@ -247,8 +331,12 @@ void write_row(
     for (int index = 0; index < 19; ++index) {
       csv << ',';
     }
-    csv << static_cast<int>(aimed.target_lock) << ",,,,,," <<
-      static_cast<int>(aimed.fire_command) << ",1\n";
+    // target_lock is field 24; fields 25..29 are the five unavailable
+    // command diagnostics before fire_command (field 30).
+    csv << static_cast<int>(aimed.target_lock) << ",,,,," <<
+      static_cast<int>(aimed.fire_command) << ",1,";
+    write_prediction_fields(csv, prediction);
+    csv << '\n';
     return;
   }
 
@@ -291,7 +379,9 @@ void write_row(
   write_optional(csv, aimed.command_yaw_degree);
   csv << ',';
   write_optional(csv, aimed.command_pitch_degree);
-  csv << ',' << static_cast<int>(aimed.fire_command) << ',' << (aimed.test_only ? 1 : 0) << '\n';
+  csv << ',' << static_cast<int>(aimed.fire_command) << ',' << (aimed.test_only ? 1 : 0) << ',';
+  write_prediction_fields(csv, prediction);
+  csv << '\n';
 }
 
 }  // namespace
@@ -326,6 +416,18 @@ int main(int argc, char ** argv)
     }
     rm_auto_aim::offline::SafeOfflineAimer aimer(aimer_config);
 
+    rm_auto_aim::offline::PredictionConfig prediction_config{};
+    prediction_config.enabled = options.prediction_horizon_ms.has_value();
+    if (options.prediction_horizon_ms.has_value()) {
+      prediction_config.horizon_ns = milliseconds_to_ns(
+        *options.prediction_horizon_ms, "--prediction-horizon-ms");
+    }
+    if (options.max_prediction_horizon_ms.has_value()) {
+      prediction_config.max_horizon_ns = milliseconds_to_ns(
+        *options.max_prediction_horizon_ms, "--max-prediction-horizon-ms");
+    }
+    rm_auto_aim::offline::OfflinePredictor predictor(prediction_config);
+
     cv::VideoCapture video(options.video_path);
     if (!video.isOpened()) {
       throw std::runtime_error("cannot open video: " + options.video_path);
@@ -346,7 +448,11 @@ int main(int argc, char ** argv)
       " model_profile_kind=" << (model_profile.test_only ? "test_only" : "production") <<
       " effective_test_only=" << (pnp_stage.config().test_only || model_profile.test_only ? "true" : "false") <<
       " aimer_mode=" << rm_auto_aim::offline::aimer_mode_name(options.aimer_mode) <<
-      " frame_period_ns=" << period_ns << '\n';
+      " frame_period_ns=" << period_ns <<
+      " prediction=" << (prediction_config.enabled ? "enabled" : "disabled") <<
+      " prediction_horizon_ns=" << prediction_config.horizon_ns <<
+      " max_prediction_horizon_ns=" << prediction_config.max_horizon_ns <<
+      " prediction_test_only=true production_ready=false\n";
     if (pnp_stage.config().test_only) {
       std::cout << "warning=test_only calibration/geometry/extrinsic; no physical accuracy claim\n";
     }
@@ -394,28 +500,41 @@ int main(int argc, char ** argv)
       // explicitly unavailable/zero. It is retained by Aimer for future
       // ballistic work and does not affect the safe output in this phase.
       const auto aimed = aimer.aim(selected, 0.0);
+      std::optional<rm_auto_aim::offline::PredictionResult> prediction;
+      if (prediction_config.enabled) {
+        prediction = predictor.predict(selected, stamp_ns);
+      }
 
       std::cout << "frame=" << processed << " stamp_ns=" << stamp_ns <<
         " detections=" << detections.size() << " valid_pnp=" << valid_pnp_count <<
         " tracks=" << update.tracks.size() << " state=" <<
         rm_auto_aim::offline::tracking_state_name(update.state) << " target_lock=" <<
         static_cast<int>(aimed.target_lock) << " fire_command=" <<
-        static_cast<int>(aimed.fire_command) << '\n';
+        static_cast<int>(aimed.fire_command);
+      if (prediction.has_value()) {
+        std::cout << " prediction_valid=" << (prediction->valid ? "true" : "false") <<
+          " prediction_reason=" <<
+          rm_auto_aim::offline::prediction_failure_reason_name(prediction->failure_reason);
+      }
+      std::cout << '\n';
 
       if (poses.empty()) {
-        write_row(csv, processed, stamp_ns, 0, 0, 0, nullptr, nullptr, false, aimed);
+        write_row(csv, processed, stamp_ns, 0, 0, 0, nullptr, nullptr, false, aimed,
+          prediction.has_value() ? &*prediction : nullptr);
       } else {
         for (std::size_t index = 0; index < poses.size(); ++index) {
           const auto * track = find_track(update, index, stamp_ns);
           const bool is_selected = selected.has_value() && track != nullptr &&
             selected->track_id == track->track_id;
           write_row(csv, processed, stamp_ns, poses.size(), valid_pnp_count, index,
-            &poses[index], track, is_selected, aimed);
+            &poses[index], track, is_selected, aimed,
+            prediction.has_value() ? &*prediction : nullptr);
         }
       }
 
       const auto annotated = rm_auto_aim::offline::annotate_offline_frame(
-        image, poses, update, selected, aimed);
+        image, poses, update, selected, aimed,
+        prediction.has_value() ? &*prediction : nullptr);
       const auto output_path = std::filesystem::path(options.annotated_dir) /
         ("frame_" + std::to_string(processed) + ".png");
       if (annotated.empty() || !cv::imwrite(output_path.string(), annotated)) {

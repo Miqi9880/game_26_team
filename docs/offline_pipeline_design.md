@@ -12,6 +12,7 @@ OpenVinoYoloDetector
   → OfflineTracker
   → TargetSelector
   → SafeOfflineAimer
+  → OfflinePredictor (optional test-only diagnostic)
   → CSV + PNG
 ```
 
@@ -68,13 +69,41 @@ candidate_pitch_rad = test_zero_pitch_rad + relative_pitch_rad
 
 `SafeOfflineAimer` 接收 `shoot_speed_mps` 并原样保留为诊断字段；本阶段不进行弹道补偿、提前量或开火决策。离线录像没有对应 VisionData 时显式传入 0。
 
+## OfflinePredictor：恒速基线与延迟诊断
+
+`OfflinePredictor` 是独立的、默认关闭的回放诊断组件。只有显式传入
+`--prediction-horizon-ms` 才会启用；显式传入 `0` 仍表示一次有意的零 horizon 诊断。
+`--max-prediction-horizon-ms` 设置上限（默认 500 ms），超过上限直接 fail-closed，不能静默截断。
+CLI 将毫秒四舍五入为整数纳秒；预测器只使用帧的 `stamp_ns`，不读取
+`steady_clock::now()` 或其他墙钟。
+
+对当前 selected、`state=Tracking` 且通过完整观测校验的轨迹，公式固定为：
+
+```text
+horizon_s = horizon_ns / 1e9
+predicted_relative_yaw_rad = current_relative_yaw_rad + yaw_vel_rad_s * horizon_s
+predicted_relative_pitch_rad = current_relative_pitch_rad + pitch_vel_rad_s * horizon_s
+predicted_stamp_ns = source_stamp_ns + horizon_ns
+```
+
+角度和角速度始终是 `rad`、`rad/s`，不做 yaw wrap；degree 只在 CSV/标注中由上述 rad 派生。
+负/回退/重复/不匹配时间戳、负或超限 horizon、缺少角度、NaN/Inf 角度或速度、整型时间戳溢出
+以及非有限结果都有单独的 `PredictionFailureReason`。`Lost`、`TempLost`、`Detecting`、无目标或
+无效轨迹均不能预测。预测结果固定 `test_only=true`、`production_ready=false`，不会回写
+`TargetSelector`，不会替换 `SafeOfflineAimer` 的 selected track，也不会进入 `RobotCtrl`。
+
+CSV 在启用时记录 prediction valid/reason、horizon、源/预测时间戳、relative yaw/pitch rad 及
+派生 degree；默认关闭时 prediction 字段保持空诊断。标注只叠加 test-only 文字，不改变控制输出。
+`diagnose_synthetic_prediction_error` 只比较合成回放中预测时间戳与未来测量角，结果标记
+`synthetic=true`，不等于真实延迟、命中率或比赛性能。
+
 ## 离线工具输出
 
 `auto_aim_offline` 要求显式提供版本化 `--model-profile`；读取 test-only 模型时还必须传入
 `--allow-test-profile`，读取 test-only PnP 时传入 `--allow-test-config`。它输出逐帧 CSV 和标注 PNG。
 CSV 记录检测数量、有效 PnP 数量、相机坐标、relative rad、track 状态、track id、lock、可选
-test absolute rad/degree、fire 和 test-only 标志。标注图叠加四点、PnP 状态、selected track、
-tracking 状态、相对角和 `fire=0`。
+test absolute rad/degree、可选 prediction 诊断、fire 和 test-only 标志。标注图叠加四点、PnP 状态、
+selected track、tracking 状态、相对角、可选 prediction 诊断和 `fire=0`。
 
 独立 `offline_tracker_replay_test` 复用同一个 C++ Tracker/Selector，对合成序列检查逐帧
 `stamp_ns`、状态、track id、选择和关联结果。它不复制算法、不依赖模型/视频/OpenVINO/ROS/相机/串口，

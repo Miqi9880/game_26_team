@@ -61,6 +61,21 @@ Tracker 每帧和每条轨迹都保留确定性的关联结果/原因（如 `new
 
 `offline_tracker_replay_test` 使用真实 C++ `OfflineTracker` 和 `TargetSelector`，而不是 Python 的算法副本。其合成序列覆盖连续运动、多目标乱序、近距离交叉、遮挡、超时、重新捕获、时间异常、非有限数据、非正深度、跳变和确定性重复回放。CTest XML 与源码中的 fixture 一起构成可复现的离线回放证据；该测试不生成或伪造真实录像/模型证据包。
 
+## OfflinePredictor 与合成延迟
+
+预测器只接受 `TrackedTarget`，并要求 `state=Tracking`、观测通过
+`is_valid_target_observation()`、`relative_yaw_rad/relative_pitch_rad` 和 Tracker 的
+`yaw_vel_rad_s/pitch_vel_rad_s` 均有限。它使用严格递增、可解释的帧 `stamp_ns` 与整数纳秒 horizon，
+执行透明的 constant-velocity relative-angle 公式，不使用 quaternion、world/camera→gimbal 外参、
+IMU、yaw wrap、EKF、弹道或开火判断。所有失败条件（时间戳、状态、角度/速度、horizon、溢出和非有限
+结果）均保留枚举原因；失锁轨迹不能被预测成有效目标。
+
+预测默认关闭。CLI 的预测结果只写 CSV/标注诊断，带有 `test_only=true` 和
+`production_ready=false`，不改变 Selector、Aimer 的 selected track、安全命令或 RobotCtrl；
+`fire_command` 始终为 0。`offline_predictor_test` 覆盖恒速、零/负/超限 horizon、缺失/非有限输入、
+各失锁状态、时间回退/重复、溢出、多目标 ID、排列确定性和安全边界。合成未来角度误差仅是
+`synthetic/test-only` 延迟诊断，不能外推真实预测误差、命中率或比赛性能。
+
 ## TargetSelector
 
 Selector 只从有效且处于 `tracking` 的轨迹中选择。候选排序不使用敌我颜色、固定 class id、车辆编号、前哨站规则或装甲专属优先级：

@@ -30,7 +30,7 @@
 |---|---|---|---|
 | 场景 1 模块 2 | OpenVINO / `RawArmorDetection` | `raw_armor_detector.cpp`、`raw_armor_detector_test.cpp`、版本化 model profile 校验 | 正式比赛模型、类别/颜色/四点语义和实测数据 |
 | 场景 1 模块 3、场景 4 标定章节 | `PnpStage` | `pnp_stage.cpp`、`pnp_stage_test.cpp`、`docs/pnp_config_schema.md`；test-only 配置显式 opt-in | production K/D、装甲尺寸、camera→gimbal 外参和误差报告 |
-| 场景 1 模块 4、场景 5B | `OfflineTracker` / `TargetSelector` | `offline_pipeline.cpp`、`offline_pipeline_test.cpp`；包含时间戳、跳变、短暂/长时间失锁和多目标确定性选择测试 | 正式模型、真实相机数据、实车运动、正式 EKF/预测验收 |
+| 场景 1 模块 4、场景 5B | `OfflineTracker` / `TargetSelector` / `OfflinePredictor` | `offline_pipeline.cpp`、离线回放测试；包含时间戳、跳变、短暂/长时间失锁、多目标确定性选择和恒速延迟诊断 | 正式模型、真实相机数据、实车运动、正式 EKF/预测验收 |
 | 场景 1 模块 5、场景 8 | `SafeOfflineAimer` | `offline_pipeline.cpp`、Aimer 测试；相对角诊断和 test-only 绝对零点候选均不开火 | 正式绝对零点、云台控制链路、弹道/延迟和开火联调 |
 | 场景 3 | `/Vision_data` 输入适配 | `ros_adapters.hpp`、`auto_aim_core_test.cpp`、串口 loopback；检查时间戳、`frame_id`、四元数 wxyz 和记录字段 | IMU/四元数方向、world 轴、零点和真实联调含义 |
 | 场景 9 | Tracker + TargetSelector 状态链 | 多目标关联、检测顺序变化、置信度/中心/历史 track-id 选择测试 | 两车对打、目标切换压力数据、稳定性和实车验收 |
@@ -67,7 +67,10 @@ quaternion 推导、车辆半径、装甲尺寸/高度、固定分辨率、颜�
 `--model-profile`；test-only 模型和 PnP 配置分别需要显式 opt-in，避免离线链路静默使用未审查
 的旧模型语义。`OfflineTracker` 对负数、回退和重复时间戳会返回安全快照，并将活动持久轨迹
 置为 `TempLost`，因此直接读取 tracker 状态也不能继续锁定；这只是诊断/安全闩修复，不代表
-增加了正式预测或多目标稳定性能力。
+增加了正式预测或多目标稳定性能力。新增 `OfflinePredictor` 仍是默认关闭的 constant-velocity
+relative-angle test-only 层：它使用整数纳秒 horizon 和 Tracker 有限差分速度，明确拒绝失锁、时间
+异常、缺角度/非有限值和超限 horizon；不复制同济的实时钟、EKF、world/quaternion、外参或弹道逻辑。
+合成未来角度误差只用于可复现的延迟诊断，不是实际延迟、命中率或比赛性能证据。
 
 ## 2. RoboMaster 论坛
 
@@ -109,7 +112,7 @@ quaternion 推导、车辆半径、装甲尺寸/高度、固定分辨率、颜�
 |---|---|---|
 | 四点检测与预处理逆变换 | `src/auto_aim_ros2/src/raw_armor_detector.cpp` | 已有显式 letterbox 和点序测试；正式比赛模型仍待提供和核验 |
 | `solvePnP` 与几何校验 | `src/auto_aim_ros2/src/pnp_stage.cpp`、`docs/pnp_config_schema.md` | test-only 合成配置可验证；无 production 标定数据 |
-| 观测跟踪与目标选择 | `src/auto_aim_ros2/src/offline_pipeline.cpp` | 已有超时、时间戳、跳变和失锁测试；不能据此宣称实车性能 |
+| 观测跟踪与目标选择 | `src/auto_aim_ros2/src/offline_pipeline.cpp` | 已有超时、时间戳、跳变、失锁、恒速预测和合成延迟测试；不能据此宣称实车性能 |
 | ROS 2 日志/离线回放 | `src/auto_aim_ros2/src/ros_backend.cpp`、`docs/offline_pipeline_design.md` | `null`、`mock`、`offline_reference` 均受 dry-run 安全门控 |
 | 相机与 Orin 部署 | `docs/orin_real_camera_bringup.md` | 仅准备清单；尚未在 Orin 编译或连接真实相机 |
 

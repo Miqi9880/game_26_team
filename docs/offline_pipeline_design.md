@@ -27,7 +27,9 @@ OpenVinoYoloDetector
 
 ## Tracker
 
-Tracker 维护单调递增的 `track_id`，按 `class_id + armor_size` 和相机坐标距离进行贪心关联。每个帧必须提供严格递增的 `stamp_ns`，并且观测自己的时间戳必须与帧时间一致。
+Tracker 维护单调递增的 `track_id`，只在相同 `class_id + armor_size` 的有效观测之间关联。关联坐标始终是 camera xyz；gimbal xyz、quaternion 和世界坐标不会参与比较。候选边必须通过 camera 位置、relative angle 和可选有限差分速度门限；匹配以稳定边顺序作为偏好，并用增广路径求最大基数，再由 `track_id` 和稳定观测顺序消除等价选择，因此 detection 输入排列变化不会改变轨迹结果。失败边不创建可锁定的替代轨迹，而是保留旧轨迹诊断。
+
+每个帧必须提供严格递增的 `stamp_ns`，并且观测自己的时间戳必须与帧时间一致。回放中的 frame 编号缺口只记录数据空洞；Tracker 不补帧，也不以不可复现的时钟、跨设备时间或 cross-topic 时间作补偿。
 
 状态机：
 
@@ -36,7 +38,9 @@ lost → detecting → tracking
 tracking → temp_lost → lost
 ```
 
-只有 `state=tracking` 且观测有效时才允许 `target_lock=49`；其他状态均为 50。时间倒退、重复时间戳、NaN/Inf、非正深度、身份不符、位置/角度跳变都会 fail-closed。速度只做相邻相对角的有限差分，不做 EKF、弹道预测、yaw wrap 或 world/IMU 补偿。
+只有 `state=tracking` 且观测通过完整有效性校验时才允许 `target_lock=49`；其他状态均为 50。时间倒退、重复时间戳、NaN/Inf、非正深度、不支持或冲突的装甲语义、身份不符、位置/角度跳变都会 fail-closed。`RawArmorDetection::ArmorTypeHint::Unknown` 仅在 PnP 已给出合法、显式 `armor_size` 时可继续作为该 PnP 结果的原始提示，绝不把未知值强行映射为 small/large。速度只做相邻相对角的有限差分，不做 EKF、弹道预测、yaw wrap 或 world/IMU 补偿。
+
+短遮挡只进入 `temp_lost`，其中绝不锁定；重新出现后重新经过连续帧门槛。到达 `max_temp_lost_ms` 边界即进入 `lost`，之后不能复用旧轨迹给无关观测。结构无效与关联竞争分别记录为 `rejected_invalid` 和 `rejected_association_conflict`。TrackerUpdate 和每条轨迹均保留关联结果/原因，以及接受、拒绝、重捕获、miss、超时和时间戳拒绝统计，供离线回放解释而非性能宣称。
 
 ## TargetSelector
 
@@ -46,6 +50,8 @@ tracking → temp_lost → lost
 2. 置信度近似相等时优先上一帧 `track_id`；
 3. 再按 bbox 中心到图像中心的距离；
 4. 最后按 `track_id` 做确定性排序。
+
+可选 `switch_debounce_frames` 仅在上一目标仍是有效 `Tracking` 候选时，要求替代目标在连续的 selector 调用中胜出相应次数；如果上一目标失效、`temp_lost` 或 `lost`，selector 立即放弃它，绝不因为防抖返回陈旧目标。每次调用（包括无候选的安全返回）记录候选数、切换/防抖次数和原因。当前 API 没有额外 frame token，因此离线调用方应每帧调用一次 selector。
 
 不根据 `id=7/107` 或颜色字段猜敌我，也不把未知类别强行映射为装甲尺寸。
 
@@ -70,8 +76,18 @@ CSV 记录检测数量、有效 PnP 数量、相机坐标、relative rad、track
 test absolute rad/degree、fire 和 test-only 标志。标注图叠加四点、PnP 状态、selected track、
 tracking 状态、相对角和 `fire=0`。
 
+独立 `offline_tracker_replay_test` 复用同一个 C++ Tracker/Selector，对合成序列检查逐帧
+`stamp_ns`、状态、track id、选择和关联结果。它不复制算法、不依赖模型/视频/OpenVINO/ROS/相机/串口，
+也不把合成回放写成真实数据证据。若未来用 `auto_aim_offline` CSV 归档真实录像回放，必须继续使用
+已有 PR #16 报告器和 PR #17 evidence bundle，而不是新增 CSV 解析、哈希或准入逻辑。
+
 录像没有有效 FPS 时必须通过 `--fps` 或 `--frame-period-ms` 提供可复现时间；不会把所有帧时间戳写成 0。
 
 ## 仍不是比赛结论
 
 test-only 内参、装甲尺寸和外参只证明软件链路可以运行，不证明真实距离、角度或命中率。正式模型语义、相机标定、装甲实测尺寸、camera→gimbal 外参、绝对角零点和开火时序仍需单独确认。
+
+本轮只读借鉴 `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/{tracker,target,aimer,solver}.{hpp,cpp}`
+中的 detecting/temp-lost 状态管理、失锁诊断和避免频繁目标替换的工程思路。没有移植其 11 维 EKF、
+世界坐标、四元数、车辆尺寸、固定分辨率、协方差、颜色/车型优先级、弹道、Planner/MPC/Shooter 或任何硬件代码；
+也没有采用其参数作为本项目阈值。

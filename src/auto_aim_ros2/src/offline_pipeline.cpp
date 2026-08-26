@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -44,44 +45,91 @@ const cv::Vec3d * camera_position_for(const TargetObservation & observation) noe
   return &observation.camera_xyz_m.value();
 }
 
-bool valid_observation(const TargetObservation & observation) noexcept
+bool valid_armor_size(pnp::ArmorSize size) noexcept
 {
-  if (!observation.valid || !observation.geometry_known || observation.class_id < 0 ||
-    !finite(observation.confidence) || observation.confidence < 0.0F ||
-    observation.confidence > 1.0F || !finite(observation.reprojection_error_px) ||
-    observation.reprojection_error_px < 0.0 || camera_position_for(observation) == nullptr)
-  {
-    return false;
+  return size == pnp::ArmorSize::Small || size == pnp::ArmorSize::Large;
+}
+
+bool valid_armor_type_hint(detector::RawArmorDetection::ArmorTypeHint hint) noexcept
+{
+  using ArmorTypeHint = detector::RawArmorDetection::ArmorTypeHint;
+  return hint == ArmorTypeHint::Unknown || hint == ArmorTypeHint::Small ||
+         hint == ArmorTypeHint::Large;
+}
+
+bool armor_hint_agrees_with_size(const TargetObservation & observation) noexcept
+{
+  using ArmorTypeHint = detector::RawArmorDetection::ArmorTypeHint;
+  switch (observation.raw_detection.armor_type) {
+    case ArmorTypeHint::Unknown:
+      // PnP may have selected its geometry through the reviewed class map.
+      return true;
+    case ArmorTypeHint::Small:
+      return observation.armor_size == pnp::ArmorSize::Small;
+    case ArmorTypeHint::Large:
+      return observation.armor_size == pnp::ArmorSize::Large;
   }
-  if (observation.raw_detection.class_id != observation.class_id ||
-    !finite(observation.raw_detection.confidence) ||
-    observation.raw_detection.confidence < 0.0F || observation.raw_detection.confidence > 1.0F ||
+  return false;
+}
+
+const char * target_observation_validation_reason(const TargetObservation & observation) noexcept
+{
+  if (!observation.valid || !observation.geometry_known) {
+    return "PnP observation is not valid geometry";
+  }
+  if (observation.stamp_ns < 0) {
+    return "observation timestamp must not be negative";
+  }
+  if (observation.class_id < 0 || observation.raw_detection.class_id < 0 ||
+    observation.raw_detection.class_id != observation.class_id)
+  {
+    return "observation class identity is invalid or inconsistent";
+  }
+  if (observation.raw_detection.color_id < -1) {
+    return "raw detection color identity is invalid";
+  }
+  if (!valid_armor_size(observation.armor_size) ||
+    !valid_armor_type_hint(observation.raw_detection.armor_type) ||
+    !armor_hint_agrees_with_size(observation))
+  {
+    return "observation armor identity is invalid or inconsistent";
+  }
+  if (!finite(observation.confidence) || observation.confidence < 0.0F ||
+    observation.confidence > 1.0F || !finite(observation.reprojection_error_px) ||
+    observation.reprojection_error_px < 0.0)
+  {
+    return "observation confidence or reprojection evidence is invalid";
+  }
+  if (!finite(observation.raw_detection.confidence) ||
+    observation.raw_detection.confidence < 0.0F ||
+    observation.raw_detection.confidence > 1.0F ||
     !finite(observation.raw_detection.bbox.x) || !finite(observation.raw_detection.bbox.y) ||
     !finite(observation.raw_detection.bbox.width) || !finite(observation.raw_detection.bbox.height) ||
     observation.raw_detection.bbox.width <= 0.0F || observation.raw_detection.bbox.height <= 0.0F)
   {
-    return false;
+    return "raw detection evidence is invalid";
   }
   for (const auto & keypoint : observation.raw_detection.keypoints) {
     if (!finite_point(keypoint)) {
-      return false;
+      return "raw detection keypoint is not finite";
     }
   }
-
-  const auto & camera_position = *observation.camera_xyz_m;
-  if (!finite_vec(camera_position) || camera_position[2] <= kPositiveDepthEpsilon) {
-    return false;
+  const auto * camera_position = camera_position_for(observation);
+  if (camera_position == nullptr || !finite_vec(*camera_position) ||
+    (*camera_position)[2] <= kPositiveDepthEpsilon)
+  {
+    return "camera position is invalid or has non-positive depth";
   }
   if (observation.gimbal_xyz_m.has_value() && !finite_vec(*observation.gimbal_xyz_m)) {
-    return false;
+    return "gimbal position is not finite";
   }
   if (observation.relative_yaw_rad.has_value() && !finite(*observation.relative_yaw_rad)) {
-    return false;
+    return "relative yaw is not finite";
   }
   if (observation.relative_pitch_rad.has_value() && !finite(*observation.relative_pitch_rad)) {
-    return false;
+    return "relative pitch is not finite";
   }
-  return true;
+  return nullptr;
 }
 
 bool same_target_identity(
@@ -89,6 +137,164 @@ bool same_target_identity(
   const TargetObservation & second) noexcept
 {
   return first.class_id == second.class_id && first.armor_size == second.armor_size;
+}
+
+bool observation_physical_less(
+  const TargetObservation & lhs,
+  const TargetObservation & rhs) noexcept
+{
+  if (lhs.class_id != rhs.class_id) {
+    return lhs.class_id < rhs.class_id;
+  }
+  if (lhs.armor_size != rhs.armor_size) {
+    return static_cast<int>(lhs.armor_size) < static_cast<int>(rhs.armor_size);
+  }
+  const auto & lp = *lhs.camera_xyz_m;
+  const auto & rp = *rhs.camera_xyz_m;
+  for (int index = 0; index < 3; ++index) {
+    if (lp[index] != rp[index]) {
+      return lp[index] < rp[index];
+    }
+  }
+  if (lhs.confidence != rhs.confidence) {
+    return lhs.confidence > rhs.confidence;
+  }
+  const auto & lb = lhs.raw_detection.bbox;
+  const auto & rb = rhs.raw_detection.bbox;
+  if (lb.x != rb.x) return lb.x < rb.x;
+  if (lb.y != rb.y) return lb.y < rb.y;
+  if (lb.width != rb.width) return lb.width < rb.width;
+  if (lb.height != rb.height) return lb.height < rb.height;
+  return lhs.detection_index < rhs.detection_index;
+}
+
+struct AssociationEdge
+{
+  std::size_t track_index{0};
+  std::size_t observation_index{0};
+  double distance_m{0.0};
+  double yaw_velocity_rad_s{0.0};
+  double pitch_velocity_rad_s{0.0};
+};
+
+struct AssociationGateStatus
+{
+  bool same_identity_active{false};
+  bool has_valid_edge{false};
+  AssociationResult rejection{AssociationResult::None};
+  std::string reason;
+};
+
+struct GateEvaluation
+{
+  AssociationResult result{AssociationResult::None};
+  std::string reason;
+  double distance_m{0.0};
+  double yaw_velocity_rad_s{0.0};
+  double pitch_velocity_rad_s{0.0};
+
+  bool accepted() const noexcept
+  {
+    return result == AssociationResult::Matched;
+  }
+};
+
+GateEvaluation evaluate_gate(
+  const TrackedTarget & track,
+  const TargetObservation & observation,
+  std::int64_t timestamp_ns,
+  const TrackerConfig & config)
+{
+  GateEvaluation result{};
+  const auto elapsed_ns = timestamp_ns - track.last_valid_timestamp_ns;
+  if (elapsed_ns <= 0) {
+    result.result = AssociationResult::RejectedTimestamp;
+    result.reason = "track timestamp is not increasing";
+    return result;
+  }
+  const auto * previous_position = camera_position_for(track.observation);
+  const auto * current_position = camera_position_for(observation);
+  if (previous_position == nullptr || current_position == nullptr) {
+    result.result = AssociationResult::RejectedInvalid;
+    result.reason = "camera association evidence is unavailable";
+    return result;
+  }
+  result.distance_m = point_distance(*previous_position, *current_position);
+  if (!finite(result.distance_m) || result.distance_m > config.max_position_jump_m) {
+    result.result = AssociationResult::RejectedPositionJump;
+    result.reason = "camera position jump exceeds tracker limit";
+    return result;
+  }
+  if (track.observation.relative_yaw_rad.has_value() && observation.relative_yaw_rad.has_value() &&
+    std::abs(*observation.relative_yaw_rad - *track.observation.relative_yaw_rad) >
+    config.max_angle_jump_rad)
+  {
+    result.result = AssociationResult::RejectedAngleJump;
+    result.reason = "relative yaw jump exceeds tracker limit";
+    return result;
+  }
+  if (track.observation.relative_pitch_rad.has_value() && observation.relative_pitch_rad.has_value() &&
+    std::abs(*observation.relative_pitch_rad - *track.observation.relative_pitch_rad) >
+    config.max_angle_jump_rad)
+  {
+    result.result = AssociationResult::RejectedAngleJump;
+    result.reason = "relative pitch jump exceeds tracker limit";
+    return result;
+  }
+  const double dt_s = static_cast<double>(elapsed_ns) / 1'000'000'000.0;
+  if (track.observation.relative_yaw_rad.has_value() && observation.relative_yaw_rad.has_value()) {
+    result.yaw_velocity_rad_s =
+      (*observation.relative_yaw_rad - *track.observation.relative_yaw_rad) / dt_s;
+  }
+  if (track.observation.relative_pitch_rad.has_value() && observation.relative_pitch_rad.has_value()) {
+    result.pitch_velocity_rad_s =
+      (*observation.relative_pitch_rad - *track.observation.relative_pitch_rad) / dt_s;
+  }
+  if (!finite(result.yaw_velocity_rad_s) || !finite(result.pitch_velocity_rad_s) ||
+    (config.max_velocity_rad_s > 0.0 &&
+    (std::abs(result.yaw_velocity_rad_s) > config.max_velocity_rad_s ||
+    std::abs(result.pitch_velocity_rad_s) > config.max_velocity_rad_s)))
+  {
+    result.result = AssociationResult::RejectedVelocity;
+    result.reason = !finite(result.yaw_velocity_rad_s) || !finite(result.pitch_velocity_rad_s) ?
+      "computed angular velocity is not finite" : "computed angular velocity exceeds tracker limit";
+    return result;
+  }
+  result.result = AssociationResult::Matched;
+  result.reason = "camera identity and motion gates matched";
+  return result;
+}
+
+int rejection_priority(AssociationResult result) noexcept
+{
+  switch (result) {
+    case AssociationResult::RejectedPositionJump:
+      return 1;
+    case AssociationResult::RejectedAngleJump:
+      return 2;
+    case AssociationResult::RejectedVelocity:
+      return 3;
+    case AssociationResult::RejectedTimestamp:
+      return 4;
+    case AssociationResult::RejectedInvalid:
+      return 5;
+    default:
+      return 100;
+  }
+}
+
+bool better_primary_track(const TrackedTarget & candidate, const TrackedTarget & current) noexcept;
+
+void set_primary_track(TrackerUpdate & update)
+{
+  update.primary_track.reset();
+  for (const auto & track : update.tracks) {
+    if (!update.primary_track.has_value() || better_primary_track(track, *update.primary_track)) {
+      update.primary_track = track;
+    }
+  }
+  update.state = update.primary_track.has_value() ?
+    update.primary_track->state : TrackingState::Lost;
 }
 
 cv::Point2f detection_center(const TargetObservation & observation) noexcept
@@ -158,6 +364,37 @@ const char * tracking_state_name(TrackingState state) noexcept
   return "unknown";
 }
 
+const char * association_result_name(AssociationResult result) noexcept
+{
+  switch (result) {
+    case AssociationResult::None:
+      return "none";
+    case AssociationResult::NewTrack:
+      return "new_track";
+    case AssociationResult::Matched:
+      return "matched";
+    case AssociationResult::Reacquired:
+      return "reacquired";
+    case AssociationResult::RejectedInvalid:
+      return "rejected_invalid";
+    case AssociationResult::RejectedAssociationConflict:
+      return "rejected_association_conflict";
+    case AssociationResult::RejectedTimestamp:
+      return "rejected_timestamp";
+    case AssociationResult::RejectedPositionJump:
+      return "rejected_position_jump";
+    case AssociationResult::RejectedAngleJump:
+      return "rejected_angle_jump";
+    case AssociationResult::RejectedVelocity:
+      return "rejected_velocity";
+    case AssociationResult::Missed:
+      return "missed";
+    case AssociationResult::Expired:
+      return "expired";
+  }
+  return "unknown";
+}
+
 TargetObservation make_target_observation(
   const pnp::PoseObservation & pose,
   std::int64_t stamp_ns,
@@ -182,6 +419,11 @@ TargetObservation make_target_observation(
     result.reprojection_error_px = pose.reprojection_error_px;
   }
   return result;
+}
+
+bool is_valid_target_observation(const TargetObservation & observation) noexcept
+{
+  return target_observation_validation_reason(observation) == nullptr;
 }
 
 std::optional<std::string> TrackerConfig::validate() const
@@ -218,28 +460,37 @@ TrackerUpdate OfflineTracker::make_update(
   bool had_observation,
   std::string reason,
   std::size_t valid_count,
-  std::size_t rejected_count) const
+  std::size_t accepted_count,
+  std::size_t rejected_count,
+  std::size_t matched_count,
+  std::size_t new_count,
+  std::size_t reacquired_count,
+  std::size_t missed_count,
+  std::size_t expired_count,
+  AssociationResult association_result) const
 {
   TrackerUpdate result{};
   result.accepted = accepted;
   result.rejected = rejected;
   result.had_observation = had_observation;
-  result.rejection_reason = std::move(reason);
+  result.association_result = association_result;
+  result.association_reason = std::move(reason);
+  if (rejected) {
+    result.rejection_reason = result.association_reason;
+  }
   result.timestamp_ns = timestamp_ns;
   result.valid_observation_count = valid_count;
+  result.accepted_count = accepted_count;
+  result.accepted_observation_count = accepted_count;
   result.rejected_observation_count = rejected_count;
+  result.matched_count = matched_count;
+  result.new_count = new_count;
+  result.reacquired_count = reacquired_count;
+  result.missed_count = missed_count;
+  result.expired_count = expired_count;
+  result.statistics = statistics_;
   result.tracks = tracks_;
-
-  for (const auto & track : result.tracks) {
-    if (!result.primary_track.has_value() || better_primary_track(track, *result.primary_track)) {
-      result.primary_track = track;
-    }
-  }
-  if (result.primary_track.has_value()) {
-    result.state = result.primary_track->state;
-  } else {
-    result.state = TrackingState::Lost;
-  }
+  set_primary_track(result);
   return result;
 }
 
@@ -257,53 +508,41 @@ TrackerUpdate OfflineTracker::update(
   const std::vector<TargetObservation> & observations,
   std::int64_t timestamp_ns)
 {
-  if (timestamp_ns < 0) {
-    auto result = make_update(timestamp_ns, false, true, !observations.empty(),
-      "timestamp must not be negative", 0, observations.size());
-    result.lock_allowed = false;
-    for (auto & track : result.tracks) {
-      if (track.state == TrackingState::Tracking) {
+  ++statistics_.frame_count;
+  statistics_.observation_count += observations.size();
+
+  const auto rejected_timestamp_update = [&](const char * reason) {
+      ++statistics_.rejected_timestamp_count;
+      statistics_.rejected_count += observations.size();
+      // A bad frame clock is itself a safety event.  Latch every active
+      // persistent track out of tracking so callers that inspect
+      // `tracks()`/`state()` instead of this returned snapshot cannot keep a
+      // stale lock alive.  The last valid sample and frame clock remain
+      // unchanged; a later strictly newer valid frame must reacquire through
+      // the normal confirmation threshold.
+      for (auto & track : tracks_) {
+        if (track.state == TrackingState::Lost) {
+          continue;
+        }
         track.state = TrackingState::TempLost;
+        track.consecutive_valid = 0;
+        track.yaw_vel_rad_s = 0.0;
+        track.pitch_vel_rad_s = 0.0;
+        track.updated_this_frame = false;
+        track.association_result = AssociationResult::RejectedTimestamp;
+        track.association_reason = reason;
       }
-    }
-    // make_update() computes the diagnostic primary track/state before the
-    // safety transition above. Recompute them so a rejected timestamp cannot
-    // report a stale "tracking" state to CSV/ROS diagnostics.
-    result.primary_track.reset();
-    for (const auto & track : result.tracks) {
-      if (!result.primary_track.has_value() ||
-        better_primary_track(track, *result.primary_track))
-      {
-        result.primary_track = track;
-      }
-    }
-    result.state = result.primary_track.has_value() ?
-      result.primary_track->state : TrackingState::Lost;
-    return result;
+      auto result = make_update(timestamp_ns, false, true, !observations.empty(), reason, 0, 0,
+          observations.size(), 0, 0, 0, 0, 0, AssociationResult::RejectedTimestamp);
+      result.lock_allowed = false;
+      return result;
+    };
+
+  if (timestamp_ns < 0) {
+    return rejected_timestamp_update("timestamp must not be negative");
   }
   if (last_update_timestamp_ns_ >= 0 && timestamp_ns <= last_update_timestamp_ns_) {
-    auto result = make_update(timestamp_ns, false, true, !observations.empty(),
-      "timestamp is not strictly increasing", 0, observations.size());
-    result.lock_allowed = false;
-    for (auto & track : result.tracks) {
-      if (track.state == TrackingState::Tracking) {
-        track.state = TrackingState::TempLost;
-      }
-    }
-    // Keep the diagnostic snapshot consistent with the safety transition;
-    // the persistent tracker state is intentionally not changed by a bad
-    // timestamp, but the returned update must not claim an active lock.
-    result.primary_track.reset();
-    for (const auto & track : result.tracks) {
-      if (!result.primary_track.has_value() ||
-        better_primary_track(track, *result.primary_track))
-      {
-        result.primary_track = track;
-      }
-    }
-    result.state = result.primary_track.has_value() ?
-      result.primary_track->state : TrackingState::Lost;
-    return result;
+    return rejected_timestamp_update("timestamp is not strictly increasing");
   }
 
   last_update_timestamp_ns_ = timestamp_ns;
@@ -311,241 +550,351 @@ TrackerUpdate OfflineTracker::update(
   std::vector<std::size_t> valid_indices;
   valid_indices.reserve(observations.size());
   std::size_t rejected_count = 0;
+  std::size_t accepted_count = 0;
+  std::size_t matched_count = 0;
+  std::size_t new_count = 0;
+  std::size_t reacquired_count = 0;
+  std::size_t missed_count = 0;
+  std::size_t expired_count = 0;
+  AssociationResult first_rejection = AssociationResult::None;
   std::string first_rejection_reason;
+  const auto note_rejection = [&](AssociationResult result, const std::string & reason,
+      bool invalid_evidence = false) {
+      ++rejected_count;
+      ++statistics_.rejected_count;
+      switch (result) {
+        case AssociationResult::RejectedInvalid:
+          if (invalid_evidence) {
+            ++statistics_.invalid_count;
+          }
+          break;
+        case AssociationResult::RejectedTimestamp:
+          ++statistics_.rejected_timestamp_count;
+          break;
+        case AssociationResult::RejectedPositionJump:
+          ++statistics_.position_jump_count;
+          break;
+        case AssociationResult::RejectedAngleJump:
+          ++statistics_.angle_jump_count;
+          break;
+        case AssociationResult::RejectedVelocity:
+          ++statistics_.velocity_count;
+          break;
+        default:
+          break;
+      }
+      if (first_rejection == AssociationResult::None) {
+        first_rejection = result;
+        first_rejection_reason = reason;
+      }
+    };
   for (std::size_t index = 0; index < observations.size(); ++index) {
     const auto & observation = observations[index];
     if (observation.stamp_ns != timestamp_ns) {
-      ++rejected_count;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "observation timestamp does not match frame timestamp";
-      }
-    } else if (!valid_observation(observation)) {
-      ++rejected_count;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "observation is invalid or incomplete";
-      }
+      note_rejection(AssociationResult::RejectedTimestamp,
+        "observation timestamp does not match frame timestamp");
+    } else if (const auto * error = target_observation_validation_reason(observation); error != nullptr) {
+      note_rejection(AssociationResult::RejectedInvalid, error, true);
     } else {
       valid_indices.push_back(index);
+      ++statistics_.valid_count;
     }
   }
 
-  // Sort by physical evidence, not input order. This makes creation and
-  // association deterministic when detector output order changes.
+  // Sort by physical evidence, never by vector order. New IDs and all-edge
+  // matching therefore stay stable when detector output order changes.
   std::sort(valid_indices.begin(), valid_indices.end(), [&observations](std::size_t first, std::size_t second) {
-    const auto & lhs = observations[first];
-    const auto & rhs = observations[second];
-    if (lhs.class_id != rhs.class_id) {
-      return lhs.class_id < rhs.class_id;
-    }
-    if (lhs.armor_size != rhs.armor_size) {
-      return static_cast<int>(lhs.armor_size) < static_cast<int>(rhs.armor_size);
-    }
-    const auto & lp = *lhs.camera_xyz_m;
-    const auto & rp = *rhs.camera_xyz_m;
-    if (lp[0] != rp[0]) {
-      return lp[0] < rp[0];
-    }
-    if (lp[1] != rp[1]) {
-      return lp[1] < rp[1];
-    }
-    if (lp[2] != rp[2]) {
-      return lp[2] < rp[2];
-    }
-    if (lhs.confidence != rhs.confidence) {
-      return lhs.confidence > rhs.confidence;
-    }
-    return lhs.detection_index < rhs.detection_index;
+    return observation_physical_less(observations[first], observations[second]);
   });
 
-  std::vector<bool> track_matched(tracks_.size(), false);
-  std::vector<bool> observation_consumed(observations.size(), false);
-  std::size_t accepted_count = 0;
+  const auto timeout_ns = static_cast<std::int64_t>(config_.max_temp_lost_ms) *
+    kNanosecondsPerMillisecond;
+  const std::size_t existing_track_count = tracks_.size();
+  std::vector<bool> preexpired(existing_track_count, false);
+  std::vector<bool> track_updated(existing_track_count, false);
+  std::vector<AssociationResult> track_failure(existing_track_count, AssociationResult::None);
+  std::vector<std::string> track_failure_reason(existing_track_count);
 
+  // Expire before building edges. A detection at the timeout boundary is a
+  // new capture, never a stale-ID revival.
+  for (std::size_t index = 0; index < existing_track_count; ++index) {
+    auto & track = tracks_[index];
+    track.updated_this_frame = false;
+    if (track.state == TrackingState::Lost) {
+      continue;
+    }
+    track.association_result = AssociationResult::None;
+    track.association_reason.clear();
+    if (track.last_valid_timestamp_ns < 0) {
+      continue;
+    }
+    const auto elapsed_ns = timestamp_ns - track.last_valid_timestamp_ns;
+    if (elapsed_ns >= timeout_ns) {
+      preexpired[index] = true;
+      track.state = TrackingState::Lost;
+      track.consecutive_valid = 0;
+      ++track.consecutive_missed;
+      ++track.missed_count;
+      ++track.expired_count;
+      track.yaw_vel_rad_s = 0.0;
+      track.pitch_vel_rad_s = 0.0;
+      track.association_result = AssociationResult::Expired;
+      track.association_reason = "temporary-loss timeout expired before association";
+      ++missed_count;
+      ++expired_count;
+      ++statistics_.missed_count;
+      ++statistics_.expired_count;
+    }
+  }
+
+  std::vector<AssociationGateStatus> observation_status(observations.size());
+  std::vector<AssociationEdge> edges;
   for (const auto observation_index : valid_indices) {
     const auto & observation = observations[observation_index];
-    std::optional<std::size_t> best_track_index;
-    double best_distance = std::numeric_limits<double>::infinity();
-    for (std::size_t track_index = 0; track_index < tracks_.size(); ++track_index) {
+    auto & status = observation_status[observation_index];
+    for (std::size_t track_index = 0; track_index < existing_track_count; ++track_index) {
       const auto & track = tracks_[track_index];
-      if (track_matched[track_index] || track.state == TrackingState::Lost ||
-        track.last_valid_timestamp_ns == timestamp_ns || !track.valid() ||
+      if (preexpired[track_index] || track.state == TrackingState::Lost ||
+        track.last_valid_timestamp_ns < 0 || !is_valid_target_observation(track.observation) ||
         !same_target_identity(track.observation, observation))
       {
         continue;
       }
-      const auto * previous_position = camera_position_for(track.observation);
-      const auto * current_position = camera_position_for(observation);
-      if (previous_position == nullptr || current_position == nullptr) {
+      status.same_identity_active = true;
+      const auto gate = evaluate_gate(track, observation, timestamp_ns, config_);
+      if (gate.accepted()) {
+        status.has_valid_edge = true;
+        edges.push_back(AssociationEdge{track_index, observation_index, gate.distance_m,
+          gate.yaw_velocity_rad_s, gate.pitch_velocity_rad_s});
         continue;
       }
-      const double distance = point_distance(*previous_position, *current_position);
-      if (distance > config_.max_position_jump_m) {
-        continue;
-      }
-      if (!best_track_index.has_value() || distance < best_distance - kFiniteEpsilon ||
-        (std::abs(distance - best_distance) <= kFiniteEpsilon &&
-        track.track_id < tracks_[*best_track_index].track_id))
+      if (status.rejection == AssociationResult::None ||
+        rejection_priority(gate.result) < rejection_priority(status.rejection))
       {
-        best_track_index = track_index;
-        best_distance = distance;
+        status.rejection = gate.result;
+        status.reason = gate.reason;
+      }
+      if (track_failure[track_index] == AssociationResult::None ||
+        rejection_priority(gate.result) < rejection_priority(track_failure[track_index]))
+      {
+        track_failure[track_index] = gate.result;
+        track_failure_reason[track_index] = gate.reason;
       }
     }
-
-    if (!best_track_index.has_value()) {
-      // If an active track of the same identity exists but is outside the
-      // position gate, this is a jump rejection, not a new target. This
-      // prevents a single outlier from creating a second lockable track.
-      bool same_identity_active = false;
-      for (const auto & track : tracks_) {
-        if (track.last_valid_timestamp_ns < timestamp_ns &&
-          track.state != TrackingState::Lost && track.valid() &&
-          same_target_identity(track.observation, observation))
-        {
-          same_identity_active = true;
-          break;
-        }
-      }
-      if (same_identity_active) {
-        ++rejected_count;
-        if (first_rejection_reason.empty()) {
-          first_rejection_reason = "position jump exceeds tracker limit";
-        }
-        observation_consumed[observation_index] = true;
-        continue;
-      }
-      TrackedTarget track{};
-      track.track_id = next_track_id_++;
-      track.state = config_.min_detect_count <= 1 ? TrackingState::Tracking :
-        TrackingState::Detecting;
-      track.observation = observation;
-      track.consecutive_valid = 1;
-      track.first_valid_timestamp_ns = timestamp_ns;
-      track.last_valid_timestamp_ns = timestamp_ns;
-      tracks_.push_back(track);
-      track_matched.push_back(true);
-      observation_consumed[observation_index] = true;
-      ++accepted_count;
-      continue;
-    }
-
-    const auto track_index = *best_track_index;
-    auto & track = tracks_[track_index];
-    const auto elapsed_ns = timestamp_ns - track.last_valid_timestamp_ns;
-    if (elapsed_ns <= 0) {
-      ++rejected_count;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "track timestamp is not increasing";
-      }
-      track_matched[track_index] = true;
-      observation_consumed[observation_index] = true;
-      continue;
-    }
-
-    bool angle_jump = false;
-    if (track.observation.relative_yaw_rad.has_value() && observation.relative_yaw_rad.has_value() &&
-      std::abs(*observation.relative_yaw_rad - *track.observation.relative_yaw_rad) >
-      config_.max_angle_jump_rad)
-    {
-      angle_jump = true;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "yaw jump exceeds tracker limit";
-      }
-    }
-    if (track.observation.relative_pitch_rad.has_value() && observation.relative_pitch_rad.has_value() &&
-      std::abs(*observation.relative_pitch_rad - *track.observation.relative_pitch_rad) >
-      config_.max_angle_jump_rad)
-    {
-      angle_jump = true;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "pitch jump exceeds tracker limit";
-      }
-    }
-    const double dt_s = static_cast<double>(elapsed_ns) / 1'000'000'000.0;
-    double yaw_velocity = 0.0;
-    double pitch_velocity = 0.0;
-    if (track.observation.relative_yaw_rad.has_value() && observation.relative_yaw_rad.has_value()) {
-      yaw_velocity = (*observation.relative_yaw_rad - *track.observation.relative_yaw_rad) / dt_s;
-    }
-    if (track.observation.relative_pitch_rad.has_value() && observation.relative_pitch_rad.has_value()) {
-      pitch_velocity = (*observation.relative_pitch_rad - *track.observation.relative_pitch_rad) / dt_s;
-    }
-    if (!finite(yaw_velocity) || !finite(pitch_velocity)) {
-      angle_jump = true;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "computed motion is not finite";
-      }
-    }
-    if (config_.max_velocity_rad_s > 0.0 &&
-      (std::abs(yaw_velocity) > config_.max_velocity_rad_s ||
-      std::abs(pitch_velocity) > config_.max_velocity_rad_s))
-    {
-      angle_jump = true;
-      if (first_rejection_reason.empty()) {
-        first_rejection_reason = "computed motion exceeds tracker limit";
-      }
-    }
-
-    track_matched[track_index] = true;
-    observation_consumed[observation_index] = true;
-    if (angle_jump) {
-      ++rejected_count;
-      continue;
-    }
-
-    const bool recovering = track.state == TrackingState::TempLost;
-    track.observation = observation;
-    track.consecutive_missed = 0;
-    track.consecutive_valid = recovering ? 1 : track.consecutive_valid + 1;
-    track.state = track.consecutive_valid >= config_.min_detect_count ?
-      TrackingState::Tracking : TrackingState::Detecting;
-    track.last_valid_timestamp_ns = timestamp_ns;
-    track.yaw_vel_rad_s = yaw_velocity;
-    track.pitch_vel_rad_s = pitch_velocity;
-    ++accepted_count;
   }
 
-  // A matched flag only means an observation was considered for that track;
-  // angle-jump rejection must still count as a miss for state transitions.
-  for (std::size_t track_index = 0; track_index < tracks_.size(); ++track_index) {
-    auto & track = tracks_[track_index];
-    const bool actually_updated = std::any_of(
-      valid_indices.begin(), valid_indices.end(), [&](std::size_t observation_index) {
-        return observation_consumed[observation_index] &&
-          same_target_identity(track.observation, observations[observation_index]) &&
-          track.last_valid_timestamp_ns == timestamp_ns &&
-          track.observation.detection_index == observations[observation_index].detection_index;
-      });
-    if (actually_updated) {
+  std::sort(edges.begin(), edges.end(), [&](const AssociationEdge & lhs, const AssociationEdge & rhs) {
+    if (lhs.distance_m != rhs.distance_m) return lhs.distance_m < rhs.distance_m;
+    const auto lhs_id = tracks_[lhs.track_index].track_id;
+    const auto rhs_id = tracks_[rhs.track_index].track_id;
+    if (lhs_id != rhs_id) return lhs_id < rhs_id;
+    const auto & lhs_observation = observations[lhs.observation_index];
+    const auto & rhs_observation = observations[rhs.observation_index];
+    if (observation_physical_less(lhs_observation, rhs_observation)) return true;
+    if (observation_physical_less(rhs_observation, lhs_observation)) return false;
+    return lhs.observation_index < rhs.observation_index;
+  });
+
+  // Find a maximum-cardinality matching instead of consuming edges greedily.
+  // A globally shortest edge can otherwise strand a track that only has that
+  // observation, even though the other track has a feasible alternative.  The
+  // edge list is already sorted by distance, track ID, and stable observation
+  // evidence above; preserving that order in each adjacency list makes the
+  // augmenting-path result deterministic while still maximizing matches.
+  std::vector<std::vector<std::size_t>> adjacency(existing_track_count);
+  for (std::size_t edge_index = 0; edge_index < edges.size(); ++edge_index) {
+    adjacency[edges[edge_index].track_index].push_back(edge_index);
+  }
+  std::vector<std::size_t> track_order(existing_track_count);
+  for (std::size_t track_index = 0; track_index < existing_track_count; ++track_index) {
+    track_order[track_index] = track_index;
+  }
+  std::sort(track_order.begin(), track_order.end(), [&](std::size_t lhs, std::size_t rhs) {
+    const auto lhs_id = tracks_[lhs].track_id;
+    const auto rhs_id = tracks_[rhs].track_id;
+    return lhs_id == rhs_id ? lhs < rhs : lhs_id < rhs_id;
+  });
+
+  std::vector<std::optional<std::size_t>> matched_track_for_observation(observations.size());
+  std::vector<std::optional<std::size_t>> matched_edge_for_track(existing_track_count);
+  std::function<bool(std::size_t, std::vector<bool> &)> augment =
+    [&](std::size_t track_index, std::vector<bool> & seen_observations) {
+      for (const auto edge_index : adjacency[track_index]) {
+        const auto observation_index = edges[edge_index].observation_index;
+        if (seen_observations[observation_index]) {
+          continue;
+        }
+        seen_observations[observation_index] = true;
+        const auto incumbent = matched_track_for_observation[observation_index];
+        if (!incumbent.has_value() || augment(*incumbent, seen_observations)) {
+          matched_track_for_observation[observation_index] = track_index;
+          matched_edge_for_track[track_index] = edge_index;
+          return true;
+        }
+      }
+      return false;
+    };
+
+  for (const auto track_index : track_order) {
+    std::vector<bool> seen_observations(observations.size(), false);
+    (void)augment(track_index, seen_observations);
+  }
+
+  std::vector<bool> observation_assigned(observations.size(), false);
+  std::vector<AssociationEdge> assignments;
+  assignments.reserve(edges.size());
+  for (const auto track_index : track_order) {
+    if (!matched_edge_for_track[track_index].has_value()) {
       continue;
     }
-    if (track.last_valid_timestamp_ns < 0) {
+    const auto & edge = edges[*matched_edge_for_track[track_index]];
+    track_updated[track_index] = true;
+    observation_assigned[edge.observation_index] = true;
+    assignments.push_back(edge);
+  }
+
+  for (const auto & edge : assignments) {
+    auto & track = tracks_[edge.track_index];
+    const bool recovering = track.state == TrackingState::TempLost;
+    track.observation = observations[edge.observation_index];
+    track.updated_this_frame = true;
+    track.consecutive_missed = 0;
+    track.consecutive_valid = recovering ? 1 : track.consecutive_valid + 1;
+    if (recovering) {
+      track.first_valid_timestamp_ns = timestamp_ns;
+    }
+    track.last_valid_timestamp_ns = timestamp_ns;
+    track.yaw_vel_rad_s = edge.yaw_velocity_rad_s;
+    track.pitch_vel_rad_s = edge.pitch_velocity_rad_s;
+    track.state = track.consecutive_valid >= config_.min_detect_count ?
+      TrackingState::Tracking : TrackingState::Detecting;
+    track.association_result = recovering ? AssociationResult::Reacquired : AssociationResult::Matched;
+    track.association_reason = recovering ?
+      "temporary-loss track reacquired; confirmation sequence restarted" :
+      "camera identity and motion gates matched";
+    ++track.accepted_count;
+    ++track.matched_count;
+    ++accepted_count;
+    ++matched_count;
+    ++statistics_.accepted_count;
+    ++statistics_.matched_count;
+    if (recovering) {
+      ++track.reacquisition_count;
+      ++reacquired_count;
+      ++statistics_.reacquisition_count;
+    }
+  }
+
+  for (const auto observation_index : valid_indices) {
+    if (observation_assigned[observation_index]) {
+      continue;
+    }
+    const auto & observation = observations[observation_index];
+    const auto & status = observation_status[observation_index];
+    if (status.same_identity_active) {
+      const AssociationResult result = status.has_valid_edge ?
+        AssociationResult::RejectedAssociationConflict :
+        (status.rejection == AssociationResult::None ? AssociationResult::RejectedInvalid : status.rejection);
+      const std::string reason = status.has_valid_edge ?
+        "all valid association edges were consumed by deterministic matching" :
+        (status.reason.empty() ? "association has no valid edge" : status.reason);
+      note_rejection(result, reason);
+      for (std::size_t track_index = 0; track_index < existing_track_count; ++track_index) {
+        auto & track = tracks_[track_index];
+        if (!track_updated[track_index] && !preexpired[track_index] &&
+          track.state != TrackingState::Lost && same_target_identity(track.observation, observation) &&
+          track_failure[track_index] == AssociationResult::None)
+        {
+          track_failure[track_index] = result;
+          track_failure_reason[track_index] = reason;
+        }
+      }
+      continue;
+    }
+
+    TrackedTarget track{};
+    track.track_id = next_track_id_++;
+    track.state = config_.min_detect_count <= 1 ? TrackingState::Tracking : TrackingState::Detecting;
+    track.observation = observation;
+    track.consecutive_valid = 1;
+    track.first_valid_timestamp_ns = timestamp_ns;
+    track.last_valid_timestamp_ns = timestamp_ns;
+    track.updated_this_frame = true;
+    track.association_result = AssociationResult::NewTrack;
+    track.association_reason = "new camera-frame identity track created";
+    track.accepted_count = 1;
+    tracks_.push_back(std::move(track));
+    ++accepted_count;
+    ++new_count;
+    ++statistics_.accepted_count;
+    ++statistics_.new_count;
+  }
+
+  for (std::size_t track_index = 0; track_index < existing_track_count; ++track_index) {
+    auto & track = tracks_[track_index];
+    if (track_updated[track_index] || preexpired[track_index] || track.state == TrackingState::Lost ||
+      track.last_valid_timestamp_ns < 0)
+    {
       continue;
     }
     ++track.consecutive_missed;
-    const auto elapsed_ns = timestamp_ns - track.last_valid_timestamp_ns;
-    if (elapsed_ns < static_cast<std::int64_t>(config_.max_temp_lost_ms) *
-      kNanosecondsPerMillisecond)
-    {
-      track.state = TrackingState::TempLost;
-    } else {
-      track.state = TrackingState::Lost;
-      track.consecutive_valid = 0;
-    }
+    ++track.missed_count;
+    ++missed_count;
+    ++statistics_.missed_count;
     track.yaw_vel_rad_s = 0.0;
     track.pitch_vel_rad_s = 0.0;
+    const auto elapsed_ns = timestamp_ns - track.last_valid_timestamp_ns;
+    if (elapsed_ns >= timeout_ns) {
+      track.state = TrackingState::Lost;
+      track.consecutive_valid = 0;
+      ++track.expired_count;
+      ++expired_count;
+      ++statistics_.expired_count;
+      track.association_result = AssociationResult::Expired;
+      track.association_reason = "temporary-loss timeout expired";
+      continue;
+    }
+    track.state = TrackingState::TempLost;
+    if (track_failure[track_index] != AssociationResult::None) {
+      track.association_result = track_failure[track_index];
+      track.association_reason = track_failure_reason[track_index];
+      ++track.rejected_count;
+    } else {
+      track.association_result = AssociationResult::Missed;
+      track.association_reason = "no accepted observation for active track";
+    }
   }
 
-  const bool had_observation = !observations.empty();
-  const bool rejected = rejected_count > 0;
-  const bool accepted = accepted_count > 0;
-  return make_update(
-    timestamp_ns, accepted, rejected, had_observation,
-    first_rejection_reason, accepted_count, rejected_count);
+  AssociationResult association_result = AssociationResult::None;
+  std::string association_reason;
+  if (first_rejection != AssociationResult::None) {
+    association_result = first_rejection;
+    association_reason = first_rejection_reason;
+  } else if (reacquired_count > 0) {
+    association_result = AssociationResult::Reacquired;
+    association_reason = "temporary-loss track reacquired";
+  } else if (matched_count > 0) {
+    association_result = AssociationResult::Matched;
+    association_reason = "one or more camera-frame tracks matched";
+  } else if (new_count > 0) {
+    association_result = AssociationResult::NewTrack;
+    association_reason = "one or more new camera-frame tracks created";
+  } else if (expired_count > 0) {
+    association_result = AssociationResult::Expired;
+    association_reason = "one or more tracks expired";
+  } else if (missed_count > 0) {
+    association_result = AssociationResult::Missed;
+    association_reason = "one or more active tracks were missed";
+  }
+  return make_update(timestamp_ns, accepted_count > 0, rejected_count > 0, !observations.empty(),
+    association_reason, valid_indices.size(), accepted_count, rejected_count, matched_count, new_count,
+    reacquired_count, missed_count, expired_count, association_result);
 }
 
 void OfflineTracker::reset() noexcept
 {
   tracks_.clear();
+  statistics_ = {};
   next_track_id_ = 1;
   last_update_timestamp_ns_ = -1;
 }
@@ -557,8 +906,13 @@ const TrackerConfig & OfflineTracker::config() const noexcept
 
 TrackingState OfflineTracker::state() const noexcept
 {
-  const auto update = make_update(0, false, false, false, {}, 0, 0);
-  return update.state;
+  const TrackedTarget * primary = nullptr;
+  for (const auto & track : tracks_) {
+    if (primary == nullptr || better_primary_track(track, *primary)) {
+      primary = &track;
+    }
+  }
+  return primary == nullptr ? TrackingState::Lost : primary->state;
 }
 
 const std::vector<TrackedTarget> & OfflineTracker::tracks() const noexcept
@@ -566,10 +920,18 @@ const std::vector<TrackedTarget> & OfflineTracker::tracks() const noexcept
   return tracks_;
 }
 
+const TrackerStatistics & OfflineTracker::statistics() const noexcept
+{
+  return statistics_;
+}
+
 std::optional<std::string> TargetSelectorConfig::validate() const
 {
   if (!finite(confidence_tie_epsilon) || confidence_tie_epsilon < 0.0F) {
     return "confidence_tie_epsilon must be finite and non-negative";
+  }
+  if (switch_debounce_frames <= 0) {
+    return "switch_debounce_frames must be positive";
   }
   return std::nullopt;
 }
@@ -586,15 +948,33 @@ std::optional<TrackedTarget> TargetSelector::select(
   int image_width,
   int image_height)
 {
+  // Count selector invocations, including safe no-candidate returns.  The
+  // API has no frame token, so debounce is intentionally defined over
+  // consecutive select calls supplied by the offline caller.
+  ++diagnostics_.selection_count;
+  diagnostics_.candidate_count = 0;
+  diagnostics_.switched = false;
+  diagnostics_.candidate_track_id.reset();
+  diagnostics_.selected_track_id.reset();
+  diagnostics_.switch_reason = "none";
   if (image_width <= 0 || image_height <= 0) {
     previous_track_id_.reset();
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+    ++diagnostics_.no_candidate_count;
+    diagnostics_.switch_reason = "invalid_image_dimensions";
     return std::nullopt;
   }
 
-  const TrackedTarget * best = nullptr;
-  std::optional<double> best_center_distance;
+  struct Candidate
+  {
+    const TrackedTarget * track{nullptr};
+    double center_distance_px{0.0};
+  };
+  std::vector<Candidate> candidates;
+  candidates.reserve(tracks.size());
   for (const auto & candidate : tracks) {
-    if (!candidate.target_lock() || !valid_observation(candidate.observation)) {
+    if (!candidate.target_lock() || !is_valid_target_observation(candidate.observation)) {
       continue;
     }
     const auto candidate_center_distance = center_distance(
@@ -602,57 +982,117 @@ std::optional<TrackedTarget> TargetSelector::select(
     if (!candidate_center_distance.has_value()) {
       continue;
     }
-    if (best == nullptr) {
-      best = &candidate;
-      best_center_distance = candidate_center_distance;
-      continue;
-    }
-
-    const bool higher_confidence = candidate.observation.confidence >
-      best->observation.confidence + config_.confidence_tie_epsilon;
-    const bool tied_confidence = std::abs(
-      candidate.observation.confidence - best->observation.confidence) <=
-      config_.confidence_tie_epsilon;
-    if (higher_confidence) {
-      best = &candidate;
-      best_center_distance = candidate_center_distance;
-      continue;
-    }
-    if (!tied_confidence) {
-      continue;
-    }
-
-    const bool candidate_is_previous = previous_track_id_.has_value() &&
-      candidate.track_id == *previous_track_id_;
-    const bool best_is_previous = previous_track_id_.has_value() &&
-      best->track_id == *previous_track_id_;
-    if (candidate_is_previous != best_is_previous) {
-      if (candidate_is_previous) {
-        best = &candidate;
-        best_center_distance = candidate_center_distance;
-      }
-      continue;
-    }
-    if (*candidate_center_distance < *best_center_distance - kFiniteEpsilon ||
-      (std::abs(*candidate_center_distance - *best_center_distance) <= kFiniteEpsilon &&
-      candidate.track_id < best->track_id))
-    {
-      best = &candidate;
-      best_center_distance = candidate_center_distance;
-    }
+    candidates.push_back(Candidate{&candidate, *candidate_center_distance});
   }
 
-  if (best == nullptr) {
+  diagnostics_.candidate_count = candidates.size();
+  if (candidates.empty()) {
     previous_track_id_.reset();
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+    ++diagnostics_.no_candidate_count;
+    diagnostics_.switch_reason = "no_valid_tracking_candidates";
     return std::nullopt;
   }
-  previous_track_id_ = best->track_id;
-  return *best;
+
+  const auto better_candidate = [&](const Candidate & candidate, const Candidate & current) {
+      const float candidate_confidence = candidate.track->observation.confidence;
+      const float current_confidence = current.track->observation.confidence;
+      if (candidate_confidence > current_confidence + config_.confidence_tie_epsilon) {
+        return true;
+      }
+      if (current_confidence > candidate_confidence + config_.confidence_tie_epsilon) {
+        return false;
+      }
+      const bool candidate_is_previous = previous_track_id_.has_value() &&
+        candidate.track->track_id == *previous_track_id_;
+      const bool current_is_previous = previous_track_id_.has_value() &&
+        current.track->track_id == *previous_track_id_;
+      if (candidate_is_previous != current_is_previous) {
+        return candidate_is_previous;
+      }
+      if (candidate.center_distance_px < current.center_distance_px - kFiniteEpsilon) {
+        return true;
+      }
+      if (current.center_distance_px < candidate.center_distance_px - kFiniteEpsilon) {
+        return false;
+      }
+      return candidate.track->track_id < current.track->track_id;
+    };
+  const Candidate * ranked = &candidates.front();
+  const Candidate * previous = nullptr;
+  for (const auto & candidate : candidates) {
+    if (better_candidate(candidate, *ranked)) {
+      ranked = &candidate;
+    }
+    if (previous_track_id_.has_value() && candidate.track->track_id == *previous_track_id_) {
+      previous = &candidate;
+    }
+  }
+  diagnostics_.candidate_track_id = ranked->track->track_id;
+
+  const Candidate * selected = nullptr;
+  if (!previous_track_id_.has_value()) {
+    selected = ranked;
+    diagnostics_.switch_reason = "initial_selection";
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+  } else if (previous == nullptr) {
+    selected = ranked;
+    diagnostics_.switch_reason = "previous_target_unavailable";
+    diagnostics_.switched = selected->track->track_id != *previous_track_id_;
+    if (diagnostics_.switched) {
+      ++diagnostics_.switch_count;
+    }
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+  } else if (ranked->track->track_id == previous->track->track_id) {
+    selected = previous;
+    diagnostics_.switch_reason = "kept_previous";
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+  } else if (config_.switch_debounce_frames == 1) {
+    selected = ranked;
+    diagnostics_.switched = true;
+    ++diagnostics_.switch_count;
+    diagnostics_.switch_reason = "ranked_replacement";
+    pending_track_id_.reset();
+    pending_switch_frames_ = 0;
+  } else {
+    if (pending_track_id_.has_value() && *pending_track_id_ == ranked->track->track_id) {
+      ++pending_switch_frames_;
+    } else {
+      pending_track_id_ = ranked->track->track_id;
+      pending_switch_frames_ = 1;
+    }
+    if (pending_switch_frames_ >= config_.switch_debounce_frames) {
+      selected = ranked;
+      diagnostics_.switched = true;
+      ++diagnostics_.switch_count;
+      diagnostics_.switch_reason = "debounce_confirmed_replacement";
+      pending_track_id_.reset();
+      pending_switch_frames_ = 0;
+    } else {
+      // Holding is safe only because previous was found in this frame's valid
+      // Tracking candidates; a stale or TempLost target is never returned.
+      selected = previous;
+      ++diagnostics_.debounce_hold_count;
+      diagnostics_.switch_reason = "debounce_hold";
+    }
+  }
+
+  previous_track_id_ = selected->track->track_id;
+  diagnostics_.selected_track_id = selected->track->track_id;
+  return *selected->track;
 }
 
-void TargetSelector::reset() noexcept
+void TargetSelector::reset()
 {
   previous_track_id_.reset();
+  pending_track_id_.reset();
+  pending_switch_frames_ = 0;
+  diagnostics_ = {};
+  diagnostics_.switch_reason = "reset";
 }
 
 std::optional<std::uint64_t> TargetSelector::previous_track_id() const noexcept
@@ -663,6 +1103,11 @@ std::optional<std::uint64_t> TargetSelector::previous_track_id() const noexcept
 const TargetSelectorConfig & TargetSelector::config() const noexcept
 {
   return config_;
+}
+
+const TargetSelectorDiagnostics & TargetSelector::diagnostics() const noexcept
+{
+  return diagnostics_;
 }
 
 const char * aimer_mode_name(AimerMode mode) noexcept

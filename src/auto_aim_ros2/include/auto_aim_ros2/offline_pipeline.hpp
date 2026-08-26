@@ -25,6 +25,26 @@ enum class TrackingState : std::uint8_t
 
 const char * tracking_state_name(TrackingState state) noexcept;
 
+// The outcome of one frame's association work.  These values are diagnostic
+// only; they never imply a control or fire decision.
+enum class AssociationResult : std::uint8_t
+{
+  None = 0,
+  NewTrack,
+  Matched,
+  Reacquired,
+  RejectedInvalid,
+  RejectedAssociationConflict,
+  RejectedTimestamp,
+  RejectedPositionJump,
+  RejectedAngleJump,
+  RejectedVelocity,
+  Missed,
+  Expired,
+};
+
+const char * association_result_name(AssociationResult result) noexcept;
+
 // A target observation is measured evidence after PnP. It deliberately keeps
 // camera-frame position as the association coordinate. A gimbal pose is
 // optional and is never substituted for camera pose when comparing samples.
@@ -50,6 +70,11 @@ TargetObservation make_target_observation(
   std::int64_t stamp_ns,
   std::size_t detection_index = 0) noexcept;
 
+// Full offline-boundary validation shared by Tracker and TargetSelector.
+// Unknown armor hints remain valid when PnP supplied the explicit armor_size;
+// unsupported enum values and conflicting known hints fail closed.
+bool is_valid_target_observation(const TargetObservation & observation) noexcept;
+
 // Explainable association only: no EKF, ballistic prediction, yaw wrapping,
 // or world-coordinate transform is performed here.
 struct TrackerConfig
@@ -64,6 +89,28 @@ struct TrackerConfig
   std::optional<std::string> validate() const;
 };
 
+// Cumulative, reproducible tracker evidence.  Counts are deliberately kept
+// separate: a structurally valid observation is not necessarily accepted by
+// the association gates.
+struct TrackerStatistics
+{
+  std::uint64_t frame_count{0};
+  std::uint64_t observation_count{0};
+  std::uint64_t valid_count{0};
+  std::uint64_t accepted_count{0};
+  std::uint64_t matched_count{0};
+  std::uint64_t new_count{0};
+  std::uint64_t reacquisition_count{0};
+  std::uint64_t rejected_count{0};
+  std::uint64_t invalid_count{0};
+  std::uint64_t position_jump_count{0};
+  std::uint64_t angle_jump_count{0};
+  std::uint64_t velocity_count{0};
+  std::uint64_t missed_count{0};
+  std::uint64_t expired_count{0};
+  std::uint64_t rejected_timestamp_count{0};
+};
+
 struct TrackedTarget
 {
   std::uint64_t track_id{0};
@@ -75,10 +122,22 @@ struct TrackedTarget
   std::int64_t last_valid_timestamp_ns{-1};
   double yaw_vel_rad_s{0.0};
   double pitch_vel_rad_s{0.0};
+  bool updated_this_frame{false};
+  AssociationResult association_result{AssociationResult::None};
+  std::string association_reason;
+  std::uint64_t accepted_count{0};
+  std::uint64_t matched_count{0};
+  std::uint64_t reacquisition_count{0};
+  std::uint64_t rejected_count{0};
+  std::uint64_t missed_count{0};
+  std::uint64_t expired_count{0};
 
   bool valid() const noexcept
   {
-    return observation.valid && observation.geometry_known;
+    // Keep direct/synthetic TrackedTarget callers on the same fail-closed
+    // boundary as OfflineTracker and TargetSelector.  A state value alone
+    // must not turn malformed observation evidence into a lock.
+    return is_valid_target_observation(observation);
   }
 
   bool target_lock() const noexcept
@@ -98,7 +157,17 @@ struct TrackerUpdate
   // to valid Tracking targets, so TempLost/Lost can never lock.
   std::vector<TrackedTarget> tracks;
   std::size_t valid_observation_count{0};
+  std::size_t accepted_count{0};
+  std::size_t accepted_observation_count{0};
   std::size_t rejected_observation_count{0};
+  std::size_t matched_count{0};
+  std::size_t new_count{0};
+  std::size_t reacquired_count{0};
+  std::size_t missed_count{0};
+  std::size_t expired_count{0};
+  AssociationResult association_result{AssociationResult::None};
+  std::string association_reason;
+  TrackerStatistics statistics{};
   std::int64_t timestamp_ns{0};
   bool lock_allowed{true};
   std::optional<TrackedTarget> primary_track;
@@ -127,10 +196,12 @@ public:
   const TrackerConfig & config() const noexcept;
   TrackingState state() const noexcept;
   const std::vector<TrackedTarget> & tracks() const noexcept;
+  const TrackerStatistics & statistics() const noexcept;
 
 private:
   TrackerConfig config_;
   std::vector<TrackedTarget> tracks_;
+  TrackerStatistics statistics_{};
   std::uint64_t next_track_id_{1};
   std::int64_t last_update_timestamp_ns_{-1};
 
@@ -141,14 +212,38 @@ private:
     bool had_observation,
     std::string reason,
     std::size_t valid_count,
-    std::size_t rejected_count) const;
+    std::size_t accepted_count,
+    std::size_t rejected_count,
+    std::size_t matched_count,
+    std::size_t new_count,
+    std::size_t reacquired_count,
+    std::size_t missed_count,
+    std::size_t expired_count,
+    AssociationResult association_result) const;
 };
 
 struct TargetSelectorConfig
 {
   float confidence_tie_epsilon{1e-6F};
+  // One means switch immediately. Larger values require the same replacement
+  // candidate to win this many consecutive selections while the old target
+  // remains a current valid Tracking candidate.
+  int switch_debounce_frames{1};
 
   std::optional<std::string> validate() const;
+};
+
+struct TargetSelectorDiagnostics
+{
+  std::uint64_t selection_count{0};
+  std::uint64_t switch_count{0};
+  std::uint64_t no_candidate_count{0};
+  std::uint64_t debounce_hold_count{0};
+  std::size_t candidate_count{0};
+  bool switched{false};
+  std::optional<std::uint64_t> candidate_track_id;
+  std::optional<std::uint64_t> selected_track_id;
+  std::string switch_reason{"none"};
 };
 
 // Stateful deterministic selector. Confidence is primary; previous track ID,
@@ -163,13 +258,17 @@ public:
     int image_width,
     int image_height);
 
-  void reset() noexcept;
+  void reset();
   std::optional<std::uint64_t> previous_track_id() const noexcept;
   const TargetSelectorConfig & config() const noexcept;
+  const TargetSelectorDiagnostics & diagnostics() const noexcept;
 
 private:
   TargetSelectorConfig config_;
   std::optional<std::uint64_t> previous_track_id_;
+  std::optional<std::uint64_t> pending_track_id_;
+  int pending_switch_frames_{0};
+  TargetSelectorDiagnostics diagnostics_{};
 };
 
 enum class AimerMode : std::uint8_t

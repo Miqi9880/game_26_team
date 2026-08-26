@@ -5,6 +5,12 @@
 #include "crc.h"
 #include "protocol_new.hpp"
 
+namespace
+{
+constexpr std::size_t kFrameCrcOverhead =
+  SerialFrameParser::kFrameOverhead - sizeof(io::MsgEndInfo);
+}
+
 bool SerialFrameParser::IsKnownPayloadLength(
   std::uint16_t command, std::uint16_t payload_length)
 {
@@ -16,6 +22,13 @@ bool SerialFrameParser::IsKnownPayloadLength(
     default:
       return false;
   }
+}
+
+bool SerialFrameParser::HasFrameTail(std::uint16_t command) noexcept
+{
+  // Vision is the MCU -> vision receive packet and carries the confirmed
+  // 0D 0A terminator.  RobotCtrl is the host -> MCU packet and ends at CRC16.
+  return command == io::VISION_ID;
 }
 
 void SerialFrameParser::DiscardPrefix(std::size_t length) noexcept
@@ -64,7 +77,8 @@ std::size_t SerialFrameParser::Feed(
 
       io::FrameHeader header{};
       std::memcpy(&header, buffer_.data(), sizeof(header));
-      if (header.data_length > kMaxPayloadLength ||
+      if (header.data_length < sizeof(std::uint16_t) ||
+        header.data_length > kMaxPayloadLength ||
         !Verify_CRC8_Check_Sum(buffer_.data(), sizeof(io::FrameHeader)))
       {
         // Drop only this candidate SOF so a later valid SOF in the same chunk can recover.
@@ -72,21 +86,35 @@ std::size_t SerialFrameParser::Feed(
         continue;
       }
 
-      const std::size_t frame_length =
-        static_cast<std::size_t>(header.data_length) + kFrameOverhead;
+      // The command is part of every supported payload and is needed to
+      // distinguish the Vision tail-framed packet from the RobotCtrl packet
+      // that terminates immediately after CRC16.
+      constexpr std::size_t kCommandOffset = sizeof(io::FrameHeader);
+      constexpr std::size_t kCommandEnd = kCommandOffset + sizeof(std::uint16_t);
+      if (buffered_length_ < kCommandEnd) {
+        break;
+      }
+
+      std::uint16_t command = 0;
+      std::memcpy(&command, buffer_.data() + kCommandOffset, sizeof(command));
+      if (!IsKnownPayloadLength(command, header.data_length)) {
+        DiscardPrefix(1);
+        continue;
+      }
+
+      const std::size_t frame_length = static_cast<std::size_t>(header.data_length) +
+        kFrameCrcOverhead +
+        (HasFrameTail(command) ? sizeof(io::MsgEndInfo) : 0U);
       if (buffered_length_ < frame_length) {
         break;
       }
 
-      const std::size_t tail_offset = frame_length - sizeof(io::MsgEndInfo);
-      const bool tail_valid =
-        buffer_[tail_offset] == io::END1_SOF && buffer_[tail_offset + 1] == io::END2_SOF;
+      const bool tail_valid = !HasFrameTail(command) ||
+        (buffer_[frame_length - sizeof(io::MsgEndInfo)] == io::END1_SOF &&
+        buffer_[frame_length - sizeof(io::MsgEndInfo) + 1U] == io::END2_SOF);
       const bool crc16_valid = Verify_CRC16_Check_Sum(
-        buffer_.data(), static_cast<std::uint32_t>(header.data_length + 9));
-
-      std::uint16_t command = 0;
-      std::memcpy(&command, buffer_.data() + sizeof(io::FrameHeader), sizeof(command));
-      if (!tail_valid || !crc16_valid || !IsKnownPayloadLength(command, header.data_length)) {
+        buffer_.data(), static_cast<std::uint32_t>(header.data_length + kFrameCrcOverhead));
+      if (!tail_valid || !crc16_valid) {
         DiscardPrefix(1);
         continue;
       }

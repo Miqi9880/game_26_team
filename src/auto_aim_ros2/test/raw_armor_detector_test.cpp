@@ -1,10 +1,14 @@
 #include "auto_aim_ros2/raw_armor_detector.hpp"
 
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -21,6 +25,32 @@ using rm_auto_aim::detector::load_model_profile;
 using rm_auto_aim::detector::sigmoid_probability;
 using rm_auto_aim::detector::validate_input_shape;
 using rm_auto_aim::detector::validate_output_shape;
+
+class ScopedTemporaryPath
+{
+public:
+  explicit ScopedTemporaryPath(std::filesystem::path value) : path(std::move(value)) {}
+
+  ~ScopedTemporaryPath()
+  {
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
+
+  std::filesystem::path path;
+};
+
+void write_test_artifact(const std::filesystem::path & path, const std::string & contents)
+{
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    throw std::runtime_error("cannot create temporary test artifact: " + path.string());
+  }
+  stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  if (!stream) {
+    throw std::runtime_error("cannot write temporary test artifact: " + path.string());
+  }
+}
 }
 
 TEST(RawArmorDetection, RejectsWrongKeypointCount)
@@ -300,8 +330,12 @@ TEST(ModelProfile, TestOnlyRequiresExplicitOptIn)
   options.allow_test_only = true;
   const auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
   EXPECT_TRUE(profile.test_only);
+  EXPECT_EQ(profile.schema_version, 1);
   EXPECT_EQ(profile.model_id, "legacy_yolov5_reference");
-  EXPECT_EQ(profile.model_path, "external://sp_vision_25/assets/yolov5.xml");
+  EXPECT_EQ(profile.model_format, "legacy_single_path");
+  EXPECT_EQ(profile.model_artifacts.xml.path, "external://sp_vision_25/assets/yolov5.xml");
+  EXPECT_FALSE(profile.model_artifacts.bin.sha256.has_value());
+  EXPECT_TRUE(profile.model_artifacts.bin.path.empty());
   EXPECT_EQ(profile.input_shape, (std::array<std::size_t, 4>{{1, 3, 640, 640}}));
   EXPECT_EQ(profile.output_shape, (std::array<std::size_t, 3>{{1, 25200, 22}}));
   EXPECT_EQ(profile.color_class_count, 4U);
@@ -318,6 +352,7 @@ TEST(ModelProfile, ConvertsOnlyValidatedProfileToDetectorConfig)
   const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
     profile, "/tmp/reference.xml");
   EXPECT_EQ(config.model_path, "/tmp/reference.xml");
+  EXPECT_TRUE(config.model_bin_path.empty());
   EXPECT_EQ(config.input_width, 640);
   EXPECT_EQ(config.input_height, 640);
   EXPECT_EQ(config.expected_output_rows, 25200U);
@@ -333,36 +368,137 @@ TEST(ModelProfile, ConvertsOnlyValidatedProfileToDetectorConfig)
   EXPECT_FALSE(config.center_padding);
 }
 
+TEST(ModelProfile, SchemaV2ParsesAndBindsExplicitXmlBinManifest)
+{
+  const auto unique_suffix = std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+  ScopedTemporaryPath fixture{
+    std::filesystem::temp_directory_path() /
+      ("game26_model_profile_v2_manifest_" + unique_suffix + ".yaml")};
+  {
+    std::ofstream yaml(fixture.path);
+    ASSERT_TRUE(yaml.is_open());
+    yaml << R"(schema_version: 2
+profile: test_only
+model:
+  id: test_only_openvino_ir
+  format: openvino_ir
+  artifacts:
+    xml:
+      path: external://test-fixtures/reviewed.xml
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    bin:
+      path: external://test-fixtures/reviewed.bin
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  source: synthetic manifest fixture
+  version: fixture-v2
+input:
+  shape: [1, 3, 640, 640]
+  layout: NCHW
+  element_type: f32
+  source_color_order: BGR
+  model_color_order: RGB
+  normalization: divide_255
+  resize_mode: top_left
+output:
+  shape: [1, 25200, 22]
+  layout: NRC
+  element_type: f32
+  keypoint_count: 4
+  objectness_index: 8
+  color_logits_offset: 9
+  color_class_count: 4
+  armor_logits_offset: 13
+  armor_class_count: 9
+postprocess:
+  objectness_threshold: 0.7
+  nms_threshold: 0.3
+  keypoint_order: [0, 3, 2, 1]
+semantics:
+  color_id_to_name: [blue, red, gray, purple]
+  armor_class_names: [hero, engineer, infantry3, infantry4, infantry5, sentry, outpost, base, unknown]
+  class_to_armor_type:
+    0: small
+    1: small
+    2: small
+    3: small
+    4: small
+    5: large
+    6: large
+    7: large
+    8: small
+)";
+  }
+
+  ModelProfileLoadOptions options{};
+  options.allow_test_only = true;
+  const auto profile = load_model_profile(fixture.path.string(), options);
+  EXPECT_TRUE(profile.test_only);
+  EXPECT_EQ(profile.schema_version, 2);
+  EXPECT_EQ(profile.model_format, "openvino_ir");
+  EXPECT_EQ(profile.model_artifacts.xml.path, "external://test-fixtures/reviewed.xml");
+  EXPECT_EQ(profile.model_artifacts.bin.path, "external://test-fixtures/reviewed.bin");
+  ASSERT_TRUE(profile.model_artifacts.xml.sha256.has_value());
+  ASSERT_TRUE(profile.model_artifacts.bin.sha256.has_value());
+
+  const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
+    profile, "/tmp/test-only.xml", "CPU", "/tmp/test-only.bin");
+  EXPECT_EQ(config.model_path, "/tmp/test-only.xml");
+  EXPECT_EQ(config.model_bin_path, "/tmp/test-only.bin");
+  EXPECT_FALSE(config.require_model_path_match);
+  EXPECT_FALSE(config.require_model_bin_path_match);
+  EXPECT_FALSE(config.require_model_hash_match);
+}
+
 TEST(ModelProfile, ProductionProfileBindsRuntimePathToReviewedArtifact)
 {
   ModelProfileLoadOptions options{};
   options.allow_test_only = true;
   auto profile = load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH, options);
   profile.test_only = false;
-  profile.model_path = "/opt/game26/models/reviewed.xml";
-  profile.model_sha256 = std::string(64, 'a');
+  profile.schema_version = 2;
+  profile.model_format = "openvino_ir";
+  profile.model_artifacts.xml.path = "/opt/game26/models/reviewed.xml";
+  profile.model_artifacts.xml.sha256 = std::string(64, 'a');
+  profile.model_artifacts.bin.path = "/opt/game26/models/reviewed.bin";
+  profile.model_artifacts.bin.sha256 = std::string(64, 'b');
 
   EXPECT_FALSE(profile.validate().has_value());
   EXPECT_THROW(
     rm_auto_aim::detector::detector_config_from_model_profile(
-      profile, "/opt/game26/models/other.xml"),
+      profile, "/opt/game26/models/other.xml", "CPU", "/opt/game26/models/reviewed.bin"),
+    std::invalid_argument);
+  EXPECT_THROW(
+    rm_auto_aim::detector::detector_config_from_model_profile(
+      profile, "/opt/game26/models/reviewed.xml", "CPU", "/opt/game26/models/other.bin"),
     std::invalid_argument);
 
   const auto config = rm_auto_aim::detector::detector_config_from_model_profile(
     profile, "/opt/game26/models/reviewed.xml");
   EXPECT_TRUE(config.require_model_path_match);
-  EXPECT_EQ(config.reviewed_model_path, profile.model_path);
+  EXPECT_EQ(config.reviewed_model_path, profile.model_artifacts.xml.path);
+  EXPECT_TRUE(config.require_model_bin_path_match);
+  EXPECT_EQ(config.model_bin_path, profile.model_artifacts.bin.path);
+  EXPECT_EQ(config.reviewed_model_bin_path, profile.model_artifacts.bin.path);
   EXPECT_TRUE(config.require_model_hash_match);
-  EXPECT_EQ(config.reviewed_model_sha256, *profile.model_sha256);
+  EXPECT_EQ(config.reviewed_model_sha256, *profile.model_artifacts.xml.sha256);
+  EXPECT_EQ(config.reviewed_model_bin_sha256, *profile.model_artifacts.bin.sha256);
 
-  profile.model_path = "relative/reviewed.xml";
+  profile.model_artifacts.xml.path = "relative/reviewed.xml";
   EXPECT_TRUE(profile.validate().has_value());
 
-  profile.model_path = "/opt/game26/models/reviewed.xml";
-  profile.model_sha256.reset();
+  profile.model_artifacts.xml.path = "/opt/game26/models/reviewed.xml";
+  profile.model_artifacts.xml.sha256.reset();
   EXPECT_TRUE(profile.validate().has_value());
 
-  profile.model_sha256 = "not-a-sha256";
+  profile.model_artifacts.xml.sha256 = "not-a-sha256";
+  EXPECT_TRUE(profile.validate().has_value());
+
+  profile.model_artifacts.xml.sha256 = std::string(64, 'a');
+  profile.model_artifacts.bin.sha256.reset();
+  EXPECT_TRUE(profile.validate().has_value());
+
+  profile.model_artifacts.bin.sha256 = "not-a-sha256";
   EXPECT_TRUE(profile.validate().has_value());
 }
 
@@ -421,12 +557,70 @@ TEST(OpenVinoYoloDetector, MissingModelIsReportedClearly)
   }
 }
 
+TEST(OpenVinoYoloDetector, ReviewedManifestMissingBinFailsClosedBeforeRuntimeLoad)
+{
+  DetectorConfig config{};
+  config.model_path = MODEL_PROFILE_TEST_CONFIG_PATH;
+  config.model_bin_path = "/definitely/not/a/game26/model.bin";
+  config.require_model_bin_path_match = true;
+  config.reviewed_model_bin_path = config.model_bin_path;
+  try {
+    rm_auto_aim::detector::OpenVinoYoloDetector detector(config);
+    FAIL() << "expected missing reviewed BIN to throw";
+  } catch (const std::runtime_error & error) {
+    EXPECT_NE(std::string(error.what()).find("BIN file does not exist"), std::string::npos);
+  }
+}
+
+TEST(OpenVinoYoloDetector, ReviewedBinHashMismatchFailsBeforeOpenVinoParsesXml)
+{
+  const auto unique_suffix = std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+  ScopedTemporaryPath xml{
+    std::filesystem::temp_directory_path() /
+      ("game26_manifest_hash_" + unique_suffix + ".xml")};
+  ScopedTemporaryPath bin{
+    std::filesystem::temp_directory_path() /
+      ("game26_manifest_hash_" + unique_suffix + ".bin")};
+  // The reviewed BIN digest below belongs to "original-bin". Replacing the
+  // weights after the XML declaration is accepted must still fail before an
+  // invalid XML graph reaches OpenVINO.
+  write_test_artifact(xml.path, "<not-a-model/>");
+  write_test_artifact(bin.path, "original-bin");
+
+  DetectorConfig config{};
+  config.model_path = xml.path.string();
+  config.model_bin_path = bin.path.string();
+  config.require_model_hash_match = true;
+  config.reviewed_model_sha256 =
+    "1f3268a67ab26e216887a191b995332088421f25b32b9b117ec31aea9e293fda";
+  config.reviewed_model_bin_sha256 =
+    "2b273dd96b861dc397e16656794c5b146fc7ae16c87bd45b1989d252924e5d0d";
+  write_test_artifact(bin.path, "replaced-bin");
+
+  try {
+    rm_auto_aim::detector::OpenVinoYoloDetector detector(config);
+    FAIL() << "expected reviewed BIN digest mismatch to throw";
+  } catch (const std::runtime_error & error) {
+    const std::string message(error.what());
+    EXPECT_NE(message.find("SHA-256"), std::string::npos);
+    // A build without OpenSSL correctly fails closed before it can verify any
+    // digest. When the verifier is present, the required regression is that
+    // the BIN failure is observed before OpenVINO can parse the invalid XML.
+    if (message.find("verification is unavailable") == std::string::npos) {
+      EXPECT_NE(message.find("model BIN artifact SHA-256 does not match"), std::string::npos);
+    }
+  }
+}
+
 TEST(OpenVinoYoloDetector, ReviewedHashMismatchIsReportedBeforeModelLoad)
 {
   DetectorConfig config{};
   config.model_path = MODEL_PROFILE_TEST_CONFIG_PATH;
+  config.model_bin_path = MODEL_PROFILE_TEST_CONFIG_PATH;
   config.require_model_hash_match = true;
   config.reviewed_model_sha256 = std::string(64, '0');
+  config.reviewed_model_bin_sha256 = std::string(64, '0');
   try {
     rm_auto_aim::detector::OpenVinoYoloDetector detector(config);
     FAIL() << "expected reviewed hash mismatch to throw";

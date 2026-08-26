@@ -36,9 +36,18 @@ python3 tools/auto_aim_qualification/auto_aim_qualification.py \
 
 ## Strict
 
-`--mode strict` 要求正式 model profile、实际模型文件、profile 中声明的模型 SHA-256、正式 PnP/K-D/装甲尺寸/camera→gimbal 外参、完整 metadata、PR #16 报告和 PR #17 manifest。任何 test-only、路径或 hash 不一致、CSV `fire_command != 0`、时间戳异常、报告/manifest 缺失都会 FAIL。工具不能生成正式 PnP、外参、绝对角零点、RobotCtrl 或开火参数。
+`--mode strict` 要求正式 schema-v2 model profile、实际 XML/BIN 模型文件、profile 中分别声明的 XML 与 BIN SHA-256、正式 PnP/K-D/装甲尺寸/camera→gimbal 外参、完整 metadata、PR #16 报告和 PR #17 manifest。任何 test-only、XML/BIN 路径或 hash 不一致、CSV `fire_command != 0`、时间戳异常、报告/manifest 缺失都会 FAIL。工具不能生成正式 PnP、外参、绝对角零点、RobotCtrl 或开火参数。
 
-模型文件存在时，审计会独立校验 profile 内声明的 SHA-256 与实际文件，并在提供 `--model-sha256` 或 metadata 中的 `model_sha256` 时将其作为第二个断言；外部值不能覆盖 profile 值，任一声明缺失（在 strict/production 或外部值已提供的情况下）、格式非法、两项声明不一致或与实际文件不匹配都会 fail-closed。
+对于生产 OpenVINO IR，审计把 XML 图和 BIN 权重作为两个命名 artifact，而不是把
+XML hash 当作整个模型。它分别校验 manifest 中的路径和 SHA-256，并且仅在两个
+artifact 都存在、可读、非别名且摘要正确时调用 OpenVINO 的
+`read_model(xml_path, bin_path)`。XML 保持不变而替换 BIN、缺失 BIN、BIN 路径不匹配
+或 BIN SHA-256 不匹配都会 fail-closed。任何可选的外部/metadata 摘要都是额外断言，
+不能覆盖 profile 中对应角色的声明。
+
+CLI 中 `--model` 是 XML 运行时路径，`--model-bin` 是 BIN 运行时路径；
+`--model-sha256` 与 `--model-bin-sha256` 也是分别的额外断言。省略 BIN 参数时，
+审计只使用 profile 明确声明的 BIN 路径，绝不按 XML 文件名猜测同名权重。
 
 模型 artifact 可读时，工具还只读检查 OpenVINO 实际 input/output 数量、静态 shape、element
 type 与 layout，并逐项和 profile 对照。动态 shape、layout/shape/type 不匹配、无法读取 IR
@@ -48,8 +57,8 @@ WARN 且 `pipeline_execution_unavailable`，绝不伪造 runtime PASS；在 stri
 中则 FAIL。
 
 每份 JSON/Markdown 还记录 profile id/version/kind、`test_only`、`effective_test_only`、
-声明/运行时路径、artifact 存在性和 SHA-256、runtime contract、输入预处理、keypoint order
-以及 class/color mapping。报告附有固定小图的 BGR→RGB、`/255`、FP32 NCHW、top-left/center
+分别的 XML/BIN 声明与运行时路径、存在性、可读性和 SHA-256、runtime contract、输入预处理、
+keypoint order 以及 class/color mapping。报告附有固定小图的 BGR→RGB、`/255`、FP32 NCHW、top-left/center
 padding 和 inverse round-trip 软件 golden evidence；它明确标为 software-only，不是 MCU
 raw-hex/hardware golden frame，也不构成 production 或命中性能结论。
 

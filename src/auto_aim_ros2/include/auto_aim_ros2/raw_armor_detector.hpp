@@ -46,19 +46,28 @@ std::optional<RawArmorDetection> make_raw_armor_detection(
 
 struct DetectorConfig
 {
+  // OpenVINO IR is a two-file artifact.  ``model_path`` is the reviewed XML
+  // graph and ``model_bin_path`` is the reviewed BIN weights file.  A
+  // production profile must bind both; an unprofiled/test-only diagnostic
+  // path may leave the BIN path empty for OpenVINO's legacy auto-discovery.
   std::string model_path;
+  std::string model_bin_path;
 
-  // A production profile binds the runtime artifact to the exact path that
-  // was reviewed.  Test-only profiles may use an external:// identifier and
-  // explicitly override it for offline fixtures; production profiles may not.
+  // A production profile binds both runtime IR paths to the exact reviewed
+  // XML/BIN manifest. Test-only profiles may use an external:// identifier
+  // and explicitly override the XML path for offline fixtures; production
+  // profiles may not substitute either member.
   bool require_model_path_match{false};
   std::string reviewed_model_path;
-  // Production profiles bind the artifact bytes as well as the reviewed path.
-  // When this gate is enabled the detector verifies the XML artifact before
-  // OpenVINO reads it; an unavailable verifier or mismatched digest fails
-  // closed.
+  bool require_model_bin_path_match{false};
+  std::string reviewed_model_bin_path;
+  // Production profiles bind both artifact byte streams as well as their
+  // reviewed paths. When this gate is enabled the detector verifies the XML
+  // and BIN before OpenVINO reads either; an unavailable verifier or either
+  // mismatched digest fails closed.
   bool require_model_hash_match{false};
   std::string reviewed_model_sha256;
+  std::string reviewed_model_bin_sha256;
   std::string device{"CPU"};
 
   // Optional semantic mapping from the reviewed model profile.  An empty map
@@ -102,6 +111,24 @@ struct DetectorConfig
   std::array<int, 4> keypoint_order{{0, 3, 2, 1}};
 };
 
+// One member of a reviewed OpenVINO IR manifest. The digest is optional only
+// for legacy/test-only profiles; production admission requires it for both
+// XML graph and BIN weights members.
+struct ModelArtifact
+{
+  std::string path;
+  std::optional<std::string> sha256;
+};
+
+// Schema-v2 OpenVINO IR artifact manifest. Keeping XML and BIN as distinct
+// named members prevents a reviewed graph hash from being mistaken for a
+// binding of the weights consumed by OpenVINO.
+struct OpenVinoIrArtifactManifest
+{
+  ModelArtifact xml;
+  ModelArtifact bin;
+};
+
 // A model profile is a versioned, reviewable description of a detector
 // artifact's tensor and semantic contract.  It is intentionally separate
 // from the physical PnP/calibration YAML.  No production profile is shipped
@@ -112,14 +139,12 @@ struct ModelProfile
   int schema_version{0};
   bool test_only{false};
   std::string model_id;
-  // For production this must be an absolute local artifact path and is bound
-  // to the runtime path.  Test-only profiles may use an external:// identifier
-  // because their model is intentionally supplied outside the repository.
-  std::string model_path;
-  // A reviewed production profile binds an artifact digest as well as its
-  // path. Both the runtime detector and the offline qualification tool verify
-  // the artifact bytes before accepting a production contract.
-  std::optional<std::string> model_sha256;
+  // Schema v2 accepts only ``openvino_ir`` and requires the named XML/BIN
+  // manifest below for production. Schema-v1 test-only profiles are retained
+  // only as legacy fixture compatibility and map their old model.path to the
+  // XML member without becoming production-admissible.
+  std::string model_format;
+  OpenVinoIrArtifactManifest model_artifacts;
   std::string source;
   std::string version;
 
@@ -164,12 +189,16 @@ ModelProfile load_model_profile(
   const std::string & yaml_path,
   ModelProfileLoadOptions options = {});
 
-// Convert a validated profile into the detector's runtime contract.  The
-// caller still supplies the actual model artifact path and OpenVINO device.
+// Convert a validated profile into the detector's runtime contract. The
+// caller supplies the actual XML path and OpenVINO device; the optional BIN
+// override exists only for explicit manifest-path matching. Empty paths use
+// the reviewed profile values. Production rejects substitution of either IR
+// member before OpenVINO initialization.
 DetectorConfig detector_config_from_model_profile(
   const ModelProfile & profile,
   std::string model_path,
-  std::string device = "CPU");
+  std::string device = "CPU",
+  std::string model_bin_path = {});
 
 struct ModelInfo
 {

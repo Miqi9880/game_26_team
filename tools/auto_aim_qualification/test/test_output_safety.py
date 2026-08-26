@@ -61,6 +61,7 @@ class OutputSafetyTests(unittest.TestCase):
         cases = (
             ("--model-profile", MODEL_PROFILE),
             ("--pnp-config", PNP_CONFIG),
+            ("--model-bin", MODEL_PROFILE),
             ("--metadata-json", ROOT / "tools/offline_evidence_report/fixtures/bundle/normal_metadata.json"),
             ("--manifest", ROOT / "tools/offline_evidence_report/fixtures/bundle/normal_metadata.json"),
             ("--camera-intrinsic-report", ROOT / "tools/offline_evidence_report/fixtures/bundle/camera_intrinsic_evidence.yaml"),
@@ -109,6 +110,7 @@ class OutputSafetyTests(unittest.TestCase):
         cases = (
             ("--model-profile", MODEL_PROFILE),
             ("--pnp-config", PNP_CONFIG),
+            ("--model-bin", MODEL_PROFILE),
             ("--metadata-json", ROOT / "tools/offline_evidence_report/fixtures/bundle/normal_metadata.json"),
             ("--manifest", ROOT / "tools/offline_evidence_report/fixtures/bundle/normal_metadata.json"),
             ("--camera-intrinsic-report", ROOT / "tools/offline_evidence_report/fixtures/bundle/camera_intrinsic_evidence.yaml"),
@@ -161,6 +163,26 @@ class OutputSafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("status=FAIL", result.stdout)
             self.assertEqual(hashlib.sha256(model.read_bytes()).hexdigest(), before)
+            self.assertFalse(markdown.exists())
+
+    def test_model_bin_file_input_is_protected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "model.bin"
+            binary.write_bytes(b"MODEL_BIN_BYTES")
+            before = hashlib.sha256(binary.read_bytes()).hexdigest()
+            markdown = root / "qualification.md"
+
+            result = subprocess.run(
+                self._command(binary, markdown) + ["--model-bin", str(binary)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("status=FAIL", result.stdout)
+            self.assertEqual(hashlib.sha256(binary.read_bytes()).hexdigest(), before)
             self.assertFalse(markdown.exists())
 
     def test_annotated_directory_and_evidence_bundle_are_protected_by_containment(self):

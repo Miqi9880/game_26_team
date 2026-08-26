@@ -24,6 +24,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("evidence_only", "strict"), default="evidence_only")
     parser.add_argument("--model-profile", required=True)
     parser.add_argument("--model")
+    parser.add_argument("--model-bin")
     parser.add_argument("--pnp-config", required=True)
     parser.add_argument("--input-csv")
     parser.add_argument("--metadata-json")
@@ -37,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id")
     parser.add_argument("--run-command")
     parser.add_argument("--model-sha256")
+    parser.add_argument("--model-bin-sha256")
     parser.add_argument("--image-width", type=int)
     parser.add_argument("--image-height", type=int)
     parser.add_argument("--allow-test-only", "--allow-test-profile", action="store_true")
@@ -80,6 +82,7 @@ def _validate_outputs(
     model_profile: str | None = None,
     pnp_config: str | None = None,
     model: str | None = None,
+    model_bin: str | None = None,
     metadata_json: str | None = None,
     evidence_bundle: str | None = None,
     manifest: str | None = None,
@@ -102,6 +105,7 @@ def _validate_outputs(
             model_profile,
             pnp_config,
             model,
+            model_bin,
             input_csv,
             metadata_json,
             manifest,
@@ -261,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
             model_profile=args.model_profile,
             pnp_config=args.pnp_config,
             model=args.model,
+            model_bin=args.model_bin,
             metadata_json=args.metadata_json,
             evidence_bundle=args.evidence_bundle,
             manifest=args.manifest,
@@ -271,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         report = qualify_offline(
             model_profile=args.model_profile,
             model=args.model,
+            model_bin=args.model_bin,
             pnp_config=args.pnp_config,
             mode=args.mode,
             allow_test_only=args.allow_test_only,
@@ -295,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
                 # and must fail closed; do not let the generic optional-field
                 # filtering silently discard it.
                 **({"model_sha256": args.model_sha256} if args.model_sha256 is not None else {}),
+                **({"model_bin_sha256": args.model_bin_sha256} if args.model_bin_sha256 is not None else {}),
             },
         )
     except Exception as exc:  # malformed input must still yield a report

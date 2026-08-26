@@ -46,9 +46,10 @@ STATUS_CODES = {"PASS": 0, "WARN": 2, "FAIL": 1}
 _SEVERITY = {"PASS": 0, "WARN": 1, "FAIL": 2}
 _SAFE_METADATA_KEYS = {
     "run_id", "commit", "dataset_id", "model_profile_id", "model_profile_version",
-    "model_source", "model_sha256", "pnp_profile", "pnp_profile_version", "pnp_source",
+    "model_source", "model_sha256", "model_bin_sha256", "pnp_profile", "pnp_profile_version", "pnp_source",
     "source_label", "run_command",
 }
+_MODEL_HASH_METADATA_KEYS = {"model_sha256", "model_bin_sha256"}
 
 
 def _safe_name(value: Any) -> str:
@@ -68,30 +69,30 @@ def _safe_metadata(value: Optional[Mapping[str, Any]]) -> tuple[dict[str, Any], 
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} ignored"})
             continue
         if isinstance(raw, (dict, list, tuple)):
-            if key_text == "model_sha256":
+            if key_text in _MODEL_HASH_METADATA_KEYS:
                 # Keep a redacted invalid marker so the model audit rejects
                 # the external assertion instead of silently treating it as
                 # absent.  Do not preserve arbitrary nested content in the
                 # report, since it could contain paths or credentials.
                 result[key_text] = "<invalid>"
-                warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a scalar string"})
+                warnings.append({"code": "metadata_field_invalid", "message": f"metadata field {key_text!r} must be a scalar string"})
                 continue
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} must be scalar"})
             continue
         if isinstance(raw, float) and not math.isfinite(raw):
-            if key_text == "model_sha256":
+            if key_text in _MODEL_HASH_METADATA_KEYS:
                 result[key_text] = "<invalid>"
-                warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a finite string"})
+                warnings.append({"code": "metadata_field_invalid", "message": f"metadata field {key_text!r} must be a finite string"})
                 continue
             warnings.append({"code": "metadata_field_ignored", "message": f"metadata field {key_text!r} must be finite"})
             continue
         if isinstance(raw, str):
             result[key_text] = _redact_text(raw)
-        elif key_text == "model_sha256" and raw is None:
+        elif key_text in _MODEL_HASH_METADATA_KEYS and raw is None:
             # JSON null is an explicit, invalid external assertion rather
             # than an omitted field.
             result[key_text] = "<invalid>"
-            warnings.append({"code": "metadata_field_invalid", "message": "metadata field 'model_sha256' must be a string"})
+            warnings.append({"code": "metadata_field_invalid", "message": f"metadata field {key_text!r} must be a string"})
         else:
             result[key_text] = raw
     return result, warnings
@@ -122,12 +123,32 @@ def _max_status(*statuses: str) -> str:
     return max(statuses or ("PASS",), key=lambda value: _SEVERITY.get(value, 2))
 
 
-def _model_hash_declared(profile_path: str | Path) -> bool:
+def _model_artifact_hashes_declared(profile_path: str | Path) -> bool:
+    """Require the reviewed digest set for the profile's schema version."""
+
     try:
         import yaml  # type: ignore
         root = yaml.safe_load(Path(profile_path).read_text(encoding="utf-8"))
         model = root.get("model", {}) if isinstance(root, Mapping) else {}
-        return any(isinstance(model.get(key), str) and model.get(key).strip() for key in ("sha256", "sha256sum", "artifact_sha256", "hash"))
+        schema_version = root.get("schema_version") if isinstance(root, Mapping) else None
+        if schema_version == 1:
+            return any(
+                isinstance(model.get(key), str) and model.get(key).strip()
+                for key in ("sha256", "sha256sum", "artifact_sha256", "hash")
+            )
+        if schema_version != 2 or not isinstance(model, Mapping):
+            return False
+        artifacts = model.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            return False
+        for name in ("xml", "bin"):
+            artifact = artifacts.get(name)
+            if not isinstance(artifact, Mapping):
+                return False
+            digest = artifact.get("sha256")
+            if not isinstance(digest, str) or not digest.strip():
+                return False
+        return True
     except Exception:
         return False
 
@@ -163,6 +184,7 @@ def qualify_offline(
     mode: str = "evidence_only",
     allow_test_only: bool = False,
     model: str | Path | None = None,
+    model_bin: str | Path | None = None,
     input_csv: str | Path | None = None,
     metadata_json: str | Path | None = None,
     evidence_bundle: str | Path | None = None,
@@ -199,6 +221,7 @@ def qualify_offline(
 
     model_audit_kwargs: dict[str, Any] = {
         "model_path": model,
+        "model_bin_path": model_bin,
         "mode": mode,
         "allow_test_only": allow_test_only,
     }
@@ -209,6 +232,8 @@ def qualify_offline(
     # missing-value sentinel remains distinguishable from an explicit null.
     if "model_sha256" in metadata:
         model_audit_kwargs["expected_model_sha256"] = metadata["model_sha256"]
+    if "model_bin_sha256" in metadata:
+        model_audit_kwargs["expected_model_bin_sha256"] = metadata["model_bin_sha256"]
     model_audit = audit_model_profile(model_profile, **model_audit_kwargs)
     model_mapping = model_audit.values.get("class_to_armor_type")
     expected_mapping = None
@@ -230,20 +255,53 @@ def qualify_offline(
     if not isinstance(runtime_contract, Mapping):
         runtime_contract = {"status": "invalid", "available": False}
     effective_test_only = model_audit.profile_kind == "test_only" or pnp_audit.profile_kind == "test_only"
+    raw_artifacts = model_values.get("model_artifacts", {})
+    if not isinstance(raw_artifacts, Mapping):
+        raw_artifacts = {}
+
+    # Preserve the original XML-only report fields while exposing the v2
+    # manifest as two independently auditable records.  The audit has already
+    # redacted paths and malformed declarations before this boundary.
+    model_artifacts: dict[str, dict[str, Any]] = {}
+    for name in ("xml", "bin"):
+        raw_record = raw_artifacts.get(name, {})
+        if not isinstance(raw_record, Mapping):
+            raw_record = {}
+        model_artifacts[name] = {
+            "required": raw_record.get("required") is True,
+            "exists": raw_record.get("exists") is True,
+            "readable": raw_record.get("readable") is True,
+            "declared_path": raw_record.get("declared_path"),
+            "runtime_path": raw_record.get("runtime_path"),
+            "runtime_path_matches_profile": raw_record.get("runtime_path_matches_profile"),
+            "declared_sha256": raw_record.get("declared_sha256"),
+            "actual_sha256": raw_record.get("actual_sha256"),
+            "sha256_matches_profile": raw_record.get("sha256_matches_profile"),
+            "sha256_matches_external": raw_record.get("sha256_matches_external"),
+            "status": raw_record.get("status"),
+        }
+    xml_artifact = model_artifacts["xml"]
+    bin_artifact = model_artifacts["bin"]
     model_artifact = {
-        "exists": model_values.get("model_artifact_exists") is True,
-        "readable": model_values.get("model_artifact_readable") is True,
-        "sha256": model_audit.model_sha256,
-        "declared_path": model_values.get("declared_model_path", model_report.get("model_path")),
-        "runtime_path": model_values.get("runtime_model_path"),
-        "runtime_path_matches_profile": model_values.get("runtime_path_matches_profile"),
+        "exists": xml_artifact["exists"],
+        "readable": xml_artifact["readable"],
+        "sha256": xml_artifact["actual_sha256"] or model_audit.model_sha256,
+        "declared_path": xml_artifact["declared_path"] or model_values.get("declared_model_path", model_report.get("model_path")),
+        "runtime_path": xml_artifact["runtime_path"] or model_values.get("runtime_model_path"),
+        "runtime_path_matches_profile": xml_artifact["runtime_path_matches_profile"],
+        "sha256_matches_profile": xml_artifact["sha256_matches_profile"],
+        "sha256_matches_external": xml_artifact["sha256_matches_external"],
     }
     findings.extend(model_report["findings"])
     findings.extend(pnp_report["findings"])
-    if any(item.get("code") in {
+    unavailable_codes = {
         "model_artifact_unavailable", "model_artifact_missing", "model_hash_unreadable",
+        "model_xml_artifact_unavailable", "model_bin_artifact_unavailable",
+        "model_xml_hash_unreadable", "model_bin_hash_unreadable",
+        "model_artifact_unverified",
         "runtime_unavailable", "runtime_model_read_failed",
-    } for item in model_report["findings"]):
+    }
+    if any(item.get("code") in unavailable_codes for item in model_report["findings"]):
         findings.append(_finding_dict(
             "pipeline_execution_unavailable",
             "pipeline execution unavailable: model/OpenVINO runtime asset is unavailable; no detector replay was claimed",
@@ -310,8 +368,8 @@ def qualify_offline(
             findings.append(_finding_dict("model_missing", "strict mode requires an actual model artifact"))
         # The reviewed profile declaration is mandatory on its own; an
         # external/metadata hash can never satisfy or replace it.
-        if not _model_hash_declared(model_profile):
-            findings.append(_finding_dict("model_hash_missing", "strict mode requires a declared model SHA-256 in the profile"))
+        if not _model_artifact_hashes_declared(model_profile):
+            findings.append(_finding_dict("model_hash_missing", "strict mode requires all declared XML/BIN model SHA-256 values in the profile"))
         if camera_intrinsic_report is None:
             findings.append(_finding_dict("camera_report_missing", "strict mode requires a camera intrinsic evidence report"))
         elif not Path(camera_intrinsic_report).is_file():
@@ -361,7 +419,11 @@ def qualify_offline(
         "model_file": model_report.get("model_path"),
         "model_file_exists": model_artifact["exists"],
         "model_sha256": model_report.get("model_sha256"),
+        "model_bin_file": bin_artifact["declared_path"],
+        "model_bin_file_exists": bin_artifact["exists"],
+        "model_bin_sha256": bin_artifact["actual_sha256"],
         "model_artifact": model_artifact,
+        "model_artifacts": model_artifacts,
         "runtime_contract": runtime_contract,
         "runtime_status": runtime_contract.get("status"),
         "preprocessing_contract": model_values.get("preprocessing_contract", {}),
@@ -435,6 +497,9 @@ def qualify_offline(
             "model_profile_version": model_audit.profile_version,
             "model_file": model_report.get("model_path"),
             "model_sha256": model_report.get("model_sha256"),
+            "model_bin_file": bin_artifact["declared_path"],
+            "model_bin_sha256": bin_artifact["actual_sha256"],
+            "model_artifacts": model_artifacts,
             "pnp_profile": pnp_audit.profile_id or pnp_audit.profile_kind,
             "pnp_profile_version": pnp_audit.profile_version,
             "camera_resolution": pnp_report.get("values", {}).get("camera_resolution"),
@@ -483,12 +548,15 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(f"- PR #17 evidence bundle/manifest: `{report.get('manifest_status')}`")
     lines.extend(["", "## Model contract evidence", ""])
     artifact = report.get("model_artifact", {})
+    artifacts = report.get("model_artifacts", {})
     runtime = report.get("runtime_contract", {})
     preprocessing = report.get("preprocessing_contract", {})
     software_evidence = report.get("software_preprocessing_evidence", {})
     mapping = report.get("class_color_mapping", {})
     if not isinstance(artifact, Mapping):
         artifact = {}
+    if not isinstance(artifacts, Mapping):
+        artifacts = {}
     if not isinstance(runtime, Mapping):
         runtime = {}
     if not isinstance(preprocessing, Mapping):
@@ -507,16 +575,27 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             bool_text(report.get("effective_test_only")),
         )
     )
-    lines.append(
-        "- model artifact: exists=`{}`, readable=`{}`, sha256=`{}`, declared=`{}`, runtime=`{}`, path_match=`{}`".format(
-            bool_text(artifact.get("exists")),
-            bool_text(artifact.get("readable")),
-            artifact.get("sha256"),
-            artifact.get("declared_path"),
-            artifact.get("runtime_path"),
-            artifact.get("runtime_path_matches_profile"),
+    for name, fallback in (("xml", artifact), ("bin", {})):
+        record = artifacts.get(name, fallback)
+        if not isinstance(record, Mapping):
+            record = fallback if isinstance(fallback, Mapping) else {}
+        label = name.upper()
+        lines.append(
+            "- {} artifact: exists=`{}`, readable=`{}`, declared_sha256=`{}`, actual_sha256=`{}`, "
+            "profile_hash_match=`{}`, external_hash_match=`{}`, declared=`{}`, runtime=`{}`, path_match=`{}`, status=`{}`".format(
+                label,
+                bool_text(record.get("exists")),
+                bool_text(record.get("readable")),
+                record.get("declared_sha256", record.get("sha256")),
+                record.get("actual_sha256", record.get("sha256")),
+                record.get("sha256_matches_profile"),
+                record.get("sha256_matches_external"),
+                record.get("declared_path"),
+                record.get("runtime_path"),
+                record.get("runtime_path_matches_profile"),
+                record.get("status"),
+            )
         )
-    )
     lines.append(
         "- OpenVINO runtime: status=`{}`, available=`{}`, reason=`{}`, input=`{}` `{}` layout=`{}`, output=`{}` `{}` layout=`{}`".format(
             runtime.get("status"),

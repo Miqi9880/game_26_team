@@ -33,8 +33,11 @@ The default is an empty string, and no production serial number is checked in.
 `camera_info_url` also defaults to empty. In that state the node publishes
 matching dimensions but a deliberately uncalibrated CameraInfo, so input
 preflight fails and PnP must not start. The checked-in `config/camera_info.yaml`
-is an unverified format example; launch does not load it and the node rejects
-its package URI. Supply a separately verified file explicitly.
+is an invalid, explicitly unverified format example. Before hardware
+initialization, the node resolves calibration URLs and rejects package, file,
+`..`, symlink, and hard-link aliases of that file. Its zero dimensions and zero
+K also prevent a copied example from passing the formal CameraInfo contract.
+Supply a separately verified file explicitly.
 Verify `/image_raw` and `/camera_info` before starting any detector:
 
 ```bash

@@ -6,9 +6,17 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
+
+#include <camera_info_manager/camera_info_manager.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 namespace hik_camera
 {
@@ -29,6 +37,77 @@ CameraInfoContractSample validCameraInfo()
   sample.d.assign(5U, 0.0);
   return sample;
 }
+
+class TemporaryCalibrationFile
+{
+public:
+  TemporaryCalibrationFile()
+  {
+    char path[] = "/tmp/hik_camera_calibration_XXXXXX";
+    const int descriptor = mkstemp(path);
+    if (descriptor >= 0) {
+      close(descriptor);
+      path_ = path;
+      std::ofstream output(path_);
+      output << "test calibration fixture\n";
+    }
+  }
+
+  ~TemporaryCalibrationFile()
+  {
+    if (!hardlink_.empty()) {
+      std::remove(hardlink_.c_str());
+    }
+    if (!alias_.empty()) {
+      std::remove(alias_.c_str());
+    }
+    if (!path_.empty()) {
+      std::remove(path_.c_str());
+    }
+  }
+
+  const std::string & path() const
+  {
+    return path_;
+  }
+
+  std::string fileUrl() const
+  {
+    return "file://" + path_;
+  }
+
+  std::string symlinkUrl()
+  {
+    alias_ = path_ + ".alias";
+    if (symlink(path_.c_str(), alias_.c_str()) != 0) {
+      alias_.clear();
+    }
+    return "file://" + alias_;
+  }
+
+  std::string hardlinkUrl()
+  {
+    hardlink_ = path_ + ".hardlink";
+    if (link(path_.c_str(), hardlink_.c_str()) != 0) {
+      hardlink_.clear();
+    }
+    return "file://" + hardlink_;
+  }
+
+  std::string dotDotUrl() const
+  {
+    constexpr const char * temporary_prefix = "/tmp/";
+    if (path_.compare(0U, 5U, temporary_prefix) != 0) {
+      return {};
+    }
+    return "file:///tmp/../tmp/" + path_.substr(5U);
+  }
+
+private:
+  std::string path_;
+  std::string alias_;
+  std::string hardlink_;
+};
 
 TEST(CameraSelection, RejectsEmptyDeviceList)
 {
@@ -155,6 +234,99 @@ TEST(CameraInfoContract, RequiresFrameDimensionsToMatch)
   const auto sample = validCameraInfo();
   EXPECT_TRUE(cameraInfoMatchesFrame(sample, 1440U, 1080U));
   EXPECT_FALSE(cameraInfoMatchesFrame(sample, 1280U, 1024U));
+}
+
+TEST(CameraInfoUrlProvenance, RejectsResolvedPackageExample)
+{
+  TemporaryCalibrationFile candidate;
+  ASSERT_FALSE(candidate.path().empty());
+
+  const auto result = validateCameraInfoUrlProvenance(
+    "package://hik_camera/config/camera_info.yaml",
+    candidate.fileUrl(), {candidate.fileUrl()});
+
+  EXPECT_FALSE(result.valid);
+  EXPECT_NE(result.reason.find("checked-in unverified"), std::string::npos);
+}
+
+TEST(CameraInfoUrlProvenance, RejectsFileAndSymlinkAliases)
+{
+  TemporaryCalibrationFile candidate;
+  ASSERT_FALSE(candidate.path().empty());
+  const auto alias_url = candidate.symlinkUrl();
+  const auto hardlink_url = candidate.hardlinkUrl();
+  const auto dotdot_url = candidate.dotDotUrl();
+  ASSERT_NE(alias_url, "file://");
+  ASSERT_NE(hardlink_url, "file://");
+  ASSERT_FALSE(dotdot_url.empty());
+
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      candidate.fileUrl(), candidate.fileUrl(), {candidate.fileUrl()}).valid);
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      alias_url, alias_url, {candidate.fileUrl()}).valid);
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      hardlink_url, hardlink_url, {candidate.fileUrl()}).valid);
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      dotdot_url, dotdot_url, {candidate.fileUrl()}).valid);
+}
+
+TEST(CameraInfoUrlProvenance, AcceptsDifferentExternalFile)
+{
+  TemporaryCalibrationFile candidate;
+  TemporaryCalibrationFile verified;
+  ASSERT_FALSE(candidate.path().empty());
+  ASSERT_FALSE(verified.path().empty());
+
+  const auto result = validateCameraInfoUrlProvenance(
+    verified.fileUrl(), verified.fileUrl(), {candidate.fileUrl()});
+
+  EXPECT_TRUE(result.valid) << result.reason;
+}
+
+TEST(CameraInfoUrlProvenance, CheckedInFileCannotPassFormalContract)
+{
+  if (!rclcpp::ok()) {
+    int argc = 0;
+    rclcpp::init(argc, nullptr);
+  }
+  auto node = std::make_shared<rclcpp::Node>("unverified_camera_info_file_test");
+  camera_info_manager::CameraInfoManager manager(node.get(), "unverified_example");
+  const std::string package_url =
+    "package://hik_camera/config/camera_info.yaml";
+  const auto installed_example_url = manager.resolveURL(
+    package_url, "unverified_example");
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      package_url, installed_example_url, {installed_example_url}).valid);
+  EXPECT_FALSE(
+    validateCameraInfoUrlProvenance(
+      installed_example_url, installed_example_url,
+      {installed_example_url}).valid);
+
+  const std::string url =
+    std::string("file://") + HIK_CAMERA_UNVERIFIED_EXAMPLE_PATH;
+  const bool example_exists = std::ifstream(HIK_CAMERA_UNVERIFIED_EXAMPLE_PATH).good();
+  EXPECT_TRUE(example_exists);
+  const bool loaded = example_exists && manager.loadCameraInfo(url);
+  EXPECT_TRUE(loaded);
+  if (!loaded) {
+    node.reset();
+    rclcpp::shutdown();
+    return;
+  }
+  const auto message = manager.getCameraInfo();
+  const auto validation = validateCameraInfoContract(
+    CameraInfoContractSample{
+        message.width, message.height, message.distortion_model,
+        message.k, message.d,
+      });
+  EXPECT_FALSE(validation.valid);
+  node.reset();
+  rclcpp::shutdown();
 }
 
 TEST(ParameterRange, AcceptsFiniteInclusiveValues)

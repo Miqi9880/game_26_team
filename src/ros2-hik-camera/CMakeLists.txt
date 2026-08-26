@@ -131,8 +131,15 @@ if(BUILD_TESTING)
     test/camera_safety_test.cpp
   )
   if(TARGET camera_safety_test)
+    target_compile_definitions(camera_safety_test PRIVATE
+      HIK_CAMERA_UNVERIFIED_EXAMPLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/camera_info.yaml"
+    )
     target_link_libraries(camera_safety_test
       ${PROJECT_NAME}_safety
+    )
+    ament_target_dependencies(camera_safety_test
+      camera_info_manager
+      rclcpp
     )
   endif()
 endif()

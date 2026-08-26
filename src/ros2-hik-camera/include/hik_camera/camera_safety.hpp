@@ -44,6 +44,11 @@ bool calculateRgb8BufferSize(
 ContractValidationResult validateCameraInfoContract(
   const CameraInfoContractSample & sample);
 
+ContractValidationResult validateCameraInfoUrlProvenance(
+  const std::string & requested_url,
+  const std::string & resolved_url,
+  const std::vector<std::string> & unverified_resolved_urls);
+
 bool cameraInfoMatchesFrame(
   const CameraInfoContractSample & sample,
   std::uint32_t frame_width,

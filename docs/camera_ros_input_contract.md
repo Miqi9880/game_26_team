@@ -46,9 +46,10 @@ Image header。
 | `frame_id` | `camera_optical_frame` | 同时用于 Image 和 CameraInfo；空值拒绝启动 |
 | `use_sensor_data_qos` | `true` | `/image_raw` 与 `/camera_info` 使用 SensorDataQoS |
 
-仓库内 `src/ros2-hik-camera/config/camera_info.yaml` 仅是未验证格式示例，launch 不再默认加载，
-节点也显式拒绝其 `package://hik_camera/config/camera_info.yaml` URI。正式文件必须从外部受控
-路径显式传入。图像分辨率来自每个成功转换的 SDK frame，不是 launch 中的猜测值；若正式
+仓库内 `src/ros2-hik-camera/config/camera_info.yaml` 是零尺寸、零 K 的不可用未验证格式示例，
+launch 不再默认加载。节点在硬件初始化前解析 URL，并按规范路径和文件身份拒绝该文件的
+`package://`、`file://`、`..`、符号链接和硬链接别名；复制件也无法通过 K/宽高校验。正式文件
+必须从外部受控路径显式传入。图像分辨率来自每个成功转换的 SDK frame，不是 launch 中的猜测值；若正式
 CameraInfo 宽高不匹配，整帧拒绝发布并留下明确错误。
 
 ## 无硬件构建与测试

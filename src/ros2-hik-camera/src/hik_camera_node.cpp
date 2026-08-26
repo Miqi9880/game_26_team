@@ -335,13 +335,16 @@ private:
         "verified calibration is supplied");
       return;
     }
-    if (camera_info_url_ == "package://hik_camera/config/camera_info.yaml") {
-      throw std::invalid_argument(
-              "the checked-in camera_info.yaml is an unverified format example and cannot be "
-              "loaded as formal calibration");
-    }
     if (!camera_info_manager_->validateURL(camera_info_url_)) {
       throw std::invalid_argument("invalid camera_info_url: " + camera_info_url_);
+    }
+    const auto resolved_url = camera_info_manager_->resolveURL(camera_info_url_, camera_name_);
+    const auto unverified_url = camera_info_manager_->resolveURL(
+      "package://hik_camera/config/camera_info.yaml", camera_name_);
+    const auto provenance = validateCameraInfoUrlProvenance(
+      camera_info_url_, resolved_url, {unverified_url});
+    if (!provenance.valid) {
+      throw std::invalid_argument(provenance.reason);
     }
     if (!camera_info_manager_->loadCameraInfo(camera_info_url_)) {
       throw std::runtime_error("unable to load camera_info_url: " + camera_info_url_);

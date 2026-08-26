@@ -65,10 +65,10 @@ Tracker 每帧和每条轨迹都保留确定性的关联结果/原因（如 `new
 
 Selector 只从有效且处于 `tracking` 的轨迹中选择。候选排序不使用敌我颜色、固定 class id、车辆编号、前哨站规则或装甲专属优先级：
 
-1. confidence 高者优先；
-2. 在 `confidence_tie_epsilon` 内，上一帧的 `track_id` 优先；
+1. 先求本帧候选中的全局最高 confidence；
+2. 只保留与该最高值之差不超过 `confidence_tie_epsilon` 的固定候选集合，上一帧的 `track_id` 优先；
 3. 再按 bbox 中心到当前图像中心的距离；
-4. 最后按较小的 `track_id`。
+4. 最后按较小的 `track_id`。固定候选集合避免逐对 epsilon 比较形成非传递关系，因而不受输入排列影响。
 
 可选 `switch_debounce_frames` 只在上一目标仍是有效 `tracking` 候选时延迟替代目标；新候选需在连续 selector 调用中胜出相应次数（离线调用方应每帧调用一次）。若旧目标不存在、失效或变为 `temp_lost/lost`，selector 不会为了防抖保留它，而是立即选择当前有效候选，或返回空。切换次数、候选数量、debounce hold 与替换原因均为诊断字段；`selection_count` 统计 selector 调用次数。
 

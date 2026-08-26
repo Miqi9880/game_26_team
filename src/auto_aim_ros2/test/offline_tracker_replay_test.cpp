@@ -1,6 +1,7 @@
 #include "auto_aim_ros2/offline_pipeline.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -539,6 +540,46 @@ TEST(OfflineTargetSelectorReplay, ConfidenceTieUsesPreviousThenCenterThenId)
   selected = id_selector.select({left_track, right_track}, kImageWidth, kImageHeight);
   ASSERT_TRUE(selected.has_value());
   EXPECT_EQ(selected->track_id, 4U);  // exact confidence + center tie: lower id
+}
+
+TEST(OfflineTargetSelectorReplay, ConfidenceEpsilonUsesGlobalMaximumAcrossPermutations)
+{
+  TargetSelectorConfig config{};
+  config.confidence_tie_epsilon = 1e-6F;
+  // Every candidate has the same image center.  Only IDs 2 and 3 are in the
+  // global epsilon band around the maximum confidence, so ID 2 must win all
+  // six input permutations.  A pairwise epsilon comparator incorrectly lets
+  // the out-of-band ID 1 participate through a non-transitive chain.
+  const std::array<TrackedTarget, 3> fixtures{
+    tracking_candidate(1, 0.0, 0.8000000F),
+    tracking_candidate(2, 0.0, 0.8000009F),
+    tracking_candidate(3, 0.0, 0.8000018F),
+  };
+  const std::array<std::array<std::size_t, 3>, 6> permutations{{
+    {{0U, 1U, 2U}},
+    {{0U, 2U, 1U}},
+    {{1U, 0U, 2U}},
+    {{1U, 2U, 0U}},
+    {{2U, 0U, 1U}},
+    {{2U, 1U, 0U}},
+  }};
+
+  for (const auto & permutation : permutations) {
+    std::vector<TrackedTarget> ordered;
+    ordered.reserve(permutation.size());
+    for (const auto index : permutation) {
+      ordered.push_back(fixtures[index]);
+    }
+    TargetSelector selector(config);
+    const auto selected = selector.select(ordered, kImageWidth, kImageHeight);
+    SCOPED_TRACE(
+      "permutation=" + std::to_string(permutation[0]) + "," +
+      std::to_string(permutation[1]) + "," + std::to_string(permutation[2]));
+    ASSERT_TRUE(selected.has_value());
+    EXPECT_EQ(selected->track_id, 2U);
+    EXPECT_EQ(selector.diagnostics().candidate_track_id,
+      std::optional<std::uint64_t>(2U));
+  }
 }
 
 TEST(OfflineTrackerReplay, InvalidInputsFailClosedAndPreserveSafeLock)

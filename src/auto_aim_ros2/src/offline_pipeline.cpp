@@ -995,36 +995,43 @@ std::optional<TrackedTarget> TargetSelector::select(
     return std::nullopt;
   }
 
-  const auto better_candidate = [&](const Candidate & candidate, const Candidate & current) {
-      const float candidate_confidence = candidate.track->observation.confidence;
-      const float current_confidence = current.track->observation.confidence;
-      if (candidate_confidence > current_confidence + config_.confidence_tie_epsilon) {
-        return true;
-      }
-      if (current_confidence > candidate_confidence + config_.confidence_tie_epsilon) {
-        return false;
-      }
-      const bool candidate_is_previous = previous_track_id_.has_value() &&
-        candidate.track->track_id == *previous_track_id_;
-      const bool current_is_previous = previous_track_id_.has_value() &&
-        current.track->track_id == *previous_track_id_;
-      if (candidate_is_previous != current_is_previous) {
-        return candidate_is_previous;
-      }
-      if (candidate.center_distance_px < current.center_distance_px - kFiniteEpsilon) {
-        return true;
-      }
-      if (current.center_distance_px < candidate.center_distance_px - kFiniteEpsilon) {
-        return false;
-      }
-      return candidate.track->track_id < current.track->track_id;
-    };
-  const Candidate * ranked = &candidates.front();
+  // Do not fold confidence with pairwise epsilon comparisons: that relation
+  // is non-transitive (A~B, B~C, but A !~ C) and can make the result depend on
+  // detector vector order.  First establish one global confidence anchor,
+  // then apply the remaining deterministic tie-breaks to that fixed set.
+  const float maximum_confidence = std::max_element(
+    candidates.begin(), candidates.end(), [](const Candidate & lhs, const Candidate & rhs) {
+      return lhs.track->observation.confidence < rhs.track->observation.confidence;
+    })->track->observation.confidence;
+  std::vector<const Candidate *> confidence_candidates;
+  confidence_candidates.reserve(candidates.size());
+  for (const auto & candidate : candidates) {
+    if (maximum_confidence - candidate.track->observation.confidence <=
+      config_.confidence_tie_epsilon)
+    {
+      confidence_candidates.push_back(&candidate);
+    }
+  }
+
+  const auto previous_it = std::find_if(
+    confidence_candidates.begin(), confidence_candidates.end(), [&](const Candidate * candidate) {
+      return previous_track_id_.has_value() && candidate->track->track_id == *previous_track_id_;
+    });
+  const Candidate * ranked = previous_it != confidence_candidates.end() ? *previous_it : nullptr;
+  if (ranked == nullptr) {
+    // The confidence set is fixed globally.  Use exact center distance and
+    // then track ID as a total, order-independent tie-break.
+    ranked = *std::min_element(
+      confidence_candidates.begin(), confidence_candidates.end(), [](const Candidate * lhs,
+        const Candidate * rhs) {
+        if (lhs->center_distance_px != rhs->center_distance_px) {
+          return lhs->center_distance_px < rhs->center_distance_px;
+        }
+        return lhs->track->track_id < rhs->track->track_id;
+      });
+  }
   const Candidate * previous = nullptr;
   for (const auto & candidate : candidates) {
-    if (better_candidate(candidate, *ranked)) {
-      ranked = &candidate;
-    }
     if (previous_track_id_.has_value() && candidate.track->track_id == *previous_track_id_) {
       previous = &candidate;
     }

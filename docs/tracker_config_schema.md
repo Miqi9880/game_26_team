@@ -48,7 +48,7 @@ Track 只做相邻观测的有限差分速度，首帧速度为 0；不做未经
 
 | 字段 | 类型 | 默认值 | 约束 | 含义 |
 |---|---:|---:|---|---|
-| `confidence_tie_epsilon` | float | `1e-6` | finite, ≥ 0 | 两个置信度被视为近似相等的范围 |
+| `confidence_tie_epsilon` | float | `1e-6` | finite, ≥ 0 | 与本帧全局最高 confidence 的差值上限；固定近似相等候选集合 |
 | `switch_debounce_frames` | int | 1 | > 0 | 替代目标连续胜出的选择次数；1 表示立即切换 |
 
 Selector 永远只返回有效 `tracking` 轨迹。防抖只在上一目标仍是有效 `tracking` 候选时保留它；旧目标变成 `temp_lost`、`lost` 或无效时立即丢弃，绝不为了稳定性返回陈旧目标。防抖计数作用于连续 selector 调用，离线调用方应每帧调用一次；诊断会记录调用数、候选数、切换数、防抖保留数和切换原因。这些统计不是实车稳定性或命中率。

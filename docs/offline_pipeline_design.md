@@ -46,10 +46,10 @@ tracking → temp_lost → lost
 
 只从有效的 `Tracking` track 中选择目标，规则固定为：
 
-1. confidence 最高；
-2. 置信度近似相等时优先上一帧 `track_id`；
+1. 先求候选中的全局最高 confidence；
+2. 取与最高值之差不超过 `confidence_tie_epsilon` 的固定集合，并优先保留上一目标；
 3. 再按 bbox 中心到图像中心的距离；
-4. 最后按 `track_id` 做确定性排序。
+4. 最后按 `track_id` 做确定性排序。不使用逐对 epsilon 比较，避免非传递关系造成输入顺序依赖。
 
 可选 `switch_debounce_frames` 仅在上一目标仍是有效 `Tracking` 候选时，要求替代目标在连续的 selector 调用中胜出相应次数；如果上一目标失效、`temp_lost` 或 `lost`，selector 立即放弃它，绝不因为防抖返回陈旧目标。每次调用（包括无候选的安全返回）记录候选数、切换/防抖次数和原因。当前 API 没有额外 frame token，因此离线调用方应每帧调用一次 selector。
 

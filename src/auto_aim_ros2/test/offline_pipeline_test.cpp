@@ -1,8 +1,11 @@
 #include "auto_aim_ros2/offline_pipeline.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -14,6 +17,7 @@ using rm_auto_aim::offline::AimerMode;
 using rm_auto_aim::offline::OfflineTracker;
 using rm_auto_aim::offline::TargetObservation;
 using rm_auto_aim::offline::TargetSelector;
+using rm_auto_aim::offline::TargetSelectorConfig;
 using rm_auto_aim::offline::TrackedTarget;
 using rm_auto_aim::offline::TrackerConfig;
 using rm_auto_aim::offline::TrackingState;
@@ -283,6 +287,45 @@ TEST(TargetSelector, ConfidenceIsPrimaryAndSelectionIsDeterministic)
   const auto repeated = selector.select({high, low}, 1280, 800);
   ASSERT_TRUE(repeated.has_value());
   EXPECT_EQ(repeated->track_id, 2U);
+}
+
+TEST(TargetSelector, ConfidenceEpsilonUsesGlobalMaximumAcrossPermutations)
+{
+  TargetSelectorConfig config{};
+  config.confidence_tie_epsilon = 1e-6F;
+  // The first two confidence gaps are within epsilon, while the lowest
+  // candidate is outside the global epsilon band around the maximum.  All
+  // boxes share the same center so the ID tie-break is the only secondary
+  // ordering; a pairwise epsilon chain must not let ID 1 or 3 win.
+  const std::array<TrackedTarget, 3> fixtures{
+    tracked(1, 0.8000000F, 640.0F),
+    tracked(2, 0.8000009F, 640.0F),
+    tracked(3, 0.8000018F, 640.0F),
+  };
+  const std::array<std::array<std::size_t, 3>, 6> permutations{{
+    {{0U, 1U, 2U}},
+    {{0U, 2U, 1U}},
+    {{1U, 0U, 2U}},
+    {{1U, 2U, 0U}},
+    {{2U, 0U, 1U}},
+    {{2U, 1U, 0U}},
+  }};
+
+  for (const auto & permutation : permutations) {
+    std::vector<TrackedTarget> ordered;
+    ordered.reserve(permutation.size());
+    for (const auto index : permutation) {
+      ordered.push_back(fixtures[index]);
+    }
+    TargetSelector selector(config);
+    const auto selected = selector.select(ordered, 1280, 800);
+    SCOPED_TRACE(
+      "permutation=" + std::to_string(permutation[0]) + "," +
+      std::to_string(permutation[1]) + "," + std::to_string(permutation[2]));
+    ASSERT_TRUE(selected.has_value());
+    EXPECT_EQ(selected->track_id, 2U);
+    EXPECT_EQ(selector.diagnostics().candidate_track_id, std::optional<std::uint64_t>(2U));
+  }
 }
 
 TEST(TargetSelector, PreviousTrackBreaksConfidenceTieThenCenterAndIdBreakTies)

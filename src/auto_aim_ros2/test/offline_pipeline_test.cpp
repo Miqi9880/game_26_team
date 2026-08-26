@@ -1,8 +1,11 @@
 #include "auto_aim_ros2/offline_pipeline.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -14,6 +17,7 @@ using rm_auto_aim::offline::AimerMode;
 using rm_auto_aim::offline::OfflineTracker;
 using rm_auto_aim::offline::TargetObservation;
 using rm_auto_aim::offline::TargetSelector;
+using rm_auto_aim::offline::TargetSelectorConfig;
 using rm_auto_aim::offline::TrackedTarget;
 using rm_auto_aim::offline::TrackerConfig;
 using rm_auto_aim::offline::TrackingState;
@@ -135,6 +139,21 @@ TEST(OfflineTracker, InvalidPnPAndBadEvidenceNeverLock)
   const auto depth_update = tracker.update(std::vector<TargetObservation>{negative_depth}, 20);
   EXPECT_TRUE(depth_update.rejected);
   EXPECT_TRUE(depth_update.tracks.empty());
+
+  auto unsupported_armor = observation(30, 0, 0.0, 0.0, 0.0);
+  unsupported_armor.armor_size = static_cast<rm_auto_aim::pnp::ArmorSize>(99);
+  const auto armor_update = tracker.update(
+    std::vector<TargetObservation>{unsupported_armor}, 30);
+  EXPECT_TRUE(armor_update.rejected);
+  EXPECT_TRUE(armor_update.tracks.empty());
+
+  auto conflicting_armor = observation(40, 0, 0.0, 0.0, 0.0);
+  conflicting_armor.raw_detection.armor_type =
+    rm_auto_aim::detector::RawArmorDetection::ArmorTypeHint::Large;
+  const auto conflicting_update = tracker.update(
+    std::vector<TargetObservation>{conflicting_armor}, 40);
+  EXPECT_TRUE(conflicting_update.rejected);
+  EXPECT_TRUE(conflicting_update.tracks.empty());
 }
 
 TEST(OfflineTracker, TemporaryAndLongLossUnlock)
@@ -196,6 +215,11 @@ TEST(OfflineTracker, NegativeTimestampReportsSafeDiagnosticState)
   ASSERT_TRUE(invalid.primary_track.has_value());
   EXPECT_EQ(invalid.state, TrackingState::TempLost);
   EXPECT_EQ(invalid.primary_track->state, TrackingState::TempLost);
+  // The safety state is persistent as well as diagnostic: callers that read
+  // the tracker directly cannot keep a lock after a corrupt frame clock.
+  EXPECT_EQ(tracker.state(), TrackingState::TempLost);
+  ASSERT_EQ(tracker.tracks().size(), 1U);
+  EXPECT_FALSE(tracker.tracks().front().target_lock());
 }
 
 TEST(OfflineTracker, PositionAndAngleJumpsAreRejectedWithoutReplacingEvidence)
@@ -265,6 +289,45 @@ TEST(TargetSelector, ConfidenceIsPrimaryAndSelectionIsDeterministic)
   EXPECT_EQ(repeated->track_id, 2U);
 }
 
+TEST(TargetSelector, ConfidenceEpsilonUsesGlobalMaximumAcrossPermutations)
+{
+  TargetSelectorConfig config{};
+  config.confidence_tie_epsilon = 1e-6F;
+  // The first two confidence gaps are within epsilon, while the lowest
+  // candidate is outside the global epsilon band around the maximum.  All
+  // boxes share the same center so the ID tie-break is the only secondary
+  // ordering; a pairwise epsilon chain must not let ID 1 or 3 win.
+  const std::array<TrackedTarget, 3> fixtures{
+    tracked(1, 0.8000000F, 640.0F),
+    tracked(2, 0.8000009F, 640.0F),
+    tracked(3, 0.8000018F, 640.0F),
+  };
+  const std::array<std::array<std::size_t, 3>, 6> permutations{{
+    {{0U, 1U, 2U}},
+    {{0U, 2U, 1U}},
+    {{1U, 0U, 2U}},
+    {{1U, 2U, 0U}},
+    {{2U, 0U, 1U}},
+    {{2U, 1U, 0U}},
+  }};
+
+  for (const auto & permutation : permutations) {
+    std::vector<TrackedTarget> ordered;
+    ordered.reserve(permutation.size());
+    for (const auto index : permutation) {
+      ordered.push_back(fixtures[index]);
+    }
+    TargetSelector selector(config);
+    const auto selected = selector.select(ordered, 1280, 800);
+    SCOPED_TRACE(
+      "permutation=" + std::to_string(permutation[0]) + "," +
+      std::to_string(permutation[1]) + "," + std::to_string(permutation[2]));
+    ASSERT_TRUE(selected.has_value());
+    EXPECT_EQ(selected->track_id, 2U);
+    EXPECT_EQ(selector.diagnostics().candidate_track_id, std::optional<std::uint64_t>(2U));
+  }
+}
+
 TEST(TargetSelector, PreviousTrackBreaksConfidenceTieThenCenterAndIdBreakTies)
 {
   TargetSelector selector;
@@ -306,7 +369,8 @@ TEST(TargetSelector, NonTrackingAndInvalidTracksAreFiltered)
   TargetSelector selector;
   auto detecting = tracked(1, 0.99F, 640.0F, TrackingState::Detecting);
   auto invalid = tracked(2, 0.9F, 640.0F);
-  invalid.observation.geometry_known = false;
+  invalid.observation.confidence = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(invalid.target_lock());
   EXPECT_FALSE(selector.select({detecting, invalid}, 1280, 800).has_value());
 }
 
@@ -393,6 +457,18 @@ TEST(OfflineAimer, NonFiniteTrackedMotionCannotBecomeLockableOutput)
   rm_auto_aim::offline::SafeOfflineAimer aimer;
   auto selected = tracked(1, 0.8F, 640.0F);
   selected.yaw_vel_rad_s = std::numeric_limits<double>::quiet_NaN();
+  const auto output = aimer.aim(selected);
+  EXPECT_EQ(output.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(output.fire_command, rm_auto_aim::pipeline::kFireNone);
+}
+
+TEST(OfflineAimer, MalformedTrackingEvidenceCannotBecomeLockableOutput)
+{
+  rm_auto_aim::offline::SafeOfflineAimer aimer;
+  auto selected = tracked(1, 0.8F, 640.0F);
+  selected.observation.raw_detection.armor_type =
+    rm_auto_aim::detector::RawArmorDetection::ArmorTypeHint::Large;
+  EXPECT_FALSE(selected.target_lock());
   const auto output = aimer.aim(selected);
   EXPECT_EQ(output.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
   EXPECT_EQ(output.fire_command, rm_auto_aim::pipeline::kFireNone);

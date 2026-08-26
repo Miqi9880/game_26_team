@@ -39,10 +39,35 @@
 开火能力已经完成。任何来自 Feishu/论坛的参数、坐标轴、接口或阈值仍须由队内逐项确认后才能进入
 production 配置。
 
+### 1.2 同济 `sp_vision_25` 的本轮只读参考
+
+本轮额外只读查看了以下本地文件：
+
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/tracker.hpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/tracker.cpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/target.hpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/target.cpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/aimer.hpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/aimer.cpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/solver.hpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/solver.cpp`
+- `/home/ubuntu22/vision-study/sp_vision_25/LICENSE`
+
+可借鉴的是 `lost/detecting/tracking/temp_lost` 的显式状态机、失锁超时、候选替代的防抖意图、
+发散/异常可诊断化，以及用离线序列验证状态演进的工程做法。本仓库据此重新实现 camera-frame
+关联、输入顺序确定性、观测门限、轨迹统计和 selector 防抖；没有复制同济源码。
+
+明确未引入同济的 `steady_clock::now()` 时间来源、11 维 EKF、协方差/过程噪声、world 坐标、
+quaternion 推导、车辆半径、装甲尺寸/高度、固定分辨率、颜色/车型/前哨站优先级、弹速/延迟/枪口
+偏置、Aimer/Planner/MPC/Shooter、`io/cboard.*`、`io/gimbal/*`、串口或完整 main 循环。虽然该仓库
+为 MIT License（Copyright 2025 TongjiSuperPower），本轮无实质代码复制，故没有把其代码或参数作为
+项目实现/配置来源；若未来复制受保护表达，将保留版权与 MIT 文本并在 PR 明示。
+
 本轮审查补充：`auto_aim_pnp_smoke` 和 `auto_aim_offline` 现在必须显式提供版本化
 `--model-profile`；test-only 模型和 PnP 配置分别需要显式 opt-in，避免离线链路静默使用未审查
-的旧模型语义。`OfflineTracker` 对负数、回退和重复时间戳返回安全快照时，会同步报告
-`TempLost` 状态；这只是诊断一致性修复，不代表增加了正式预测或多目标稳定性能力。
+的旧模型语义。`OfflineTracker` 对负数、回退和重复时间戳会返回安全快照，并将活动持久轨迹
+置为 `TempLost`，因此直接读取 tracker 状态也不能继续锁定；这只是诊断/安全闩修复，不代表
+增加了正式预测或多目标稳定性能力。
 
 ## 2. RoboMaster 论坛
 

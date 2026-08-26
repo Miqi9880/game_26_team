@@ -7,8 +7,17 @@
 - `VisionData` 从下位机到上位机，`RobotCtrlData` 从上位机到下位机；两者的位置角使用同一个“上电姿态为原点”的相对控制参考系。
 - `yaw`、`pitch`、`roll` 的外部单位为 `degree`；外部速度为 `degree/s`；外部加速度为 `degree/s²`。
 - 算法内部位置、速度、加速度分别使用 `rad`、`rad/s`、`rad/s²`。唯一的角度转换点是 `auto_aim_ros2` 的 ROS/算法适配层；串口映射层只复制字段。
+- 协议中的 C/C++ `float` 仅按 IEEE-754 binary32（fp32）记录和实现；这项类型约定不自动证明 MCU/主机的字节序、packed 对齐或线上序列化布局。即使构建使用 hard-float ABI，也不能把 ABI 选择当作已经取得线上端序或序列化证据。
 - 四元数顺序是 `w,x,y,z`，记录的是相对上电原点的姿态证据。本阶段不解释旋转方向、乘法约定或 world 轴，也不用于旋转、积分、坐标变换或预测。
 - PnP 的 `relative_yaw_rad`、`relative_pitch_rad` 是相机几何相对角，不能直接作为共享上电参考系中的 `RobotCtrl.yaw/pitch` 绝对目标；正式 camera→control 外参和零点仍需实测确认。
+
+## 协议字段与帧证据边界
+
+- `VisionData` 使用命令号 `0x0105`，payload 为 47 bytes，主线接收帧边界为 58 bytes，CRC16 后带 `0D 0A`。
+- `RobotCtrlData` 使用命令号 `0x0102`，payload 为 26 bytes，主线下发帧边界为 35 bytes，CRC16 后不追加 `0D 0A`。
+- CRC8/CRC16 的当前软件回归约定分别使用初值 `0xFF`/`0xFFFF`；CRC16 写入顺序为低字节在前、高字节在后。软件向量和 loopback 只证明本地实现，不能被写成 MCU raw-hex golden frame。
+- `bullet_count` 仅记录累计发送次数，不代表剩余弹量，也不参与目标、弹道或开火决策；`game_progress` 保留为历史协议字段并只记录，不参与算法。
+- `fire_command` 在当前所有离线、dry-run 和安全控制路径必须保持 `0`；在电控确认 `1/2` 的脉冲/电平、保持时间和停止规则前，不得发送非零值。
 
 ## 车型 profile 和位置约束
 
@@ -37,4 +46,6 @@ Yaw 在输出边界归一化到闭区间 `[-180, 180]` degree。NaN、Inf、非�
 
 ## 仍待确认
 
-`115200` 仅是现有串口路径的历史兼容默认值，不是已确认的实车波特率。固定 CRC8/CRC16 测试向量只提供软件回归证据，也不代替真实 golden frame 或硬件 CRC 权威实现。真实 golden frame、MCU/Orin 端序和 FP32 ABI、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序仍不得猜测。
+通信链路确认是 **CDC USB**，因此本链路不应被描述为需要统一 UART 波特率；代码中的 `115200` 仅保留为历史兼容参数，不能写成已确认的物理波特率或 USB line coding。当前没有 MCU 提供的原始十六进制（raw-hex） golden frame，也没有真实 CDC 收发硬件验证；软件 CRC 向量、loopback 和 parser 测试只证明软件回归行为，不能替代这两类现场证据。
+
+仍待确认的项目包括：真实 golden frame、MCU/Orin 端序与 FP32 ABI/packing 的现场一致性、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序。上述事项未闭环前不得猜测或扩大硬件联调范围。

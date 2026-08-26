@@ -56,6 +56,33 @@ HeaderStamp to_stamp(const builtin_interfaces::msg::Time & stamp)
   return HeaderStamp{stamp.sec, stamp.nanosec, true};
 }
 
+std::string reliability_name(rclcpp::ReliabilityPolicy policy)
+{
+  return policy == rclcpp::ReliabilityPolicy::BestEffort ? "best_effort" :
+         policy == rclcpp::ReliabilityPolicy::Reliable ? "reliable" : "unknown";
+}
+
+std::string durability_name(rclcpp::DurabilityPolicy policy)
+{
+  return policy == rclcpp::DurabilityPolicy::Volatile ? "volatile" :
+         policy == rclcpp::DurabilityPolicy::TransientLocal ? "transient_local" : "unknown";
+}
+
+std::string history_name(rclcpp::HistoryPolicy policy)
+{
+  return policy == rclcpp::HistoryPolicy::KeepLast ? "keep_last" :
+         policy == rclcpp::HistoryPolicy::KeepAll ? "keep_all" : "unknown";
+}
+
+PublisherEndpointSample publisher_sample(const rclcpp::TopicEndpointInfo & endpoint)
+{
+  const auto & qos = endpoint.qos_profile();
+  return PublisherEndpointSample{
+    endpoint.topic_type(), reliability_name(qos.reliability()),
+    durability_name(qos.durability()), history_name(qos.history()), qos.depth(),
+  };
+}
+
 template<typename Message, typename Callback>
 typename rclcpp::Subscription<Message>::SharedPtr create_read_only_subscription(
   const rclcpp::node_interfaces::NodeTopics::SharedPtr & topics,
@@ -137,13 +164,36 @@ RosInputPreflightNode::get_node_graph_interface() const
   return impl_->node_graph_;
 }
 
+void RosInputPreflightNode::inspect_graph_contract()
+{
+  const auto inspect = [&](const std::string & topic, const std::string & expected_type) {
+      std::vector<PublisherEndpointSample> publishers;
+      const auto endpoints = impl_->node_graph_->get_publishers_info_by_topic(topic);
+      publishers.reserve(endpoints.size());
+      for (const auto & endpoint : endpoints) {
+        publishers.push_back(publisher_sample(endpoint));
+      }
+      impl_->analyzer_->observe_topic_publishers(topic, expected_type, publishers);
+    };
+
+  try {
+    inspect(kImageTopic, kExpectedImageType);
+    inspect(kCameraInfoTopic, kExpectedCameraInfoType);
+  } catch (const std::exception & error) {
+    impl_->analyzer_->record_callback_error("ros_graph", error.what());
+  } catch (...) {
+    impl_->analyzer_->record_callback_error("ros_graph", "unknown exception");
+  }
+}
+
 void RosInputPreflightNode::on_image(
   const sensor_msgs::msg::Image::ConstSharedPtr & message)
 {
   try {
     impl_->analyzer_->observe_image(
       ImageSample{
-        to_stamp(message->header.stamp), message->width, message->height,
+        to_stamp(message->header.stamp), message->header.frame_id,
+        message->width, message->height,
         message->encoding, message->step, message->data.size(),
       },
       monotonic_seconds());
@@ -160,6 +210,7 @@ void RosInputPreflightNode::on_camera_info(
   try {
     impl_->analyzer_->observe_camera_info(
       CameraInfoSample{
+        to_stamp(message->header.stamp), message->header.frame_id,
         message->width, message->height, message->distortion_model,
         std::vector<double>(message->k.begin(), message->k.end()), message->d,
       },

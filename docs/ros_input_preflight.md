@@ -2,6 +2,9 @@
 
 `auto_aim_tools/ros_input_preflight` 是 C++17 与 `rclcpp` 实现的独立只读诊断工具，用于接入 Orin、真实相机或实车前检查输入。它只订阅：
 
+相机到检测链路的完整字段契约、启动顺序和故障表见
+[`camera_ros_input_contract.md`](camera_ros_input_contract.md)。
+
 - `/image_raw`（`sensor_msgs/msg/Image`）
 - `/camera_info`（`sensor_msgs/msg/CameraInfo`）
 - `/Vision_data`（`auto_aim_interfaces/msg/Vision`）
@@ -30,7 +33,12 @@ ament_xmllint src/auto_aim_tools/package.xml
 git diff --check
 ```
 
-`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖格式、typed encoding 算术溢出与其他边界；`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖正常输入、缺 topic、空图、非法 `CameraInfo`、Header 时间戳回退、停止发布后超时、非法 Vision 字段，并检查节点图只有三个输入订阅。`process_contract_test.cpp` 启动真实可执行程序，用标准 JSON parser 解析报告，并验证正常、FAIL、SIGINT 的退出码、`ros2 run` 的失败路径，以及异常 Image、CameraInfo、Vision 的 `overall`、finding 状态和原因。当前 ROS Humble 验证包含 34 个 GTest case，`colcon test-result` 汇总为 37 项、0 error、0 failure、0 skipped；测试不连接硬件。
+`preflight_analyzer_test.cpp` 用普通 C++ sample 覆盖消息字段、配对和 graph finding；
+`fake_ros_publishers_test.cpp` 使用 `rclcpp` fake publisher 覆盖有效 rgb8、缺 CameraInfo、
+K/D、宽高、frame_id、encoding、stride、data、时间戳、topic 和 QoS 错误，并检查节点图只有
+三个输入订阅且没有 publisher/service/client。`process_contract_test.cpp` 启动真实预检进程，
+验证参数错误、正常/失败退出、SIGINT、SIGTERM、重复停止和强制退出后的回收。测试不连接 SDK
+或硬件；准确 case 数和结果以本提交的 `colcon test-result --verbose` 为准。
 
 ## Orin 与实车前执行
 
@@ -43,6 +51,7 @@ source install/setup.bash
 ros2 run auto_aim_tools ros_input_preflight \
   --duration 10 \
   --timeout 1.0 \
+  --expected-frame-id camera_optical_frame \
   --vehicle-profile new_turtle \
   --format text
 ```
@@ -61,6 +70,7 @@ ros2 run auto_aim_tools ros_input_preflight \
 ros2 run auto_aim_tools ros_input_preflight \
   --duration 10 \
   --timeout 1.0 \
+  --expected-frame-id camera_optical_frame \
   --vehicle-profile dog_leg \
   --format json \
   --output /tmp/ros_input_preflight.json
@@ -74,6 +84,7 @@ ros2 run auto_aim_tools ros_input_preflight \
 ros2 run auto_aim_tools ros_input_preflight \
   --duration 10 \
   --timeout 1.0 \
+  --expected-frame-id camera_optical_frame \
   --vehicle-profile new_turtle \
   --assume-shared-clock-domain \
   --sync-tolerance-ms 50
@@ -87,7 +98,7 @@ ros2 run auto_aim_tools ros_input_preflight \
 
 - `PASS`：本次观测满足该项可验证的格式要求。
 - `WARN`：信息不足、统计样本不足或需人工确认；不应被写成已验证。
-- `FAIL`：缺 topic、格式/有限值/范围错误、时间戳回退或接收超时。
+- `FAIL`：缺/重复/wrong-type topic、可确认的 QoS 错误、格式/有限值/范围错误、Image/CameraInfo 配对错误、时间戳缺失/回退或接收超时。
 
 进程在存在 `FAIL` 时返回退出码 `2`，只有 `PASS/WARN` 时返回 `0`，收到 Ctrl-C 时返回 `130`。瞬时坏帧不会被后续正常帧覆盖；异常回调被记录为 `FAIL`，工具继续收集并输出报告。
 
@@ -95,8 +106,9 @@ ros2 run auto_aim_tools ros_input_preflight \
 
 ```text
 ROS 2 INPUT PREFLIGHT: WARN
-[PASS] /image_raw image.encoding: Encoding has a known byte width | bytes_per_pixel=3, encoding=bgr8
+[PASS] /image_raw image.encoding: Image encoding matches the camera contract | actual=rgb8, expected=rgb8
 [PASS] /camera_info camera_info.K: K has 9 finite entries with positive fx/fy and non-zero K[8] | length=9
+[PASS] cross_topic image_camera.timestamp_pairing: Every Image has a CameraInfo with the exact same non-zero Header timestamp
 [PASS] /Vision_data vision.yaw_range: yaw is within inclusive [-180 degree, 180 degree] | yaw=12.5 degree
 [WARN] /Vision_data vision.acceleration_finite: Installed Vision interface has no acceleration field; degree/s^2 check is unavailable
 [WARN] cross_topic image_vision.clock_domain: Shared clock domain was not explicitly declared: 时间基准未确认; timestamps were not compared
@@ -111,12 +123,13 @@ quaternion 只检查恰为 4 项、接口声明顺序为 `wxyz` 且元素有限�
 
 - 当前 `origin/main` 的 `auto_aim_interfaces/msg/Vision.msg` 没有 `yaw_acc`、`pitch_acc` 字段。工具兼容未来字段；当前运行会明确 `WARN`“无法检查”，不会修改接口补字段。
 - 频率使用本机单调时钟和订阅到达时间统计，不等同于传感器曝光频率、端到端延迟或 DDS 无丢包证明。
-- 未知图像 encoding 会 `WARN`；仍检查正 `step` 及 `len(data) == step * height`。工具不解码像素，也不启动相机验证画质。
+- 相机到检测契约只接受 `rgb8`；其他 encoding 直接 `FAIL`。同时要求 `step == width * 3` 和 `len(data) == step * height`。工具不解码像素，也不启动相机验证画质。
 - `CameraInfo` 检查尺寸、K、D、有限值及常见 distortion model 的长度，不验证标定精度、外参或重投影误差。
-- 仅检查各自 topic 内 Header 时间戳单调性。跨 Image/Vision 比较必须显式声明共同时间域，比较结果也不是同步证明。
+- Image 与 CameraInfo 必须精确同 stamp 配对，并分别检查单调性。100 ms 只容纳观测结束时的一条最终 DDS 尾帧并报告 `WARN`；多条、中间或更旧的未配对消息失败。跨 Image/Vision 比较仍必须显式声明共同时间域，比较结果也不是同步证明。
+- Humble/Fast DDS 可能在 graph API 中把 history/depth 返回为 unknown/0。此时 best-effort/volatile 可自动检查，但 keep-last/depth 5 报告 `WARN`，必须用 `ros2 topic info -v` 人工复核。
 - quaternion 的真实方向、参考系和传感器时序未在本工具中验证。
 - fake publisher 是离线 ROS 验收证据，不替代 Orin、真实相机、下位机或实车记录。
 
 ## 回退方法
 
-运行时回退只需停止 `ros_input_preflight`；它没有发布、参数或设备状态需要恢复。代码回退应关闭该工具的启动入口，或通过 PR revert 删除 `src/auto_aim_tools` 与本文档。由于工具是独立包，回退不需要修改 `auto_aim_ros2`、`auto_aim_interfaces`、串口桥、协议或控制安全配置。
+运行时回退只需停止 `ros_input_preflight`；它没有发布、参数或设备状态需要恢复。代码回退使用交付的功能提交执行 `git revert <功能提交 SHA>`。不要使用 `reset --hard`、`checkout --` 或 `git clean`。

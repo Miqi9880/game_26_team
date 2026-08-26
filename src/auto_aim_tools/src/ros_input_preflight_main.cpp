@@ -35,6 +35,7 @@ struct Arguments
   std::string vehicle_profile{"unselected"};
   bool shared_clock_domain{false};
   double sync_tolerance_ms{50.0};
+  std::string expected_frame_id{"camera_optical_frame"};
 };
 
 double finite_number(const std::string & value, const std::string & option, bool positive)
@@ -64,12 +65,13 @@ void print_usage(std::ostream & stream)
   stream <<
     "Usage: ros_input_preflight [options] [--ros-args ...]\n"
     "  --duration SECONDS              observation duration (default: 5)\n"
-    "  --timeout SECONDS               Image/Vision timeout (default: 1)\n"
+    "  --timeout SECONDS               input topic timeout (default: 1)\n"
     "  --format text|json              report format (default: text)\n"
     "  --output PATH                   write only the report to PATH\n"
     "  --vehicle-profile PROFILE       unselected|new_turtle|dog_leg\n"
     "  --assume-shared-clock-domain    explicitly allow cross-topic comparison\n"
-    "  --sync-tolerance-ms MILLISECONDS diagnostic delta tolerance (default: 50)\n";
+    "  --sync-tolerance-ms MILLISECONDS diagnostic delta tolerance (default: 50)\n"
+    "  --expected-frame-id FRAME_ID     required Image/CameraInfo frame (default: camera_optical_frame)\n";
 }
 
 Arguments parse_arguments(const std::vector<std::string> & arguments)
@@ -107,6 +109,11 @@ Arguments parse_arguments(const std::vector<std::string> & arguments)
     } else if (option == "--sync-tolerance-ms") {
       result.sync_tolerance_ms = finite_number(
         next_value(arguments, &index, option), option, false);
+    } else if (option == "--expected-frame-id") {
+      result.expected_frame_id = next_value(arguments, &index, option);
+      if (result.expected_frame_id.empty()) {
+        throw std::invalid_argument("--expected-frame-id must not be empty");
+      }
     } else {
       throw std::invalid_argument("unknown option: " + option);
     }
@@ -130,7 +137,7 @@ int main(int argc, char ** argv)
     auto analyzer = std::make_shared<auto_aim_tools::PreflightAnalyzer>(
       auto_aim_tools::PreflightConfig{
       arguments.timeout_s, arguments.vehicle_profile, arguments.shared_clock_domain,
-      arguments.sync_tolerance_ms,
+      arguments.sync_tolerance_ms, arguments.expected_frame_id,
     },
       start_s);
     auto node = std::make_shared<auto_aim_tools::RosInputPreflightNode>(analyzer);
@@ -145,6 +152,7 @@ int main(int argc, char ** argv)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    node->inspect_graph_contract();
     const auto report = analyzer->build_report(auto_aim_tools::monotonic_seconds());
     const auto rendered = arguments.format == "json" ?
       auto_aim_tools::format_report_json(report) :

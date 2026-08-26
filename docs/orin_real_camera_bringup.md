@@ -4,6 +4,9 @@
 截至本文编写时，没有在 Orin 上编译，也没有连接真实相机、串口或机器人；文中的命令是
 上线前的检查流程，不代表硬件验证已经通过。
 
+ROS Image/CameraInfo 的精确字段、QoS、配对规则和预检启动顺序以
+[`camera_ros_input_contract.md`](camera_ros_input_contract.md) 为准。
+
 ## 1. 当前审计结论
 
 | 组件 | 当前仓库依赖 | 当前证据/状态 | 上线前动作 |
@@ -22,19 +25,10 @@
 `cv_bridge::toCvShare` 或 `toCvCopy`，必须同步在 `auto_aim_ros2/package.xml`、CMake 和 Orin
 安装清单中增加 `cv_bridge`，并重新验证 encoding、step 和 QoS；不能只安装但不说明边界。
 
-相机节点还有两项必须在真实硬件前单独复核的实现风险（本阶段不改核心代码）：
-
-- `hik_camera_node.cpp` 预留图像缓冲区使用 `reserve()`，但像素转换前把
-  `image_msg_.data.size()` 作为目标缓冲区长度；`reserve()` 不改变 size，SDK 可能因此收到
-  长度为 0 的目标缓冲区。首次相机联调必须观察转换返回码和实际图像字节数；若失败，应在
-  相机代码任务中改为显式 `resize(max_width * max_height * 3)` 后再传长度，并加回归测试。
-- `config/camera_params.yaml` 含 `balance_ratio_r/g/b` 覆盖项，但节点当前只在
-  `declareParameters()` 中声明曝光和增益。不同 ROS 2 参数严格程度下这些覆盖项可能被拒绝或
-  未真正应用；上车前需确认启动日志和 `ros2 param get`，必要时在相机代码任务中补齐声明。
-
-节点还会枚举 USB 列表并直接使用第一台设备，且对创建/打开/转换失败的返回码检查不完整。
-初次联调应只连接一台目标相机，并把 SDK 返回码、型号、序列号和帧尺寸写入记录；不能把
-“节点进程启动”当作“图像链路有效”。
+相机节点已经使用实际 rgb8 size 执行 `resize()`，检查转换输出长度，声明白平衡参数，并对
+枚举、创建、打开、转换、释放和停止路径保留 SDK 状态诊断。没有显式序列号时只允许恰好
+一台相机；多台、找不到指定序列号或序列号重复都会拒绝启动。这些是 compile-check 与纯 C++
+回归覆盖的代码边界，不是 MVS SDK 或真实 USB 相机已验证的证据。
 
 ## 2. WSL 基线检查（只读）
 
@@ -152,8 +146,8 @@ OpenVINO CMake 配置存在；仓库内海康 SDK 动态库为空。`camera_info
 
 ### 4.1 启动前检查
 
-相机节点 `hik_camera` 当前只枚举 USB 设备并硬编码选择枚举列表中的第一台相机。接入多台
-相机时不能凭设备顺序判断目标；应先只连接目标相机，并在日志中记录序列号/型号。启动前检查：
+相机节点 `hik_camera` 在只发现一台相机时允许隐式选择；接入多台时必须用 `camera_serial`
+精确指定且序列号必须唯一。仍应在日志中记录序列号/型号。启动前检查：
 
 ```bash
 lsusb
@@ -167,23 +161,24 @@ MVS/USB 访问失败、设备数为 0、SDK 版本不匹配时应停止，不要
 
 ### 4.2 相机内参和参数文件
 
-`src/ros2-hik-camera/config/camera_info.yaml` 当前含有 1440×1080 的候选 K/D，但缺少序列号、
-镜头、标定日期、标定板规格和重投影报告；它只能作为格式示例，不能作为 production 标定
-证据。正式文件应复制到受控路径并记录：
+`src/ros2-hik-camera/config/camera_info.yaml` 是零尺寸、零 K 的不可用格式示例；节点在硬件
+初始化前按规范路径和文件身份拒绝它的 URL/文件别名，不能作为 production 标定证据。
+正式文件应生成到外部受控路径并记录：
 
 - 相机序列号、镜头和固件；
 - 原始图像宽高、像素格式、裁剪/缩放/letterbox；
 - `K`、`D`、畸变模型和重投影误差；
 - 标定板类型、尺寸、采集日期、工具和版本。
 
-当前节点默认 `camera_name: narrow_stereo`、`camera_info_url: package://hik_camera/config/camera_info.yaml`，
-默认曝光 3000、增益 15。上车前必须通过 launch 参数显式替换为实测文件，并确认相机发布的
-分辨率与 PnP YAML 完全一致；不允许用 `CameraInfo.P` 冒充原始图像的 `K`，也不允许自动猜测
-缩放比例。
+当前节点默认 `camera_name: narrow_stereo`、`camera_info_url: ""`、
+`frame_id: camera_optical_frame`、`use_sensor_data_qos: true`，默认曝光 3000、增益 15。
+URL 为空时发布明确未标定的 K/D，预检会失败。仓库内候选 YAML 的 package URI 被显式拒绝；
+上车前必须通过 launch 参数提供受控的实测文件，并确认相机发布分辨率与 PnP YAML 完全一致。
+不允许用 `CameraInfo.P` 冒充原始图像的 `K`，也不允许自动猜测缩放比例。
 
-相机节点的 `image_raw` 是相对 topic 名称；如果 launch 时使用 namespace，最终 topic 可能不再
-是根命名空间的 `/image_raw`。当前 `auto_aim_node` 订阅绝对的 `/image_raw` 和 `/camera_info`，
-因此现场必须保持根命名空间或显式 remap，并在 `ros2 topic list` 中记录最终名称。
+相机节点固定发布根 topic `/image_raw` 和 `/camera_info`，与当前 `auto_aim_node` 的绝对订阅
+一致。不要用 remap 或第二个 fake publisher 绕过预检；必须在 `ros2 topic list` 和
+`ros2 topic info -v` 中记录最终 graph。
 
 ### 4.3 话题、编码和 QoS
 
@@ -191,6 +186,7 @@ MVS/USB 访问失败、设备数为 0、SDK 版本不匹配时应停止，不要
 
 ```bash
 ros2 launch hik_camera hik_camera.launch.py \
+  frame_id:=camera_optical_frame \
   use_sensor_data_qos:=true \
   camera_info_url:=file:///absolute/path/to/verified_camera_info.yaml
 ```
@@ -235,6 +231,20 @@ fire_command=0
 ROS 节点。串口设备权限、波特率和 RobotCtrl golden frame 未经电控确认前，不得启动会打开
 `/dev/tty*` 的配置；`fire_command=1/2` 不属于本阶段验证范围。
 
+检测节点启动前先单独运行只读预检并保存报告：
+
+```bash
+ros2 run auto_aim_tools ros_input_preflight \
+  --duration 10 \
+  --timeout 1.0 \
+  --expected-frame-id camera_optical_frame \
+  --format json \
+  --output /tmp/ros_input_preflight.json
+```
+
+存在任何 `FAIL` 都必须停止，不得继续启动检测。预检本身没有 publisher，不能创建
+`/Robot_ctrl_data`。只有契约通过并人工复核 QoS history/depth 后，才进入下面的 null backend。
+
 推荐先用无硬件的 Null backend 验证发布器：
 
 ```bash
@@ -276,6 +286,7 @@ record_dir=/tmp/game26-bringup/${run_id}
 mkdir -p "${record_dir}"
 
 ros2 launch hik_camera hik_camera.launch.py \
+  frame_id:=camera_optical_frame \
   use_sensor_data_qos:=true \
   camera_info_url:=file:///absolute/path/to/verified_camera_info.yaml \
   2>&1 | tee "${record_dir}/hik_camera.log"

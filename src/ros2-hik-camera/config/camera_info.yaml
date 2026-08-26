@@ -1,51 +1,33 @@
-image_width: 1440
-image_height: 1080
-camera_name: narrow_stereo
-
+# INVALID UNVERIFIED FORMAT EXAMPLE ONLY. It contains no usable calibration.
+# The node rejects canonical aliases of this file before camera initialization.
+image_width: 0
+image_height: 0
+camera_name: unverified_example
 
 distortion_model: plumb_bob
 
-## 小头8mm
-# camera_matrix:
-#   rows: 3
-#   cols: 3
-#   data: [2395.480340, 0.000000, 714.096961, 0.000000, 2393.500691, 573.103961, 0.000000, 0.000000, 1.000000]
-
-##英雄8mm
 camera_matrix:
   rows: 3
   cols: 3
-  data: [2404.55024035025, 0.000000000000, 741.2746736739983,
-          0.000000000000, 2403.909723281978, 549.5916614617547,
-          0.000000000000, 0.000000000000, 1.000000000000]
+  data: [0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0]
 
-
-
-## 小头8mm
-# distortion_coefficients:
-#   rows: 1
-#   cols: 5
-#   data: [-0.022111, 0.020275, -0.000261, 0.000434, 0.000000]
-
-##英雄8mm
 distortion_coefficients:
   rows: 1
   cols: 5
-  data: [-0.01859514952299835, 0.3885509747958853, -0.0006131890704244383, -0.0004804354342040962, 0.04876308502]
-
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
 
 rectification_matrix:
   rows: 3
   cols: 3
-  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
 
 projection_matrix:
   rows: 3
   cols: 4
-  data: [2389.439697, 0.000000, 713.864724, 0.000000, 0.000000, 2388.744873, 572.545387, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000]
-
-
-
-
-
-
+  data: [0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0]

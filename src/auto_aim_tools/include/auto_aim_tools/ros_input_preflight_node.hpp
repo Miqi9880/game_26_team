@@ -27,6 +27,8 @@ public:
   rclcpp::node_interfaces::NodeGraphInterface::SharedPtr
   get_node_graph_interface() const;
 
+  void inspect_graph_contract();
+
 private:
   void on_image(const sensor_msgs::msg::Image::ConstSharedPtr & message);
   void on_camera_info(

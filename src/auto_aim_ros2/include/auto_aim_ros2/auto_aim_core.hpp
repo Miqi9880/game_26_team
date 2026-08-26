@@ -59,7 +59,9 @@ struct ImageFrame
 
   bool has_pixels() const noexcept
   {
-    return !bgr_image.empty() && bgr_image.type() == CV_8UC3;
+    return !bgr_image.empty() && bgr_image.type() == CV_8UC3 &&
+           width == static_cast<std::uint32_t>(bgr_image.cols) &&
+           height == static_cast<std::uint32_t>(bgr_image.rows);
   }
 };
 

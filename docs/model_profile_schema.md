@@ -17,6 +17,10 @@ the old repository, a model cache, or a model filename.  The conversion helper
 `detector_config_from_model_profile()` copies the validated tensor and
 post-processing contract into `DetectorConfig`; the detector then validates the
 actual IR input/output shape and element type again at OpenVINO initialization.
+For `profile: production`, the C++ loader also requires a syntactically valid
+`model.sha256` declaration before converting the profile. The read-only
+qualification tool compares that declaration to the artifact bytes; no model
+path or digest is inferred from a filename or cache.
 
 The detector smoke tool accepts the contract when supplied, while retaining a
 deliberate unprofiled legacy smoke path for inspecting the old reference IR.
@@ -103,6 +107,46 @@ configured tensor offsets.  Keypoint order must be a permutation of
 `[0,1,2,3]`; names must be non-empty and unique; and every supported armor
 class must have an explicit `small`/`large` mapping.  Unknown class semantics
 are rejected instead of receiving a guessed armor size.
+
+## Explicit preprocessing and software-only golden evidence
+
+The runtime builds the input tensor explicitly rather than relying on an
+implicit OpenVINO color/layout conversion. For a `CV_8UC3` BGR source image of
+size `(source_width, source_height)` and a reviewed NCHW canvas
+`(input_width, input_height)`, it uses:
+
+```text
+scale = min(input_width / source_width, input_height / source_height)
+resized_width  = max(1, int(source_width  * scale))
+resized_height = max(1, int(source_height * scale))
+top_left: pad_x = 0, pad_y = 0
+center:   pad_x = (input_width - resized_width) / 2,
+          pad_y = (input_height - resized_height) / 2
+```
+
+The canvas is black outside the resized image. Each canvas pixel `BGR(y,x)` is
+converted exactly once:
+
+```text
+tensor[0, y, x] = BGR(y,x)[2] / 255  # R
+tensor[1, y, x] = BGR(y,x)[1] / 255  # G
+tensor[2, y, x] = BGR(y,x)[0] / 255  # B
+```
+
+Because integer raster dimensions are floored, model points use the only
+inverse transform
+`image_point = (model_point - [pad_x,pad_y]) / [effective_scale_x,effective_scale_y]`,
+where `effective_scale_x = resized_width/source_width` and
+`effective_scale_y = resized_height/source_height`. Before inversion, the
+detector rejects non-finite points and points outside the actual resized
+rectangle (including black padding); it also rejects points outside the
+original image bounds and never clamps them into an apparent detection.
+
+`raw_armor_detector_test` and the qualification report use fixed small-image
+golden tensors and resize/padding round trips to make this mechanics
+reviewable. Those values are **software preprocessing evidence only**. They
+are not a model-output benchmark, an MCU raw-hex frame, a hardware golden
+frame, calibration evidence, or a production-readiness claim.
 
 ## Checked-in profile and production boundary
 

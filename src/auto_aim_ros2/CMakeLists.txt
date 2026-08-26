@@ -9,6 +9,7 @@ find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 find_package(OpenCV REQUIRED COMPONENTS calib3d core dnn imgcodecs imgproc videoio)
 find_package(yaml-cpp REQUIRED)
+find_package(OpenSSL QUIET)
 
 # The WSL image used by the team provides the C++ runtime here.  Keep the
 # lookup optional so the ROS communication/dry-run package still builds on a
@@ -33,6 +34,13 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
 
 target_include_directories(${PROJECT_NAME} PUBLIC include)
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS} yaml-cpp)
+
+if(OpenSSL_FOUND)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE AUTO_AIM_HAS_OPENSSL=1)
+  target_link_libraries(${PROJECT_NAME} OpenSSL::Crypto)
+else()
+  message(WARNING "auto_aim_ros2: OpenSSL not found; production model hash verification fails closed")
+endif()
 
 if(OpenVINO_FOUND)
   target_compile_definitions(${PROJECT_NAME} PRIVATE AUTO_AIM_HAS_OPENVINO=1)

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -74,6 +75,122 @@ class QualificationTests(unittest.TestCase):
             artifact.write_text("CHANGED", encoding="utf-8")
             changed = audit_model_profile(profile, model_path=artifact, mode="strict")
             self.assertIn("model_hash_mismatch", {item.code for item in changed.findings})
+
+    def _artifact_profile(self, root: Path, artifact: Path) -> Path:
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        profile = root / "profile.yaml"
+        profile.write_text(
+            self.model_profile.read_text(encoding="utf-8")
+            .replace("model:\n", "model:\n  sha256: " + digest + "\n")
+            .replace("path: external://sp_vision_25/assets/yolov5.xml", f"path: {artifact}"),
+            encoding="utf-8",
+        )
+        return profile
+
+    def test_missing_artifact_and_openvino_runtime_are_explicitly_unavailable(self):
+        missing = Path(tempfile.gettempdir()) / "game26-does-not-exist-model.xml"
+        result = audit_model_profile(self.model_profile, model_path=missing, allow_test_only=True)
+        codes = {item.code for item in result.findings}
+        self.assertEqual(result.status, "WARN")
+        self.assertIn("model_artifact_unavailable", codes)
+        self.assertEqual(result.values["runtime_contract"]["status"], "model_artifact_unavailable")
+        self.assertFalse(result.values["model_artifact_exists"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"not-an-openvino-model")
+            profile = self._artifact_profile(root, artifact)
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value={"status": "unavailable", "runtime": "openvino", "available": False, "reason": "ImportError"},
+            ):
+                runtime_result = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
+            self.assertEqual(runtime_result.status, "WARN")
+            self.assertIn("runtime_unavailable", {item.code for item in runtime_result.findings})
+            self.assertEqual(runtime_result.values["runtime_contract"]["status"], "unavailable")
+            self.assertEqual(runtime_result.values["runtime_contract"]["reason"], "ImportError")
+
+    def test_runtime_shape_type_and_dynamic_contract_mismatches_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"test-only-artifact")
+            profile = self._artifact_profile(root, artifact)
+            cases = (
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": [1, 3, 320, 320], "input_shape_error": None,
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f32",
+                        "input_layout": "NCHW", "output_layout": "NRC",
+                    },
+                    "runtime_input_shape_mismatch",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": None, "input_shape_error": "dynamic",
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f16",
+                        "input_layout": "NCHW", "output_layout": "NRC",
+                    },
+                    "runtime_dynamic_shape",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 2, "output_count": 1,
+                    },
+                    "runtime_input_count",
+                ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": [1, 3, 640, 640], "input_shape_error": None,
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f32",
+                        "input_layout": "NHWC", "output_layout": "NRC",
+                    },
+                    "runtime_input_layout_mismatch",
+                ),
+            )
+            for observed, expected in cases:
+                with self.subTest(expected=expected):
+                    with mock.patch(
+                        "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                        return_value=observed,
+                    ):
+                        result = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
+                    self.assertEqual(result.status, "FAIL")
+                    self.assertIn(expected, {item.code for item in result.findings})
+
+    def test_report_contains_runtime_contract_preprocessing_and_effective_test_only(self):
+        report = qualify_offline(
+            model_profile=self.model_profile,
+            pnp_config=self.pnp_config,
+            input_csv=self.csv,
+            metadata_json=self.metadata,
+            allow_test_only=True,
+        )
+        self.assertTrue(report["test_only"])
+        self.assertTrue(report["effective_test_only"])
+        self.assertFalse(report["model_file_exists"])
+        self.assertEqual(report["runtime_status"], "model_artifact_unavailable")
+        self.assertEqual(report["preprocessing_contract"]["source_color_order"], "BGR")
+        self.assertEqual(report["preprocessing_contract"]["model_color_order"], "RGB")
+        self.assertEqual(report["preprocessing_contract"]["normalization"], "divide_255")
+        self.assertEqual(report["preprocessing_contract"]["layout"], "NCHW")
+        self.assertEqual(report["keypoint_order"], [0, 3, 2, 1])
+        self.assertTrue(report["software_preprocessing_evidence"]["software_evidence_only"])
+        self.assertFalse(report["software_preprocessing_evidence"]["mcu_raw_hex_fixture"])
+        markdown = render_markdown(report)
+        self.assertIn("## Model contract evidence", markdown)
+        self.assertIn("preprocessing golden: status=`PASS`, software-only=`true`", markdown)
 
     def test_external_model_hash_cannot_override_profile_hash(self):
         """Both profile and metadata/CLI hash assertions must be checked."""

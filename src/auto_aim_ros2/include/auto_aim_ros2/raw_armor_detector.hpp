@@ -53,6 +53,12 @@ struct DetectorConfig
   // explicitly override it for offline fixtures; production profiles may not.
   bool require_model_path_match{false};
   std::string reviewed_model_path;
+  // Production profiles bind the artifact bytes as well as the reviewed path.
+  // When this gate is enabled the detector verifies the XML artifact before
+  // OpenVINO reads it; an unavailable verifier or mismatched digest fails
+  // closed.
+  bool require_model_hash_match{false};
+  std::string reviewed_model_sha256;
   std::string device{"CPU"};
 
   // Optional semantic mapping from the reviewed model profile.  An empty map
@@ -60,11 +66,11 @@ struct DetectorConfig
   // emitted RawArmorDetection and unknown class ids fail closed.
   std::map<int, RawArmorDetection::ArmorTypeHint> class_to_armor_type;
 
-  // When non-empty, the model's declared element types are checked against
-  // the versioned model profile.  Empty input type keeps the legacy smoke
-  // path compatible; output remains FP32 by default because the parser below
-  // consumes float logits.
-  std::string expected_input_element_type;
+  // The explicit preprocessing below constructs a FP32 NCHW tensor.  Keep
+  // this contract even for the diagnostic legacy smoke path: accepting a
+  // same-shape model with a different input element type would make the
+  // conversion implicit and unreviewable.
+  std::string expected_input_element_type{"f32"};
   std::string expected_output_element_type{"f32"};
 
   // The first adapter targets the supplied YOLOv5 IR model.  These values are
@@ -110,6 +116,10 @@ struct ModelProfile
   // to the runtime path.  Test-only profiles may use an external:// identifier
   // because their model is intentionally supplied outside the repository.
   std::string model_path;
+  // A reviewed production profile binds an artifact digest as well as its
+  // path. Both the runtime detector and the offline qualification tool verify
+  // the artifact bytes before accepting a production contract.
+  std::optional<std::string> model_sha256;
   std::string source;
   std::string version;
 
@@ -188,9 +198,27 @@ std::optional<std::string> validate_input_shape(
 struct LetterboxResult
 {
   cv::Mat image;
+  // Nominal aspect-ratio scale used to choose integer resize dimensions.
   float scale{0.0F};
+  // Actual per-axis raster scales after integer resize rounding. Coordinate
+  // inverse uses these values so it cannot treat a padding row/column as
+  // valid source-image evidence.
+  float scale_x{0.0F};
+  float scale_y{0.0F};
+  int resized_width{0};
+  int resized_height{0};
   int pad_x{0};
   int pad_y{0};
+};
+
+// The exact testable preprocessing evidence sent to the current decoder:
+// a letterboxed CV_8UC3 BGR canvas is converted to FP32 RGB and written in
+// NCHW order with every channel divided by 255.  There is deliberately no
+// implicit crop, color conversion, or normalization step in the runtime.
+struct PreprocessedTensor
+{
+  std::vector<float> nchw_rgb_f32;
+  LetterboxResult letterbox;
 };
 
 // Converts a BGR CV_8UC3 image to the configured tensor canvas.  Empty or
@@ -199,14 +227,30 @@ std::optional<LetterboxResult> make_letterbox(
   const cv::Mat & bgr_image,
   const DetectorConfig & config);
 
+// Build the explicit FP32 [1,3,H,W] tensor from a BGR image according to the
+// configured top-left or center letterbox rule.  Empty/unsupported images and
+// invalid target dimensions fail closed with nullopt.
+std::optional<PreprocessedTensor> make_preprocessed_tensor(
+  const cv::Mat & bgr_image,
+  const DetectorConfig & config);
+
 // Convert one point from model-canvas pixels back to the original image
 // pixels.  This is the only inverse of the letterbox transform used by the
-// detector; it removes padding first and then divides by the resize scale.
+// detector; it removes padding first and then divides by the actual per-axis
+// raster scale.
 // Points are not clamped, because the caller must decide how to handle model
 // evidence outside the original image bounds.
 std::optional<cv::Point2f> model_point_to_image(
   const cv::Point2f & model_point,
   const LetterboxResult & letterbox) noexcept;
+
+// Checked inverse for detector evidence.  Unlike the geometry-only overload,
+// this rejects a point outside the source image instead of allowing padded or
+// extrapolated model coordinates to become an armor detection.
+std::optional<cv::Point2f> model_point_to_image(
+  const cv::Point2f & model_point,
+  const LetterboxResult & letterbox,
+  const cv::Size & source_image_size) noexcept;
 
 class OpenVinoYoloDetector final
 {

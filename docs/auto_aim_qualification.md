@@ -40,6 +40,19 @@ python3 tools/auto_aim_qualification/auto_aim_qualification.py \
 
 模型文件存在时，审计会独立校验 profile 内声明的 SHA-256 与实际文件，并在提供 `--model-sha256` 或 metadata 中的 `model_sha256` 时将其作为第二个断言；外部值不能覆盖 profile 值，任一声明缺失（在 strict/production 或外部值已提供的情况下）、格式非法、两项声明不一致或与实际文件不匹配都会 fail-closed。
 
+模型 artifact 可读时，工具还只读检查 OpenVINO 实际 input/output 数量、静态 shape、element
+type 与 layout，并逐项和 profile 对照。动态 shape、layout/shape/type 不匹配、无法读取 IR
+都会 FAIL。artifact 缺失会写入 `model_artifact_unavailable`；OpenVINO Python runtime 缺失会
+写入 `runtime_unavailable`。在 `evidence_only` 的显式 test-only fixture 中，这些状态保持
+WARN 且 `pipeline_execution_unavailable`，绝不伪造 runtime PASS；在 strict 或 production
+中则 FAIL。
+
+每份 JSON/Markdown 还记录 profile id/version/kind、`test_only`、`effective_test_only`、
+声明/运行时路径、artifact 存在性和 SHA-256、runtime contract、输入预处理、keypoint order
+以及 class/color mapping。报告附有固定小图的 BGR→RGB、`/255`、FP32 NCHW、top-left/center
+padding 和 inverse round-trip 软件 golden evidence；它明确标为 software-only，不是 MCU
+raw-hex/hardware golden frame，也不构成 production 或命中性能结论。
+
 ## 固定安全边界
 
 所有报告始终包含：

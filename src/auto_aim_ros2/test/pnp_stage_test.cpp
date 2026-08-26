@@ -1,13 +1,19 @@
 #include "auto_aim_ros2/auto_aim_core.hpp"
+#include "auto_aim_ros2/offline_pipeline.hpp"
 #include "auto_aim_ros2/pnp_stage.hpp"
+#include "auto_aim_ros2/raw_armor_detector.hpp"
 #include "auto_aim_ros2/ros_adapters.hpp"
+#include "auto_aim_ros2/ros_backend.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,6 +73,58 @@ RawArmorDetection make_synthetic_detection(
   detection.bbox = {min_x - 1.0F, min_y - 1.0F, max_x - min_x + 2.0F, max_y - min_y + 2.0F};
   std::copy(image_points.begin(), image_points.end(), detection.keypoints.begin());
   return detection;
+}
+
+rm_auto_aim::pipeline::ImageFrame make_synthetic_image_frame(
+  const PnpConfiguration & config,
+  std::int64_t stamp_ns)
+{
+  rm_auto_aim::pipeline::ImageFrame frame{};
+  frame.stamp_ns = stamp_ns;
+  frame.width = static_cast<std::uint32_t>(config.camera.image_width);
+  frame.height = static_cast<std::uint32_t>(config.camera.image_height);
+  frame.encoding = "bgr8";
+  frame.bgr_image = cv::Mat::zeros(
+    config.camera.image_height, config.camera.image_width, CV_8UC3);
+  return frame;
+}
+
+std::optional<RawArmorDetection> detector_contract_fixture(
+  const rm_auto_aim::pipeline::ImageFrame & frame,
+  const PnpConfiguration & config)
+{
+  // This is a post-decoder fixture, not a fake inference result.  It only
+  // connects a valid ImageFrame to the public RawArmorDetection contract so
+  // the following PnP/tracker/selector/aimer test has no model artifact or
+  // OpenVINO dependency.
+  if (!frame.has_pixels()) {
+    return std::nullopt;
+  }
+  const auto projected = make_synthetic_detection(config);
+  const std::vector<cv::Point2f> keypoints(
+    projected.keypoints.begin(), projected.keypoints.end());
+  auto detection = rm_auto_aim::detector::make_raw_armor_detection(
+    projected.class_id, projected.color_id, projected.confidence, projected.bbox, keypoints,
+    9, 4);
+  if (!detection.has_value()) {
+    return std::nullopt;
+  }
+  // class 0 is explicitly small in both test-only fixtures.  The test does
+  // not infer a physical armor size from an unknown class.
+  detection->armor_type = RawArmorDetection::ArmorTypeHint::Small;
+  return detection;
+}
+
+void expect_safe_offline_command(const rm_auto_aim::pipeline::AimCommand & command)
+{
+  EXPECT_FLOAT_EQ(command.yaw_rad, 0.0F);
+  EXPECT_FLOAT_EQ(command.pitch_rad, 0.0F);
+  EXPECT_FLOAT_EQ(command.yaw_vel_rad_s, 0.0F);
+  EXPECT_FLOAT_EQ(command.pitch_vel_rad_s, 0.0F);
+  EXPECT_FLOAT_EQ(command.yaw_acc_rad_s2, 0.0F);
+  EXPECT_FLOAT_EQ(command.pitch_acc_rad_s2, 0.0F);
+  EXPECT_EQ(command.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(command.fire_command, rm_auto_aim::pipeline::kFireNone);
 }
 
 std::unique_ptr<rm_auto_aim::pipeline::AutoAimPipeline> make_null_pipeline()
@@ -314,4 +372,160 @@ TEST(PnpStage, InvalidPnpCannotCreateLockedOrFireControlOutput)
   EXPECT_EQ(
     rm_auto_aim::ros_adapters::force_dry_run_safe(unsafe).fire_command,
     rm_auto_aim::pipeline::kFireNone);
+}
+
+TEST(OfflineApiSmoke, SyntheticImageFrameFlowsOnlyToDiagnosticAimerAndPredictor)
+{
+  const auto config = load_test_configuration();
+  PnpStage pnp_stage(config);
+  rm_auto_aim::offline::OfflineTracker tracker;
+  rm_auto_aim::offline::TargetSelector selector;
+  rm_auto_aim::offline::SafeOfflineAimer aimer;
+
+  const auto first_frame = make_synthetic_image_frame(config, 1'000'000'000);
+  ASSERT_TRUE(first_frame.has_pixels());
+  const auto first_detection = detector_contract_fixture(first_frame, config);
+  ASSERT_TRUE(first_detection.has_value());
+  const auto first_pose = pnp_stage.solve(
+    *first_detection, static_cast<int>(first_frame.width), static_cast<int>(first_frame.height));
+  ASSERT_TRUE(first_pose.valid);
+
+  const auto first_update = tracker.update(
+    std::vector<rm_auto_aim::offline::TargetObservation>{
+      rm_auto_aim::offline::make_target_observation(first_pose, first_frame.stamp_ns)},
+    first_frame.stamp_ns);
+  EXPECT_EQ(first_update.state, rm_auto_aim::offline::TrackingState::Detecting);
+  EXPECT_FALSE(first_update.target_lock());
+  EXPECT_FALSE(selector.select(
+      first_update.tracks, static_cast<int>(first_frame.width),
+      static_cast<int>(first_frame.height)).has_value());
+
+  const auto second_frame = make_synthetic_image_frame(config, 1'010'000'000);
+  const auto second_detection = detector_contract_fixture(second_frame, config);
+  ASSERT_TRUE(second_detection.has_value());
+  const auto second_pose = pnp_stage.solve(
+    *second_detection, static_cast<int>(second_frame.width),
+    static_cast<int>(second_frame.height));
+  ASSERT_TRUE(second_pose.valid);
+
+  const auto second_update = tracker.update(
+    std::vector<rm_auto_aim::offline::TargetObservation>{
+      rm_auto_aim::offline::make_target_observation(second_pose, second_frame.stamp_ns)},
+    second_frame.stamp_ns);
+  ASSERT_TRUE(second_update.target_lock());
+  const auto selected_before = selector.select(
+    second_update.tracks, static_cast<int>(second_frame.width),
+    static_cast<int>(second_frame.height));
+  ASSERT_TRUE(selected_before.has_value());
+  const auto aimed_before = aimer.aim(selected_before);
+  EXPECT_TRUE(aimed_before.test_only);
+  EXPECT_EQ(aimed_before.target_lock, rm_auto_aim::pipeline::kTargetLocked);
+  EXPECT_FALSE(aimed_before.absolute_command_valid);
+  EXPECT_FALSE(aimed_before.command_yaw_rad.has_value());
+  EXPECT_FALSE(aimed_before.command_pitch_rad.has_value());
+  EXPECT_EQ(aimed_before.fire_command, rm_auto_aim::pipeline::kFireNone);
+  const auto command_before = aimed_before.safe_command();
+  expect_safe_offline_command(command_before);
+
+  rm_auto_aim::offline::PredictionConfig prediction_config{};
+  prediction_config.enabled = true;
+  prediction_config.horizon_ns = 10'000'000;
+  prediction_config.max_horizon_ns = 100'000'000;
+  rm_auto_aim::offline::OfflinePredictor predictor(prediction_config);
+  const auto prediction = predictor.predict(selected_before, second_frame.stamp_ns);
+  ASSERT_TRUE(prediction.valid);
+  EXPECT_TRUE(prediction.test_only);
+  EXPECT_FALSE(prediction.production_ready);
+  EXPECT_EQ(prediction.track_id, selected_before->track_id);
+
+  // Predictor accepts a const selected target and is not a feedback path into
+  // selection or aiming.  The same tracker evidence therefore yields the
+  // same target and safety command after a prediction diagnostic.
+  const auto selected_after = selector.select(
+    second_update.tracks, static_cast<int>(second_frame.width),
+    static_cast<int>(second_frame.height));
+  ASSERT_TRUE(selected_after.has_value());
+  EXPECT_EQ(selected_after->track_id, selected_before->track_id);
+  const auto aimed_after = aimer.aim(selected_after);
+  EXPECT_EQ(aimed_after.target_lock, aimed_before.target_lock);
+  EXPECT_EQ(aimed_after.fire_command, aimed_before.fire_command);
+  expect_safe_offline_command(aimed_after.safe_command());
+}
+
+TEST(OfflineApiSmoke, OutOfBoundsDetectorEvidenceFailsClosedBeforeTracking)
+{
+  const auto config = load_test_configuration();
+  PnpStage pnp_stage(config);
+  const auto frame = make_synthetic_image_frame(config, 1'000'000'000);
+  auto detection = detector_contract_fixture(frame, config);
+  ASSERT_TRUE(detection.has_value());
+  detection->keypoints[0].x = -1.0F;
+
+  const auto pose = pnp_stage.solve(
+    *detection, static_cast<int>(frame.width), static_cast<int>(frame.height));
+  EXPECT_FALSE(pose.valid);
+  EXPECT_EQ(pose.failure, PoseFailure::KeypointOrderRejected);
+
+  rm_auto_aim::offline::OfflineTracker tracker;
+  const auto update = tracker.update(
+    std::vector<rm_auto_aim::offline::TargetObservation>{
+      rm_auto_aim::offline::make_target_observation(pose, frame.stamp_ns)},
+    frame.stamp_ns);
+  EXPECT_TRUE(update.rejected);
+  EXPECT_FALSE(update.target_lock());
+  EXPECT_TRUE(update.tracks.empty());
+
+  rm_auto_aim::offline::TargetSelector selector;
+  const auto selected = selector.select(
+    update.tracks, static_cast<int>(frame.width), static_cast<int>(frame.height));
+  EXPECT_FALSE(selected.has_value());
+  const auto aimed = rm_auto_aim::offline::SafeOfflineAimer{}.aim(selected);
+  EXPECT_EQ(aimed.target_lock, rm_auto_aim::pipeline::kTargetUnlocked);
+  EXPECT_EQ(aimed.fire_command, rm_auto_aim::pipeline::kFireNone);
+  expect_safe_offline_command(aimed.safe_command());
+}
+
+TEST(OfflineApiSmoke, OfflineBackendRejectsUnsafeOperatingFlagsBeforeModelLoad)
+{
+  using rm_auto_aim::ros_backend::Backend;
+  using rm_auto_aim::ros_backend::BackendKind;
+  using rm_auto_aim::ros_backend::Config;
+
+  Config config{};
+  config.kind = BackendKind::OfflineReference;
+  config.dry_run = false;
+  EXPECT_THROW({Backend backend(config);}, std::invalid_argument);
+
+  config.dry_run = true;
+  config.serial_enabled = true;
+  EXPECT_THROW({Backend backend(config);}, std::invalid_argument);
+
+  config.serial_enabled = false;
+  config.allow_fire = true;
+  EXPECT_THROW({Backend backend(config);}, std::invalid_argument);
+}
+
+TEST(OfflineApiSmoke, OfflineBackendRejectsUnavailableModelArtifactBeforeAnyFrame)
+{
+  using rm_auto_aim::ros_backend::Backend;
+  using rm_auto_aim::ros_backend::BackendKind;
+  using rm_auto_aim::ros_backend::Config;
+
+  Config config{};
+  config.kind = BackendKind::OfflineReference;
+  config.dry_run = true;
+  config.serial_enabled = false;
+  config.allow_fire = false;
+  config.allow_test_only = true;
+  config.pnp_config_path = PNP_TEST_CONFIG_PATH;
+  config.model_profile_path = (
+    std::filesystem::path(PNP_TEST_CONFIG_PATH).parent_path() / "model_profile_test.yaml").string();
+  config.model_path = "/definitely/not/a/game26/model.xml";
+
+  try {
+    Backend backend(config);
+    FAIL() << "expected unavailable model artifact to fail before frame processing";
+  } catch (const std::runtime_error & error) {
+    EXPECT_NE(std::string(error.what()).find("does not exist"), std::string::npos);
+  }
 }

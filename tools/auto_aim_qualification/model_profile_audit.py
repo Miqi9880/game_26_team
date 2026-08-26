@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from .preprocess_contract import software_preprocessing_evidence
+
 try:  # PyYAML is present in the project environment; keep import optional.
     import yaml  # type: ignore
 except Exception:  # pragma: no cover - exercised only on minimal hosts.
@@ -67,6 +69,11 @@ def _redact_value(value: Any) -> Any:
         if normalized.startswith("/") or re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("//"):
             return "<path>/" + _safe_name(value)
         return value
+    if isinstance(value, float) and not math.isfinite(value):
+        # Python's default JSON encoder writes NaN/Infinity tokens, which are
+        # not valid JSON.  Keep the evidence serializable while making the
+        # rejected non-finite value explicit.
+        return "<nonfinite>"
     return value
 
 
@@ -83,6 +90,12 @@ def _looks_unreviewed(text: Any) -> bool:
 
 def _finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _strict_int(value: Any) -> bool:
+    """Return true only for a YAML/JSON integer, excluding boolean aliases."""
+
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
@@ -112,10 +125,7 @@ class Finding:
         if self.field is not None:
             result["field"] = self.field
         if self.value is not None:
-            if isinstance(self.value, (str, int, float, bool)) or self.value is None:
-                result["value"] = _redact_value(self.value)
-            else:
-                result["value"] = str(self.value)
+            result["value"] = _redact_value(self.value)
         return result
 
 
@@ -268,6 +278,232 @@ def _expected_hash(model: Mapping[str, Any]) -> Any:
             value = model.get(key)
             return value.strip() if isinstance(value, str) else value
     return None
+
+
+def _runtime_unavailable_finding(
+    result: AuditResult,
+    *,
+    profile_kind: Optional[str],
+    mode: str,
+    code: str,
+    message: str,
+) -> None:
+    """Record an unavailable dependency without ever allowing a false PASS.
+
+    Evidence-only test fixtures may remain ``WARN`` when no model/runtime is
+    present, because the report makes no detector-execution claim.  Production
+    and strict qualification require the real artifact/runtime and therefore
+    fail closed.
+    """
+
+    add = result.fail if mode == "strict" or profile_kind == "production" else result.warn
+    add(code, message, field="model.path")
+
+
+def _runtime_element_type(port: Any) -> str:
+    """Normalize the OpenVINO port element-type spelling used by C++."""
+
+    value = port.get_element_type()
+    get_name = getattr(value, "get_type_name", None)
+    if callable(get_name):
+        value = get_name()
+    text = str(value).strip().lower()
+    # OpenVINO Python releases have used both ``f32`` and ``float32`` for the
+    # same type.  Normalize spelling only; never coerce a different type.
+    return {"float32": "f32", "fp32": "f32", "float16": "f16", "fp16": "f16"}.get(text, text)
+
+
+def _runtime_layout(port: Any) -> Optional[str]:
+    """Read an explicitly assigned OpenVINO layout, if the API exposes it."""
+
+    getter = getattr(port, "get_layout", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    text = str(value).strip()
+    if not text or text in {"[]", "?", "{?}"}:
+        return None
+    # Layout's string representation can be ``[N,C,H,W]`` in some releases.
+    text = text.strip("[]").replace(",", "").replace(" ", "")
+    return text.upper() or None
+
+
+def _runtime_static_shape(port: Any) -> tuple[Optional[list[int]], Optional[str]]:
+    """Extract one static OpenVINO port shape without compiling or inferring."""
+
+    partial = port.get_partial_shape()
+    static = getattr(partial, "is_static", None)
+    try:
+        is_static = bool(static() if callable(static) else static)
+    except Exception:
+        return None, "partial_shape_invalid"
+    if not is_static:
+        return None, "dynamic"
+    try:
+        raw_shape = partial.to_shape()
+        shape = [int(item) for item in raw_shape]
+    except Exception:
+        return None, "shape_unreadable"
+    if not shape or any(item <= 0 for item in shape):
+        return None, "shape_invalid"
+    return shape, None
+
+
+def _inspect_openvino_runtime(model_path: Path) -> dict[str, Any]:
+    """Read an OpenVINO IR contract only; never compile or run inference.
+
+    It is deliberately a small, patchable seam for unit tests.  The CLI does
+    not provide an override: an installed OpenVINO Python runtime is the only
+    source for ``actual_*`` values in a real report.
+    """
+
+    try:
+        try:
+            from openvino import Core  # type: ignore
+        except ImportError:
+            from openvino.runtime import Core  # type: ignore
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "runtime": "openvino",
+            "available": False,
+            "reason": type(exc).__name__,
+        }
+    try:
+        model = Core().read_model(str(model_path))
+        inputs = list(model.inputs)
+        outputs = list(model.outputs)
+    except Exception as exc:
+        return {
+            "status": "read_failed",
+            "runtime": "openvino",
+            "available": True,
+            "reason": type(exc).__name__,
+        }
+    result: dict[str, Any] = {
+        "status": "checked",
+        "runtime": "openvino",
+        "available": True,
+        "input_count": len(inputs),
+        "output_count": len(outputs),
+    }
+    if len(inputs) == 1:
+        shape, shape_error = _runtime_static_shape(inputs[0])
+        result["input_shape"] = shape
+        result["input_shape_error"] = shape_error
+        try:
+            result["input_element_type"] = _runtime_element_type(inputs[0])
+        except Exception:
+            result["input_element_type"] = None
+            result["input_element_type_error"] = "element_type_unreadable"
+        result["input_layout"] = _runtime_layout(inputs[0])
+    if len(outputs) == 1:
+        shape, shape_error = _runtime_static_shape(outputs[0])
+        result["output_shape"] = shape
+        result["output_shape_error"] = shape_error
+        try:
+            result["output_element_type"] = _runtime_element_type(outputs[0])
+        except Exception:
+            result["output_element_type"] = None
+            result["output_element_type_error"] = "element_type_unreadable"
+        result["output_layout"] = _runtime_layout(outputs[0])
+    return result
+
+
+def _audit_runtime_contract(
+    result: AuditResult,
+    runtime: Path,
+    *,
+    input_node: Optional[Mapping[str, Any]],
+    output_node: Optional[Mapping[str, Any]],
+    profile_kind: Optional[str],
+    mode: str,
+) -> None:
+    """Compare the actual static OpenVINO ports with the reviewed profile."""
+
+    observed = _inspect_openvino_runtime(runtime)
+    status = observed.get("status")
+    runtime_record = {
+        "runtime": observed.get("runtime", "openvino"),
+        "status": status if isinstance(status, str) else "invalid",
+        "available": observed.get("available") is True,
+        "reason": observed.get("reason"),
+        "actual_input_shape": observed.get("input_shape"),
+        "actual_output_shape": observed.get("output_shape"),
+        "actual_input_element_type": observed.get("input_element_type"),
+        "actual_output_element_type": observed.get("output_element_type"),
+        "actual_input_layout": observed.get("input_layout"),
+        "actual_output_layout": observed.get("output_layout"),
+        "input_count": observed.get("input_count"),
+        "output_count": observed.get("output_count"),
+    }
+    result.values["runtime_contract"] = runtime_record
+    if status == "unavailable":
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="runtime_unavailable",
+            message="OpenVINO runtime is unavailable; actual model contract was not claimed",
+        )
+        return
+    if status != "checked":
+        result.fail(
+            "runtime_model_read_failed",
+            "OpenVINO could not read the model artifact; actual contract is unavailable",
+            field="model.path",
+        )
+        return
+
+    if observed.get("input_count") != 1:
+        result.fail("runtime_input_count", "OpenVINO model must expose exactly one input", field="input")
+    if observed.get("output_count") != 1:
+        result.fail("runtime_output_count", "OpenVINO model must expose exactly one output", field="output")
+    for label, expected_node in (("input", input_node), ("output", output_node)):
+        if (observed.get(f"{label}_count") if label == "input" else observed.get("output_count")) != 1:
+            continue
+        actual_shape = observed.get(f"{label}_shape")
+        shape_error = observed.get(f"{label}_shape_error")
+        actual_type = observed.get(f"{label}_element_type")
+        type_error = observed.get(f"{label}_element_type_error")
+        actual_layout = observed.get(f"{label}_layout")
+        if shape_error is not None:
+            code = "runtime_dynamic_shape" if shape_error == "dynamic" else "runtime_shape_unavailable"
+            result.fail(code, f"OpenVINO {label} shape must be static and readable", field=f"{label}.shape")
+        elif not isinstance(actual_shape, list) or not all(_strict_int(item) and item > 0 for item in actual_shape):
+            result.fail("runtime_shape_unavailable", f"OpenVINO {label} shape is unavailable", field=f"{label}.shape")
+        elif expected_node is not None and actual_shape != expected_node.get("shape"):
+            result.fail(
+                f"runtime_{label}_shape_mismatch",
+                f"OpenVINO {label} shape does not match the reviewed profile",
+                field=f"{label}.shape",
+            )
+        if type_error is not None or not isinstance(actual_type, str) or not actual_type:
+            result.fail("runtime_element_type_unavailable", f"OpenVINO {label} element type is unavailable", field=f"{label}.element_type")
+        elif expected_node is not None and actual_type != expected_node.get("element_type"):
+            result.fail(
+                f"runtime_{label}_element_type_mismatch",
+                f"OpenVINO {label} element type does not match the reviewed profile",
+                field=f"{label}.element_type",
+                value=actual_type,
+            )
+        expected_layout = expected_node.get("layout") if expected_node is not None else None
+        if not isinstance(actual_layout, str) or not actual_layout:
+            # OpenVINO IR ports often carry no layout metadata at all.  Do
+            # not invent one from dimensions: report that gap and let only a
+            # reviewed profile provide the explicit NCHW/NRC interpretation.
+            add = result.fail if mode == "strict" or profile_kind == "production" else result.warn
+            add("runtime_layout_unavailable", f"OpenVINO {label} layout is unavailable", field=f"{label}.layout")
+        elif expected_layout is not None and actual_layout != str(expected_layout).upper():
+            result.fail(
+                f"runtime_{label}_layout_mismatch",
+                f"OpenVINO {label} layout does not match the reviewed profile",
+                field=f"{label}.layout",
+                value=actual_layout,
+            )
 
 
 def _check_common_profile_header(
@@ -440,6 +676,63 @@ def _audit_model_contract(
             if isinstance(armor_count, int) and set(normalized) != set(range(armor_count)):
                 result.fail("class_mapping_incomplete", "class_to_armor_type must map every armor class exactly once", field="semantics.class_to_armor_type")
             result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized.items())}
+
+    # Keep the human-readable contract distinct from the small software golden
+    # fixture.  The latter proves only deterministic preprocessing mechanics;
+    # it is never a model inference or an MCU/hardware frame claim.
+    if input_node is not None:
+        preprocessing_evidence = software_preprocessing_evidence(input_node)
+        result.values["preprocessing_contract"] = preprocessing_evidence.get("contract") or {
+            "input_shape": input_node.get("shape"),
+            "layout": input_node.get("layout"),
+            "element_type": input_node.get("element_type"),
+            "source_color_order": input_node.get("source_color_order"),
+            "model_color_order": input_node.get("model_color_order"),
+            "normalization": input_node.get("normalization"),
+            "resize_mode": input_node.get("resize_mode"),
+        }
+        result.values["software_preprocessing_evidence"] = preprocessing_evidence
+        for finding in preprocessing_evidence.get("findings", []):
+            if not isinstance(finding, Mapping):
+                result.fail("preprocess_evidence_invalid", "preprocessing evidence returned an invalid finding")
+                continue
+            code = str(finding.get("code", "preprocess_evidence_failure"))
+            message = str(finding.get("message", "preprocessing evidence failed"))
+            field = finding.get("field")
+            if code == "preprocess_runtime_unavailable":
+                _runtime_unavailable_finding(
+                    result,
+                    profile_kind=profile_kind,
+                    mode=mode,
+                    code=code,
+                    message=message,
+                )
+            else:
+                result.fail(code, message, field=str(field) if field else None)
+    if output_node is not None:
+        result.values["output_contract"] = {
+            "shape": output_node.get("shape"),
+            "layout": output_node.get("layout"),
+            "element_type": output_node.get("element_type"),
+            "keypoint_count": output_node.get("keypoint_count"),
+            "objectness_index": output_node.get("objectness_index"),
+            "color_logits_offset": output_node.get("color_logits_offset"),
+            "color_class_count": output_node.get("color_class_count"),
+            "armor_logits_offset": output_node.get("armor_logits_offset"),
+            "armor_class_count": output_node.get("armor_class_count"),
+        }
+    if postprocess is not None:
+        result.values["postprocess_contract"] = {
+            "objectness_threshold": postprocess.get("objectness_threshold"),
+            "nms_threshold": postprocess.get("nms_threshold"),
+            "keypoint_order": postprocess.get("keypoint_order"),
+        }
+    if semantics is not None:
+        result.values["semantic_contract"] = {
+            "color_id_to_name": semantics.get("color_id_to_name"),
+            "armor_class_names": semantics.get("armor_class_names"),
+            "class_to_armor_type": result.values.get("class_to_armor_type", {}),
+        }
     return model
 
 
@@ -471,27 +764,78 @@ def audit_model_profile(
     runtime = Path(model_path) if model_path is not None else None
     if runtime is None and isinstance(declared_path, str) and declared_path and not _is_uri(declared_path):
         runtime = Path(declared_path)
+    path_match: Optional[bool] = None
     if model_path is not None and declared_path and isinstance(declared_path, str) and not _is_uri(declared_path):
-        if not _same_path(runtime, Path(declared_path)):
+        path_match = _same_path(runtime, Path(declared_path))
+        if not path_match:
             result.fail("model_path_mismatch", "runtime model path does not match profile model.path", field="model.path")
     if profile_kind == "production" and model_path is None:
         result.fail("runtime_model_path_missing", "production audit requires the actual runtime model path", field="--model")
+    try:
+        artifact_exists = runtime is not None and runtime.is_file()
+        artifact_readable = bool(artifact_exists and os.access(runtime, os.R_OK))
+    except OSError:
+        artifact_exists = False
+        artifact_readable = False
+    result.values["declared_model_path"] = _safe_name(declared_path) if isinstance(declared_path, str) else None
+    result.values["runtime_model_path"] = _safe_name(runtime) if runtime is not None else None
+    result.values["runtime_path_matches_profile"] = path_match
+    result.values["model_artifact_exists"] = bool(artifact_exists)
+    result.values["model_artifact_readable"] = bool(artifact_readable)
+    result.values["test_only"] = profile_kind == "test_only"
+
     if runtime is None:
-        (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-            "model_artifact_unavailable", "model artifact path is external/unavailable; pipeline execution unavailable", field="model.path"
+        result.values["runtime_contract"] = {
+            "runtime": "openvino",
+            "status": "model_artifact_unavailable",
+            "available": False,
+            "actual_input_shape": None,
+            "actual_output_shape": None,
+            "actual_input_element_type": None,
+            "actual_output_element_type": None,
+        }
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="model_artifact_unavailable",
+            message="model artifact path is external/unavailable; pipeline execution was not claimed",
         )
-    elif not runtime.is_file() or not os.access(runtime, os.R_OK):
-        (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-            "model_artifact_missing", "model file does not exist or is not readable; pipeline execution unavailable", field="model.path"
+    elif not artifact_readable:
+        result.values["runtime_contract"] = {
+            "runtime": "openvino",
+            "status": "model_artifact_unavailable",
+            "available": False,
+            "actual_input_shape": None,
+            "actual_output_shape": None,
+            "actual_input_element_type": None,
+            "actual_output_element_type": None,
+        }
+        _runtime_unavailable_finding(
+            result,
+            profile_kind=profile_kind,
+            mode=mode,
+            code="model_artifact_unavailable",
+            message="model artifact is missing or unreadable; pipeline execution was not claimed",
         )
+    elif _unsafe_file_alias(runtime):
+        result.values["runtime_contract"] = {
+            "runtime": "openvino",
+            "status": "model_artifact_alias",
+            "available": False,
+            "actual_input_shape": None,
+            "actual_output_shape": None,
+            "actual_input_element_type": None,
+            "actual_output_element_type": None,
+        }
+        result.fail("model_artifact_alias", "model artifact must not be a symlink or hardlink alias", field="model.path")
     else:
+        hashed = False
         try:
-            if _unsafe_file_alias(runtime):
-                (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-                    "model_artifact_alias", "model artifact must not be a symlink or hardlink alias", field="model.path"
-                )
             digest = _sha256(runtime)
             result.model_sha256 = digest
+            result.values["model_artifact_sha256"] = digest
+            hashed = True
             profile_hash = _expected_hash(model)
             external_supplied = expected_model_sha256 is not _MISSING_HASH
             # Preserve a non-string value as an invalid declaration instead of
@@ -541,10 +885,22 @@ def audit_model_profile(
                         field="model.sha256",
                     )
         except OSError:
-            (result.fail if mode == "strict" or profile_kind == "production" else result.warn)(
-                "model_hash_unreadable", "model artifact could not be hashed", field="model.path"
+            _runtime_unavailable_finding(
+                result,
+                profile_kind=profile_kind,
+                mode=mode,
+                code="model_hash_unreadable",
+                message="model artifact could not be hashed",
             )
-    result.values["runtime_model_path"] = _safe_name(runtime) if runtime is not None else None
+        if hashed:
+            _audit_runtime_contract(
+                result,
+                runtime,
+                input_node=_mapping(root.get("input")),
+                output_node=_mapping(root.get("output")),
+                profile_kind=profile_kind,
+                mode=mode,
+            )
     result.values["schema_source"] = "docs/model_profile_schema.md + C++ loader contract"
     return result
 

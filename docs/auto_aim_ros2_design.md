@@ -173,6 +173,15 @@ output = FP32 [1, 25200, 22]
 
 该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。生产 profile 还要求 runtime `offline_model_path` 与 profile 的绝对 `model.path` 一致；不同路径的同 shape/type artifact 会在 OpenVINO 初始化前拒绝。非有限 objectness logit 也会被丢弃，不会通过 `sigmoid(+Inf)=1` 进入检测链路。
 
+运行时预处理同样是显式且可测试的：先按 profile 的 `top_left` 或 `center`
+letterbox 规则生成黑色 BGR canvas，再逐像素构造 FP32 `[1,3,H,W]` NCHW tensor，
+执行 BGR→RGB 与 `/255`。没有隐含 resize、裁剪、颜色转换或 padding 猜测。整数 resize
+会记录实际 `effective_scale_x/y`，模型坐标只使用
+`(model_point - padding) / effective_scale_x/y` 反变换，并先拒绝实际 resized rectangle
+外的黑色 padding；非有限或反变换后位于原图外的关键点会
+在 RawArmorDetection 边界丢弃，而不会 clamp。固定小图的 golden tensor 仅为软件预处理
+证据，不是 MCU/hardware golden frame，也不证明比赛模型性能。
+
 历史运行 B 的 smoke 命令（执行目录为 `game_26_dev`）为：
 
 ```bash

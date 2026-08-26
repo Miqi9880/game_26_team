@@ -223,9 +223,27 @@ def qualify_offline(
     )
     model_report = model_audit.as_dict()
     pnp_report = pnp_audit.as_dict()
+    model_values = model_report.get("values", {})
+    if not isinstance(model_values, Mapping):
+        model_values = {}
+    runtime_contract = model_values.get("runtime_contract", {})
+    if not isinstance(runtime_contract, Mapping):
+        runtime_contract = {"status": "invalid", "available": False}
+    effective_test_only = model_audit.profile_kind == "test_only" or pnp_audit.profile_kind == "test_only"
+    model_artifact = {
+        "exists": model_values.get("model_artifact_exists") is True,
+        "readable": model_values.get("model_artifact_readable") is True,
+        "sha256": model_audit.model_sha256,
+        "declared_path": model_values.get("declared_model_path", model_report.get("model_path")),
+        "runtime_path": model_values.get("runtime_model_path"),
+        "runtime_path_matches_profile": model_values.get("runtime_path_matches_profile"),
+    }
     findings.extend(model_report["findings"])
     findings.extend(pnp_report["findings"])
-    if any(item.get("code") in {"model_artifact_unavailable", "model_artifact_missing", "model_hash_unreadable"} for item in model_report["findings"]):
+    if any(item.get("code") in {
+        "model_artifact_unavailable", "model_artifact_missing", "model_hash_unreadable",
+        "runtime_unavailable", "runtime_model_read_failed",
+    } for item in model_report["findings"]):
         findings.append(_finding_dict(
             "pipeline_execution_unavailable",
             "pipeline execution unavailable: model/OpenVINO runtime asset is unavailable; no detector replay was claimed",
@@ -337,8 +355,20 @@ def qualify_offline(
         "commit": metadata.get("commit"),
         "model_profile_id": model_audit.profile_id,
         "model_profile_version": model_audit.profile_version,
+        "model_profile_kind": model_audit.profile_kind,
+        "test_only": model_audit.profile_kind == "test_only",
+        "effective_test_only": effective_test_only,
         "model_file": model_report.get("model_path"),
+        "model_file_exists": model_artifact["exists"],
         "model_sha256": model_report.get("model_sha256"),
+        "model_artifact": model_artifact,
+        "runtime_contract": runtime_contract,
+        "runtime_status": runtime_contract.get("status"),
+        "preprocessing_contract": model_values.get("preprocessing_contract", {}),
+        "software_preprocessing_evidence": model_values.get("software_preprocessing_evidence", {}),
+        "output_contract": model_values.get("output_contract", {}),
+        "keypoint_order": model_values.get("postprocess_contract", {}).get("keypoint_order") if isinstance(model_values.get("postprocess_contract"), Mapping) else None,
+        "class_color_mapping": model_values.get("semantic_contract", {}),
         "pnp_profile": pnp_audit.profile_id or pnp_audit.profile_kind,
         "pnp_profile_version": pnp_audit.profile_version,
         "camera_resolution": pnp_report.get("values", {}).get("camera_resolution"),
@@ -451,6 +481,75 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(f"- PnP config: `{report.get('pnp_audit', {}).get('status', 'FAIL')}`")
     lines.append(f"- PR #16 CSV report: `{report.get('csv_report_status')}`")
     lines.append(f"- PR #17 evidence bundle/manifest: `{report.get('manifest_status')}`")
+    lines.extend(["", "## Model contract evidence", ""])
+    artifact = report.get("model_artifact", {})
+    runtime = report.get("runtime_contract", {})
+    preprocessing = report.get("preprocessing_contract", {})
+    software_evidence = report.get("software_preprocessing_evidence", {})
+    mapping = report.get("class_color_mapping", {})
+    if not isinstance(artifact, Mapping):
+        artifact = {}
+    if not isinstance(runtime, Mapping):
+        runtime = {}
+    if not isinstance(preprocessing, Mapping):
+        preprocessing = {}
+    if not isinstance(software_evidence, Mapping):
+        software_evidence = {}
+    if not isinstance(mapping, Mapping):
+        mapping = {}
+    bool_text = lambda value: str(bool(value)).lower()
+    lines.append(
+        "- profile: `{} / {} / {}`; test_only: `{}`; effective_test_only: `{}`".format(
+            report.get("model_profile_id"),
+            report.get("model_profile_version"),
+            report.get("model_profile_kind"),
+            bool_text(report.get("test_only")),
+            bool_text(report.get("effective_test_only")),
+        )
+    )
+    lines.append(
+        "- model artifact: exists=`{}`, readable=`{}`, sha256=`{}`, declared=`{}`, runtime=`{}`, path_match=`{}`".format(
+            bool_text(artifact.get("exists")),
+            bool_text(artifact.get("readable")),
+            artifact.get("sha256"),
+            artifact.get("declared_path"),
+            artifact.get("runtime_path"),
+            artifact.get("runtime_path_matches_profile"),
+        )
+    )
+    lines.append(
+        "- OpenVINO runtime: status=`{}`, available=`{}`, reason=`{}`, input=`{}` `{}` layout=`{}`, output=`{}` `{}` layout=`{}`".format(
+            runtime.get("status"),
+            bool_text(runtime.get("available")),
+            runtime.get("reason"),
+            runtime.get("actual_input_shape"),
+            runtime.get("actual_input_element_type"),
+            runtime.get("actual_input_layout"),
+            runtime.get("actual_output_shape"),
+            runtime.get("actual_output_element_type"),
+            runtime.get("actual_output_layout"),
+        )
+    )
+    lines.append(
+        "- preprocessing: BGR→RGB=`{}`→`{}`, normalization=`{}`, layout=`{}`, shape=`{}`, resize/padding=`{}`".format(
+            preprocessing.get("source_color_order"),
+            preprocessing.get("model_color_order"),
+            preprocessing.get("normalization"),
+            preprocessing.get("layout"),
+            preprocessing.get("input_shape"),
+            preprocessing.get("resize_mode"),
+        )
+    )
+    lines.append(f"- keypoint order: `{report.get('keypoint_order')}`")
+    lines.append(f"- class/color mapping: `{json.dumps(mapping, ensure_ascii=False, sort_keys=True)}`")
+    lines.append(
+        "- preprocessing golden: status=`{}`, software-only=`{}`, hardware_validation=`{}`, MCU raw hex=`{}`".format(
+            software_evidence.get("status"),
+            bool_text(software_evidence.get("software_evidence_only")),
+            bool_text(software_evidence.get("hardware_validation")),
+            bool_text(software_evidence.get("mcu_raw_hex_fixture")),
+        )
+    )
     lines.append("")
     errors = report.get("diagnostics", {}).get("errors", [])
     warnings = report.get("diagnostics", {}).get("warnings", [])

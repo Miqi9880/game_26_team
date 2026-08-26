@@ -64,6 +64,8 @@ pitch_acc: 0
 
 JSON/Markdown 输出在写入前使用 `lstat` 检查目标和每一级父目录，拒绝 live/dangling symlink、hardlink 和非普通文件；创建父目录后会再次检查，并在支持的平台使用 `O_NOFOLLOW` 安全打开。检测到不安全输出路径时返回 `FAIL`，不写入报告，也不跟随链接在输出目录外创建文件。
 
+所有只读准入输入（model profile、PnP config、模型 artifact、CSV、metadata、manifest、相机报告和 producer command）都会在 qualification 开始前与两个输出路径做 same-file、hardlink、symlink 和词法别名检查。`annotated-dir`、evidence bundle 及 manifest 所在目录也受目录包含保护；任一冲突都会在写入任一报告前返回 `FAIL`，保持输入字节和 SHA-256 不变。
+
 ## 回退
 
 本功能只新增 `tools/auto_aim_qualification/` 和对应文档/测试；回退使用：

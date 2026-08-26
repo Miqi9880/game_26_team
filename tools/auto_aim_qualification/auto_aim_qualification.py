@@ -50,22 +50,85 @@ def _same_or_alias(left: Path, right: Path) -> bool:
 
     try:
         return os.path.samefile(left, right)
-    except (FileNotFoundError, OSError):
-        try:
-            return left.resolve(strict=False) == right.resolve(strict=False)
-        except OSError:
-            return os.path.abspath(left) == os.path.abspath(right)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        raise OSError("qualification output/input paths cannot be inspected") from exc
+    try:
+        return left.resolve(strict=False) == right.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("qualification output/input paths cannot be resolved") from exc
 
 
-def _validate_outputs(input_csv: str | None, json_path: str | None, markdown_path: str | None) -> None:
+def _path_is_within(path: Path, directory: Path) -> bool:
+    """Return whether a path is equal to or below a directory after resolution."""
+
+    try:
+        path.resolve(strict=False).relative_to(directory.resolve(strict=False))
+    except ValueError:
+        return False
+    except (OSError, RuntimeError) as exc:
+        raise OSError("qualification output/input paths cannot be resolved") from exc
+    return True
+
+
+def _validate_outputs(
+    input_csv: str | None,
+    json_path: str | None,
+    markdown_path: str | None,
+    *,
+    model_profile: str | None = None,
+    pnp_config: str | None = None,
+    model: str | None = None,
+    metadata_json: str | None = None,
+    evidence_bundle: str | None = None,
+    manifest: str | None = None,
+    camera_intrinsic_report: str | None = None,
+    annotated_dir: str | None = None,
+    producer_command_file: str | None = None,
+) -> None:
     paths = [Path(item) for item in (json_path, markdown_path) if item]
     if len(paths) == 2 and _same_or_alias(paths[0], paths[1]):
-        raise OSError("qualification JSON and Markdown outputs must be distinct")
-    if input_csv:
-        source = Path(input_csv)
-        for destination in paths:
+        raise OSError("qualification output aliases another qualification output")
+
+    # Every file below is read-only evidence/configuration.  A report path
+    # must never replace it, even when the path is supplied through a symlink
+    # or hardlink alias.  Check all outputs before qualification starts so a
+    # safe-looking first report cannot be written before a later collision is
+    # discovered.
+    protected_files = [
+        Path(item)
+        for item in (
+            model_profile,
+            pnp_config,
+            model,
+            input_csv,
+            metadata_json,
+            manifest,
+            camera_intrinsic_report,
+            producer_command_file,
+        )
+        if item
+    ]
+    for destination in paths:
+        for source in protected_files:
             if _same_or_alias(source, destination):
-                raise OSError("qualification output aliases the input CSV")
+                raise OSError("qualification output aliases a read-only input")
+
+        # Directory inputs are protected by containment, not only exact path
+        # equality.  This covers an output such as annotated/report.json and
+        # also reserves the evidence bundle root, whose manifest would become
+        # stale or gain an undeclared qualification report otherwise.
+        protected_directories = [item for item in (annotated_dir, evidence_bundle) if item]
+        if manifest:
+            # A manifest's parent is the evidence bundle root when callers
+            # provide only --manifest.  Adding it here prevents a new
+            # qualification report from becoming an undeclared bundle file.
+            protected_directories.append(str(Path(manifest).parent))
+        for directory in protected_directories:
+            if directory and _path_is_within(destination, Path(directory)):
+                raise OSError("qualification output is inside a read-only/output bundle directory")
+
     for destination in paths:
         _validate_output_destination(destination)
 
@@ -191,7 +254,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     outputs_safe = True
     try:
-        _validate_outputs(args.input_csv, args.output_json, args.output_markdown)
+        _validate_outputs(
+            args.input_csv,
+            args.output_json,
+            args.output_markdown,
+            model_profile=args.model_profile,
+            pnp_config=args.pnp_config,
+            model=args.model,
+            metadata_json=args.metadata_json,
+            evidence_bundle=args.evidence_bundle,
+            manifest=args.manifest,
+            camera_intrinsic_report=args.camera_intrinsic_report,
+            annotated_dir=args.annotated_dir,
+            producer_command_file=args.producer_command_file,
+        )
         report = qualify_offline(
             model_profile=args.model_profile,
             model=args.model,

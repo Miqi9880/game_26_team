@@ -119,6 +119,34 @@ bool any_regular_file(const std::vector<std::string> & candidates)
   });
 }
 
+bool library_file_present(const std::string & directory, const std::string & name)
+{
+  if (regular_file(join_path(directory, "lib" + name + ".so")) ||
+    regular_file(join_path(directory, "lib" + name + ".so.1")))
+  {
+    return true;
+  }
+#if !defined(_WIN32)
+  DIR * handle = opendir(directory.c_str());
+  if (handle == nullptr) {
+    return false;
+  }
+  const std::string prefix = "lib" + name + ".so.";
+  bool found = false;
+  while (const dirent * entry = readdir(handle)) {
+    const std::string filename = entry->d_name;
+    if (filename.rfind(prefix, 0) == 0 && regular_file(join_path(directory, filename))) {
+      found = true;
+      break;
+    }
+  }
+  closedir(handle);
+  return found;
+#else
+  return false;
+#endif
+}
+
 bool openvino_config_present()
 {
   const char * configured = std::getenv("OpenVINO_DIR");
@@ -152,15 +180,35 @@ bool openvino_config_present()
 #endif
 }
 
-bool mvs_libraries_present(const std::string & repo_root)
+std::vector<std::string> mvs_library_candidates(
+  const std::string & repo_root, const std::optional<std::string> & explicit_directory)
 {
-  const auto root = join_path(repo_root, "src/ros2-hik-camera/hikSDK/lib/arm64");
+  std::vector<std::string> candidates;
+  if (explicit_directory && !explicit_directory->empty()) {
+    candidates.emplace_back(*explicit_directory);
+  }
+  const char * configured = std::getenv("HIK_MVS_LIBRARY_DIR");
+  if ((!explicit_directory || explicit_directory->empty()) && configured != nullptr && configured[0] != '\0') {
+    candidates.emplace_back(configured);
+  }
+  candidates.emplace_back(join_path(repo_root, "src/ros2-hik-camera/hikSDK/lib/arm64"));
+  candidates.emplace_back("/opt/MVS/lib/aarch64");
+  return candidates;
+}
+
+std::string first_complete_mvs_library_directory(const std::vector<std::string> & candidates)
+{
   const std::vector<std::string> libraries{
-    "libFormatConversion.so", "libMediaProcess.so", "libMvCameraControl.so",
-    "libMVRender.so", "libMvUsb3vTL.so"};
-  return std::all_of(libraries.begin(), libraries.end(), [&root](const auto & library) {
-    return regular_file(join_path(root, library));
-  });
+    "FormatConversion", "MediaProcess", "MvCameraControl", "MVRender", "MvUsb3vTL"};
+  for (const auto & candidate : candidates) {
+    const bool complete = std::all_of(libraries.begin(), libraries.end(), [&candidate](const auto & library) {
+      return library_file_present(candidate, library);
+    });
+    if (complete) {
+      return candidate;
+    }
+  }
+  return {};
 }
 
 std::string bool_text(const bool value)
@@ -184,7 +232,19 @@ std::string permission_status(const DevicePermissionEvidence & evidence)
 
 }  // namespace
 
-EnvironmentSnapshot collect_environment(const std::string & repo_root)
+std::vector<std::string> mvs_library_search_paths(
+  const std::string & repo_root, const std::optional<std::string> & explicit_directory)
+{
+  return mvs_library_candidates(repo_root, explicit_directory);
+}
+
+std::string find_complete_mvs_library_directory(const std::vector<std::string> & candidates)
+{
+  return first_complete_mvs_library_directory(candidates);
+}
+
+EnvironmentSnapshot collect_environment(
+  const std::string & repo_root, const std::optional<std::string> & mvs_library_dir)
 {
   EnvironmentSnapshot snapshot;
 #if defined(_WIN32)
@@ -219,7 +279,9 @@ EnvironmentSnapshot collect_environment(const std::string & repo_root)
   snapshot.dependencies.openvino = openvino_config_present();
   snapshot.dependencies.mvs_headers = any_regular_file({
     join_path(repo_root, "src/ros2-hik-camera/hikSDK/include/MvCameraControl.h")});
-  snapshot.dependencies.mvs_arm64_libraries = mvs_libraries_present(repo_root);
+  snapshot.dependencies.mvs_library_directory = find_complete_mvs_library_directory(
+    mvs_library_search_paths(repo_root, mvs_library_dir));
+  snapshot.dependencies.mvs_arm64_libraries = !snapshot.dependencies.mvs_library_directory.empty();
   return snapshot;
 }
 
@@ -299,7 +361,7 @@ void print_report(
   std::ostream & output, const EnvironmentSnapshot & snapshot, const Evaluation & evaluation,
   const DevicePermissionEvidence & camera, const DevicePermissionEvidence & serial)
 {
-  output << "orin_hardware_environment_preflight.version=1\n"
+  output << "orin_hardware_environment_preflight.version=2\n"
          << "scope=READ_ONLY_METADATA\n"
          << "hardware_access=DISABLED\n"
          << "camera_opened=false\n"
@@ -321,6 +383,8 @@ void print_report(
          << "dependency.mvs_headers=" << bool_text(snapshot.dependencies.mvs_headers) << '\n'
          << "dependency.mvs_arm64_libraries=" <<
     bool_text(snapshot.dependencies.mvs_arm64_libraries) << '\n'
+         << "dependency.mvs_library_directory=" <<
+    (snapshot.dependencies.mvs_library_directory.empty() ? "NONE" : snapshot.dependencies.mvs_library_directory) << '\n'
          << "camera_permission=" << permission_status(camera) << '\n'
          << "serial_permission=" << permission_status(serial) << '\n';
 

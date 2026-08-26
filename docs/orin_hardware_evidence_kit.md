@@ -24,6 +24,8 @@ fire_command=0
 1. 按 [`tools/orin_hardware_evidence/README.md`](../tools/orin_hardware_evidence/README.md)
    构建并运行只读预检。WSL、Windows、x86_64 或无 Orin 型号证据必须保留“非目标环境”；
    ROS 2、OpenCV、OpenVINO 或 MVS 不完整必须保留“缺依赖”。不得手工改写成通过。
+   MVS 动态库可来自显式 `--mvs-library-dir`、`HIK_MVS_LIBRARY_DIR`、仓库 arm64 SDK 目录或
+   `/opt/MVS/lib/aarch64`；记录报告实际命中的 `dependency.mvs_library_directory`。
 2. 每次实际尝试复制 [`orin_hardware_experiment_record.md`](templates/orin_hardware_experiment_record.md)
    到受控的外部证据目录填写。不要把设备序列号、个人路径、token、未经审查的标定、模型、
    SDK 二进制或敏感日志提交到仓库。

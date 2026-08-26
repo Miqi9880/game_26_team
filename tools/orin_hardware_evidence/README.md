@@ -21,6 +21,24 @@ ctest --test-dir /tmp/game26-orin-preflight-build --output-on-failure
   --repo-root "$PWD"
 ```
 
+MVS 动态库搜索顺序与当前 `ros2-hik-camera/CMakeLists.txt` 的 aarch64 候选保持一致：
+
+1. 命令行 `--mvs-library-dir PATH`；
+2. 未提供命令行目录时，读取环境变量 `HIK_MVS_LIBRARY_DIR`；
+3. `src/ros2-hik-camera/hikSDK/lib/arm64`；
+4. `/opt/MVS/lib/aarch64`。
+
+例如，若构建相机包时使用了自定义 `HIK_MVS_LIBRARY_DIR`，可显式复核同一目录：
+
+```bash
+/tmp/game26-orin-preflight-build/orin_environment_preflight \
+  --repo-root "$PWD" \
+  --mvs-library-dir /approved/path/to/mvs/lib
+```
+
+报告中的 `dependency.mvs_library_directory` 为实际找到五个必需动态库的目录；没有完整命中时为
+`NONE`。该字段只证明文件元数据存在，不证明库的架构、ABI、许可或运行时可加载。
+
 只有需要核对已有设备节点的权限元数据时才显式增加：
 
 ```bash
@@ -51,7 +69,8 @@ ctest --test-dir /tmp/game26-orin-preflight-build --output-on-failure
 - ROS 2：`ros2` 是否位于 `PATH`，`ROS_DISTRO` 是否已设置；
 - OpenCV：常见系统路径是否存在 development header；
 - OpenVINO：`OpenVINO_DIR/OpenVINOConfig.cmake` 或 `/opt/intel/openvino*/runtime/cmake`；
-- MVS：仓库 SDK header 及 `hikSDK/lib/arm64` 下当前 CMake 所需的五个动态库；
+- MVS：仓库 SDK header，以及显式目录、环境变量目录、仓库 `hikSDK/lib/arm64` 或
+  `/opt/MVS/lib/aarch64` 下当前相机 CMake 所需的五个动态库；
 - Orin：Linux、非 WSL、aarch64/arm64 和 `/proc/device-tree/model` 中的 Orin 标识。
 
 这些是存在性检查，不执行 `ldd`、不校验动态库 ABI，也不调用 SDK。版本、架构、ABI、许可证和

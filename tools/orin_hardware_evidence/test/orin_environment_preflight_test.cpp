@@ -1,14 +1,38 @@
 #include "orin_hardware_evidence/orin_environment_preflight.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#include <cstdlib>
+#endif
 
 namespace
 {
 
 int failures = 0;
+
+void set_mvs_environment(const std::string & value)
+{
+#if defined(_WIN32)
+  _putenv_s("HIK_MVS_LIBRARY_DIR", value.c_str());
+#else
+  setenv("HIK_MVS_LIBRARY_DIR", value.c_str(), 1);
+#endif
+}
+
+void clear_mvs_environment()
+{
+#if defined(_WIN32)
+  _putenv_s("HIK_MVS_LIBRARY_DIR", "");
+#else
+  unsetenv("HIK_MVS_LIBRARY_DIR");
+#endif
+}
 
 void expect(const bool condition, const std::string & message)
 {
@@ -104,6 +128,71 @@ void test_safety_defaults_and_no_default_device_probe()
     "report must state devices were not opened");
 }
 
+void test_mvs_search_paths_match_camera_cmake()
+{
+  clear_mvs_environment();
+  const auto candidates = orin_hardware_evidence::mvs_library_search_paths(MVS_TEST_REPO);
+  expect(candidates.size() == 2, "default MVS search should contain two paths");
+  expect(
+    candidates[0].find("src/ros2-hik-camera/hikSDK/lib/arm64") != std::string::npos,
+    "repository arm64 SDK path must be searched");
+  expect(candidates[1] == "/opt/MVS/lib/aarch64", "system aarch64 MVS path must be searched");
+}
+
+void test_repository_mvs_directory_is_detected()
+{
+  clear_mvs_environment();
+  const auto candidates = orin_hardware_evidence::mvs_library_search_paths(MVS_TEST_REPO);
+  const auto match = orin_hardware_evidence::find_complete_mvs_library_directory(candidates);
+  expect(
+    match == std::string(MVS_TEST_REPO) + "/src/ros2-hik-camera/hikSDK/lib/arm64",
+    "complete repository MVS directory must be reported");
+}
+
+void test_opt_layout_mvs_directory_is_detected()
+{
+  const auto match = orin_hardware_evidence::find_complete_mvs_library_directory(
+    {"/missing/repository/path", MVS_TEST_OPT_LIB});
+  expect(match == MVS_TEST_OPT_LIB, "complete /opt-style MVS directory must be reported");
+}
+
+void test_explicit_mvs_directory_takes_priority()
+{
+  set_mvs_environment("/environment/mvs/path");
+  const auto candidates = orin_hardware_evidence::mvs_library_search_paths(
+    MVS_TEST_REPO, MVS_TEST_EXPLICIT_LIB);
+  expect(candidates.front() == MVS_TEST_EXPLICIT_LIB, "explicit MVS directory must be first");
+  expect(
+    std::find(candidates.begin(), candidates.end(), "/environment/mvs/path") == candidates.end(),
+    "explicit MVS directory must override the environment variable");
+  const auto match = orin_hardware_evidence::find_complete_mvs_library_directory(candidates);
+  expect(match == MVS_TEST_EXPLICIT_LIB, "explicit complete MVS directory must be reported");
+  clear_mvs_environment();
+}
+
+void test_environment_mvs_directory_is_supported()
+{
+  set_mvs_environment(MVS_TEST_EXPLICIT_LIB);
+  const auto candidates = orin_hardware_evidence::mvs_library_search_paths(MVS_TEST_REPO);
+  expect(candidates.front() == MVS_TEST_EXPLICIT_LIB, "environment MVS directory must be first");
+  const auto match = orin_hardware_evidence::find_complete_mvs_library_directory(candidates);
+  expect(match == MVS_TEST_EXPLICIT_LIB, "environment MVS directory must be reported");
+  clear_mvs_environment();
+}
+
+void test_report_includes_selected_mvs_directory()
+{
+  auto snapshot = complete_orin_snapshot();
+  snapshot.dependencies.mvs_library_directory = MVS_TEST_EXPLICIT_LIB;
+  const auto evaluation = orin_hardware_evidence::evaluate(snapshot);
+  std::ostringstream report;
+  orin_hardware_evidence::print_report(report, snapshot, evaluation, {}, {});
+  expect(
+    report.str().find("dependency.mvs_library_directory=" + std::string(MVS_TEST_EXPLICIT_LIB)) !=
+    std::string::npos,
+    "report must include the selected MVS library directory");
+}
+
 }  // namespace
 
 int main()
@@ -113,6 +202,12 @@ int main()
   test_non_orin_architecture_is_non_target();
   test_missing_dependencies_are_explicit();
   test_safety_defaults_and_no_default_device_probe();
+  test_mvs_search_paths_match_camera_cmake();
+  test_repository_mvs_directory_is_detected();
+  test_opt_layout_mvs_directory_is_detected();
+  test_explicit_mvs_directory_takes_priority();
+  test_environment_mvs_directory_is_supported();
+  test_report_includes_selected_mvs_directory();
   if (failures != 0) {
     std::cerr << failures << " test assertion(s) failed\n";
     return 1;

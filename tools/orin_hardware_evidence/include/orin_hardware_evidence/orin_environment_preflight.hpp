@@ -17,6 +17,7 @@ struct DependencyEvidence
   bool openvino{false};
   bool mvs_headers{false};
   bool mvs_arm64_libraries{false};
+  std::string mvs_library_directory;
 };
 
 struct EnvironmentSnapshot
@@ -51,9 +52,14 @@ struct Options
   std::string repo_root{"."};
   std::optional<std::string> camera_device;
   std::optional<std::string> serial_device;
+  std::optional<std::string> mvs_library_dir;
 };
 
-EnvironmentSnapshot collect_environment(const std::string & repo_root);
+EnvironmentSnapshot collect_environment(
+  const std::string & repo_root, const std::optional<std::string> & mvs_library_dir = std::nullopt);
+std::vector<std::string> mvs_library_search_paths(
+  const std::string & repo_root, const std::optional<std::string> & explicit_directory = std::nullopt);
+std::string find_complete_mvs_library_directory(const std::vector<std::string> & candidates);
 DevicePermissionEvidence inspect_device_permissions(
   const std::string & label, const std::optional<std::string> & path);
 Evaluation evaluate(const EnvironmentSnapshot & snapshot);

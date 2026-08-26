@@ -16,7 +16,7 @@ void print_usage(std::ostream & output)
 {
   output <<
     "Usage: orin_environment_preflight [--repo-root PATH] "
-    "[--camera-device PATH] [--serial-device PATH]\n"
+    "[--camera-device PATH] [--serial-device PATH] [--mvs-library-dir PATH]\n"
     "\n"
     "Read-only metadata preflight. Device paths are never opened. When a device path is\n"
     "provided, only existence and process permission metadata are queried.\n";
@@ -41,6 +41,8 @@ orin_hardware_evidence::Options parse_options(const int argc, char ** argv)
       options.camera_device = value;
     } else if (argument == "--serial-device") {
       options.serial_device = value;
+    } else if (argument == "--mvs-library-dir") {
+      options.mvs_library_dir = value;
     } else {
       throw std::invalid_argument("unknown option: " + argument);
     }
@@ -57,7 +59,8 @@ int main(const int argc, char ** argv)
 #endif
   try {
     const auto options = parse_options(argc, argv);
-    const auto snapshot = orin_hardware_evidence::collect_environment(options.repo_root);
+    const auto snapshot = orin_hardware_evidence::collect_environment(
+      options.repo_root, options.mvs_library_dir);
     const auto evaluation = orin_hardware_evidence::evaluate(snapshot);
     const auto camera = orin_hardware_evidence::inspect_device_permissions(
       "camera", options.camera_device);

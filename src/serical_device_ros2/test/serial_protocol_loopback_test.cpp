@@ -161,6 +161,14 @@ TEST(SerialCrc, KnownVectorsAndCrc16LittleEndianWireOrder)
   EXPECT_EQ(Get_CRC8_Check_Sum(payload.data(), payload.size(), 0xffU), 0x1fU);
   EXPECT_EQ(Get_CRC16_Check_Sum(payload.data(), payload.size(), 0xffffU), 0xc66eU);
 
+  std::array<std::uint8_t, 5> crc8_frame{{0x01U, 0x02U, 0x03U, 0x04U, 0x00U}};
+  Append_CRC8_Check_Sum(crc8_frame.data(), crc8_frame.size());
+  // CRC8 covers the first four bytes and occupies the final byte.
+  EXPECT_EQ(crc8_frame[4], 0x1fU);
+  EXPECT_TRUE(Verify_CRC8_Check_Sum(crc8_frame.data(), crc8_frame.size()));
+  crc8_frame[4] ^= 0x01U;
+  EXPECT_FALSE(Verify_CRC8_Check_Sum(crc8_frame.data(), crc8_frame.size()));
+
   std::array<std::uint8_t, 6> framed_payload{{0x01U, 0x02U, 0x03U, 0x04U, 0x00U, 0x00U}};
   Append_CRC16_Check_Sum(framed_payload.data(), framed_payload.size());
   EXPECT_EQ(framed_payload[4], 0x6eU);
@@ -311,6 +319,93 @@ TEST(SerialProtocolLoopback, RejectsCorruptedFramesAndInvalidInputs)
     valid_frame.data(), 502U, io::VISION_ID, valid_frame.data()), 0U);
 
   EXPECT_EQ(std::memcmp(&receiver.vision_msg_, &input, sizeof(input)), 0);
+}
+
+TEST(SerialFrameParser, DistinguishesRobotControl35ByteFrameFromVisionTailFrame)
+{
+  const auto vision = make_vision();
+  const auto control = make_control();
+  SerialMain sender;
+  std::array<std::uint8_t, 512> robot_frame{};
+  std::array<std::uint8_t, 512> vision_frame{};
+  ASSERT_EQ(pack(sender, control, io::CHASSIS_CTRL_CMD_ID, robot_frame), 35U);
+  ASSERT_EQ(pack(sender, vision, io::VISION_ID, vision_frame), 58U);
+
+  std::vector<std::uint8_t> stream;
+  stream.insert(stream.end(), robot_frame.begin(), robot_frame.begin() + 35);
+  stream.insert(stream.end(), vision_frame.begin(), vision_frame.begin() + 58);
+
+  SerialFrameParser parser;
+  std::vector<std::size_t> accepted_lengths;
+  EXPECT_EQ(parser.Feed(
+    stream.data(), stream.size(),
+    [&accepted_lengths](const std::uint8_t *, std::size_t length) {
+      accepted_lengths.push_back(length);
+      return true;
+    }), 2U);
+  ASSERT_EQ(accepted_lengths.size(), 2U);
+  EXPECT_EQ(accepted_lengths[0], 35U);
+  EXPECT_EQ(accepted_lengths[1], 58U);
+  EXPECT_EQ(parser.buffered_length(), 0U);
+}
+
+TEST(SerialFrameParser, RejectsHeaderCrc8AndWrongPayloadLengthThenRecovers)
+{
+  const auto input = make_vision();
+  SerialMain sender;
+  std::array<std::uint8_t, 512> bad_crc8{};
+  std::array<std::uint8_t, 512> bad_length{};
+  std::array<std::uint8_t, 512> valid{};
+  ASSERT_EQ(pack(sender, input, io::VISION_ID, bad_crc8), 58U);
+  ASSERT_EQ(pack(sender, input, io::VISION_ID, bad_length), 58U);
+  ASSERT_EQ(pack(sender, input, io::VISION_ID, valid), 58U);
+
+  bad_crc8[4] ^= 0x01U;
+  io::FrameHeader bad_length_header{};
+  std::memcpy(&bad_length_header, bad_length.data(), sizeof(bad_length_header));
+  bad_length_header.data_length = static_cast<std::uint16_t>(sizeof(io::VisionData) - 1U);
+  std::memcpy(bad_length.data(), &bad_length_header, sizeof(bad_length_header));
+  Append_CRC8_Check_Sum(bad_length.data(), sizeof(io::FrameHeader));
+
+  std::vector<std::uint8_t> stream;
+  stream.insert(stream.end(), bad_crc8.begin(), bad_crc8.begin() + 58);
+  stream.insert(stream.end(), bad_length.begin(), bad_length.begin() + 58);
+  stream.insert(stream.end(), valid.begin(), valid.begin() + 58);
+
+  SerialFrameParser parser;
+  std::vector<std::vector<std::uint8_t>> accepted;
+  EXPECT_EQ(parser.Feed(
+    stream.data(), stream.size(),
+    [&accepted](const std::uint8_t * data, std::size_t length) {
+      accepted.emplace_back(data, data + length);
+      return true;
+    }), 1U);
+  ASSERT_EQ(accepted.size(), 1U);
+  EXPECT_EQ(accepted.front().size(), 58U);
+  EXPECT_EQ(std::memcmp(accepted.front().data(), valid.data(), 58U), 0);
+  EXPECT_EQ(parser.buffered_length(), 0U);
+}
+
+TEST(SerialFrameParser, RetainsTruncatedVisionFrameUntilFinalByte)
+{
+  const auto input = make_vision();
+  SerialMain sender;
+  std::array<std::uint8_t, 512> frame{};
+  ASSERT_EQ(pack(sender, input, io::VISION_ID, frame), 58U);
+
+  SerialFrameParser parser;
+  std::size_t accepted = 0;
+  const auto callback = [&accepted](const std::uint8_t *, std::size_t length) {
+      EXPECT_EQ(length, 58U);
+      ++accepted;
+      return true;
+    };
+  EXPECT_EQ(parser.Feed(frame.data(), 57U, callback), 0U);
+  EXPECT_EQ(accepted, 0U);
+  EXPECT_EQ(parser.buffered_length(), 57U);
+  EXPECT_EQ(parser.Feed(frame.data() + 57U, 1U, callback), 1U);
+  EXPECT_EQ(accepted, 1U);
+  EXPECT_EQ(parser.buffered_length(), 0U);
 }
 
 TEST(SerialFrameParser, WaitsForHalfFrameAndAcceptsPayloadTailBytes)

@@ -24,6 +24,7 @@ public:
 
 private:
   static bool IsKnownPayloadLength(std::uint16_t command, std::uint16_t payload_length);
+  static bool HasFrameTail(std::uint16_t command) noexcept;
   void DiscardPrefix(std::size_t length) noexcept;
 
   std::array<std::uint8_t, kMaxFrameLength> buffer_{};

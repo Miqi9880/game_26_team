@@ -1210,12 +1210,250 @@ const AimerConfig & SafeOfflineAimer::config() const noexcept
   return config_;
 }
 
+const char * prediction_failure_reason_name(PredictionFailureReason reason) noexcept
+{
+  switch (reason) {
+    case PredictionFailureReason::None:
+      return "none";
+    case PredictionFailureReason::Disabled:
+      return "disabled";
+    case PredictionFailureReason::NoTarget:
+      return "no_target";
+    case PredictionFailureReason::InvalidTrack:
+      return "invalid_track";
+    case PredictionFailureReason::NotTracking:
+      return "not_tracking";
+    case PredictionFailureReason::InvalidObservation:
+      return "invalid_observation";
+    case PredictionFailureReason::NegativeTimestamp:
+      return "negative_timestamp";
+    case PredictionFailureReason::TimestampMismatch:
+      return "timestamp_mismatch";
+    case PredictionFailureReason::NonMonotonicTimestamp:
+      return "non_monotonic_timestamp";
+    case PredictionFailureReason::NegativeHorizon:
+      return "negative_horizon";
+    case PredictionFailureReason::HorizonExceedsMaximum:
+      return "horizon_exceeds_maximum";
+    case PredictionFailureReason::MissingRelativeAngle:
+      return "missing_relative_angle";
+    case PredictionFailureReason::NonFiniteAngle:
+      return "non_finite_angle";
+    case PredictionFailureReason::NonFiniteVelocity:
+      return "non_finite_velocity";
+    case PredictionFailureReason::TimestampOverflow:
+      return "timestamp_overflow";
+    case PredictionFailureReason::NonFiniteResult:
+      return "non_finite_result";
+  }
+  return "unknown";
+}
+
+std::optional<std::string> PredictionConfig::validate() const
+{
+  // A negative horizon is intentionally allowed through construction so the
+  // predictor can report the explicit NegativeHorizon failure reason.  The
+  // maximum, however, is a configuration invariant.
+  if (max_horizon_ns < 0) {
+    return "max_horizon_ns must not be negative";
+  }
+  return std::nullopt;
+}
+
+OfflinePredictor::OfflinePredictor(PredictionConfig config) : config_(std::move(config))
+{
+  if (const auto error = config_.validate(); error.has_value()) {
+    throw std::invalid_argument("invalid prediction configuration: " + *error);
+  }
+}
+
+PredictionResult OfflinePredictor::predict(
+  const std::optional<TrackedTarget> & selected,
+  std::int64_t frame_stamp_ns)
+{
+  PredictionResult result{};
+  result.horizon_ns = config_.horizon_ns;
+  result.test_only = true;
+  result.production_ready = false;
+  if (config_.horizon_ns >= 0) {
+    result.horizon_s = static_cast<double>(config_.horizon_ns) / 1'000'000'000.0;
+  } else {
+    result.horizon_s = static_cast<double>(config_.horizon_ns) / 1'000'000'000.0;
+  }
+
+  const auto fail = [&result](PredictionFailureReason reason, const char * message) {
+      result.valid = false;
+      result.failure_reason = reason;
+      result.reason = message;
+      result.predicted_relative_yaw_rad.reset();
+      result.predicted_relative_pitch_rad.reset();
+    };
+
+  // Disabled is a deliberate, safe default.  In particular, a caller that
+  // never supplied --prediction-horizon-ms must not accidentally get a
+  // zero-horizon record merely because this object exists.
+  if (!config_.enabled) {
+    fail(PredictionFailureReason::Disabled, "prediction is disabled");
+    return result;
+  }
+
+  if (frame_stamp_ns < 0) {
+    fail(PredictionFailureReason::NegativeTimestamp, "frame timestamp must not be negative");
+    return result;
+  }
+  if (last_source_stamp_ns_.has_value() && frame_stamp_ns <= *last_source_stamp_ns_) {
+    fail(PredictionFailureReason::NonMonotonicTimestamp,
+      "frame timestamp must be strictly increasing");
+    return result;
+  }
+  // A frame with no selected target still advances the replay clock.  This
+  // prevents a later call from silently reusing the same frame timestamp.
+  last_source_stamp_ns_ = frame_stamp_ns;
+  result.source_stamp_ns = frame_stamp_ns;
+
+  if (!selected.has_value()) {
+    fail(PredictionFailureReason::NoTarget, "no selected target");
+    return result;
+  }
+  result.track_id = selected->track_id;
+  if (selected->track_id == 0) {
+    fail(PredictionFailureReason::InvalidTrack, "track id must be non-zero");
+    return result;
+  }
+
+  if (selected->state != TrackingState::Tracking) {
+    fail(PredictionFailureReason::NotTracking,
+      "prediction requires a Tracking target");
+    return result;
+  }
+
+  const auto & observation = selected->observation;
+  if (observation.stamp_ns < 0) {
+    fail(PredictionFailureReason::NegativeTimestamp,
+      "observation timestamp must not be negative");
+    return result;
+  }
+  if (observation.stamp_ns != frame_stamp_ns ||
+    (selected->last_valid_timestamp_ns >= 0 &&
+    selected->last_valid_timestamp_ns != observation.stamp_ns))
+  {
+    fail(PredictionFailureReason::TimestampMismatch,
+      "selected observation timestamp does not match frame/last-valid timestamp");
+    return result;
+  }
+  if (!observation.relative_yaw_rad.has_value() ||
+    !observation.relative_pitch_rad.has_value())
+  {
+    fail(PredictionFailureReason::MissingRelativeAngle,
+      "relative yaw and pitch are both required");
+    return result;
+  }
+  if (!finite(*observation.relative_yaw_rad) || !finite(*observation.relative_pitch_rad)) {
+    fail(PredictionFailureReason::NonFiniteAngle,
+      "relative yaw or pitch is not finite");
+    return result;
+  }
+  if (!selected->valid()) {
+    fail(PredictionFailureReason::InvalidObservation,
+      "selected target observation failed fail-closed validation");
+    return result;
+  }
+  if (config_.horizon_ns < 0) {
+    fail(PredictionFailureReason::NegativeHorizon, "prediction horizon must not be negative");
+    return result;
+  }
+  if (config_.horizon_ns > config_.max_horizon_ns) {
+    fail(PredictionFailureReason::HorizonExceedsMaximum,
+      "prediction horizon exceeds configured maximum");
+    return result;
+  }
+  if (!finite(selected->yaw_vel_rad_s) || !finite(selected->pitch_vel_rad_s)) {
+    fail(PredictionFailureReason::NonFiniteVelocity,
+      "tracker angular velocity is not finite");
+    return result;
+  }
+  if (frame_stamp_ns > std::numeric_limits<std::int64_t>::max() - config_.horizon_ns) {
+    fail(PredictionFailureReason::TimestampOverflow,
+      "predicted timestamp overflows int64 nanoseconds");
+    return result;
+  }
+
+  const double yaw = *observation.relative_yaw_rad +
+    selected->yaw_vel_rad_s * result.horizon_s;
+  const double pitch = *observation.relative_pitch_rad +
+    selected->pitch_vel_rad_s * result.horizon_s;
+  if (!finite(yaw) || !finite(pitch)) {
+    fail(PredictionFailureReason::NonFiniteResult,
+      "constant-velocity prediction is not finite");
+    return result;
+  }
+
+  result.predicted_stamp_ns = frame_stamp_ns + config_.horizon_ns;
+  result.predicted_relative_yaw_rad = yaw;
+  result.predicted_relative_pitch_rad = pitch;
+  result.valid = true;
+  result.failure_reason = PredictionFailureReason::None;
+  result.reason = "constant_velocity_relative_angle_prediction";
+  return result;
+}
+
+void OfflinePredictor::reset() noexcept
+{
+  last_source_stamp_ns_.reset();
+}
+
+const PredictionConfig & OfflinePredictor::config() const noexcept
+{
+  return config_;
+}
+
+SyntheticPredictionError diagnose_synthetic_prediction_error(
+  const PredictionResult & prediction,
+  const TargetObservation & measured_future) noexcept
+{
+  SyntheticPredictionError result{};
+  result.synthetic = true;
+  result.track_id = prediction.track_id;
+  result.predicted_stamp_ns = prediction.predicted_stamp_ns;
+  if (!prediction.valid || !prediction.predicted_relative_yaw_rad.has_value() ||
+    !prediction.predicted_relative_pitch_rad.has_value())
+  {
+    result.reason = "prediction is not valid";
+    return result;
+  }
+  if (measured_future.stamp_ns != prediction.predicted_stamp_ns) {
+    result.reason = "measured future timestamp does not match prediction timestamp";
+    return result;
+  }
+  if (!is_valid_target_observation(measured_future) ||
+    !measured_future.relative_yaw_rad.has_value() ||
+    !measured_future.relative_pitch_rad.has_value())
+  {
+    result.reason = "measured future observation is not valid relative-angle evidence";
+    return result;
+  }
+  const double yaw_error = *measured_future.relative_yaw_rad -
+    *prediction.predicted_relative_yaw_rad;
+  const double pitch_error = *measured_future.relative_pitch_rad -
+    *prediction.predicted_relative_pitch_rad;
+  if (!finite(yaw_error) || !finite(pitch_error)) {
+    result.reason = "synthetic prediction error is not finite";
+    return result;
+  }
+  result.valid = true;
+  result.yaw_error_rad = yaw_error;
+  result.pitch_error_rad = pitch_error;
+  result.reason = "synthetic_future_angle_error";
+  return result;
+}
+
 cv::Mat annotate_offline_frame(
   const cv::Mat & bgr_image,
   const std::vector<pnp::PoseObservation> & observations,
   const TrackerUpdate & tracked,
   const std::optional<TrackedTarget> & selected,
-  const AimerOutput & aimed)
+  const AimerOutput & aimed,
+  const PredictionResult * prediction)
 {
   auto result = pnp::PnpStage::annotate(bgr_image, observations);
   if (result.empty()) {
@@ -1238,6 +1476,18 @@ cv::Mat annotate_offline_frame(
     " mode=" + aimer_mode_name(aimed.mode) + " fire=0 test_only=true";
   cv::putText(result, status, cv::Point(12, 28), cv::FONT_HERSHEY_SIMPLEX, 0.58,
     status_color, 2, cv::LINE_AA);
+  if (prediction != nullptr) {
+    std::string prediction_status = "prediction=" +
+      std::string(prediction_failure_reason_name(prediction->failure_reason));
+    if (prediction->valid && prediction->predicted_relative_yaw_rad.has_value() &&
+      prediction->predicted_relative_pitch_rad.has_value())
+    {
+      prediction_status += " yaw=" + std::to_string(*prediction->predicted_relative_yaw_rad) +
+        " pitch=" + std::to_string(*prediction->predicted_relative_pitch_rad);
+    }
+    cv::putText(result, prediction_status, cv::Point(12, 78),
+      cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(255, 180, 0), 2, cv::LINE_AA);
+  }
   if (aimed.relative_yaw_rad.has_value() && aimed.relative_pitch_rad.has_value()) {
     const auto text = "rel_rad=" + std::to_string(*aimed.relative_yaw_rad) + "," +
       std::to_string(*aimed.relative_pitch_rad);
@@ -1249,7 +1499,7 @@ cv::Mat annotate_offline_frame(
   {
     const auto text = "test_abs_degree=" + std::to_string(*aimed.command_yaw_degree) + "," +
       std::to_string(*aimed.command_pitch_degree);
-    cv::putText(result, text, cv::Point(12, 78), cv::FONT_HERSHEY_SIMPLEX, 0.52,
+    cv::putText(result, text, cv::Point(12, 103), cv::FONT_HERSHEY_SIMPLEX, 0.52,
       cv::Scalar(255, 200, 0), 1, cv::LINE_AA);
   }
   return result;

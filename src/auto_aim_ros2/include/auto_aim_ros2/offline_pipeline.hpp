@@ -317,6 +317,108 @@ struct AimerOutput
   pipeline::AimCommand safe_command() const noexcept;
 };
 
+// Failure reasons are part of the offline evidence contract.  They are
+// deliberately descriptive rather than a generic "prediction failed" flag:
+// a caller must be able to distinguish malformed input, an unsafe state, and
+// an explicitly disallowed horizon without guessing from numeric output.
+enum class PredictionFailureReason : std::uint8_t
+{
+  None = 0,
+  Disabled,
+  NoTarget,
+  InvalidTrack,
+  NotTracking,
+  InvalidObservation,
+  NegativeTimestamp,
+  TimestampMismatch,
+  NonMonotonicTimestamp,
+  NegativeHorizon,
+  HorizonExceedsMaximum,
+  MissingRelativeAngle,
+  NonFiniteAngle,
+  NonFiniteVelocity,
+  TimestampOverflow,
+  NonFiniteResult,
+};
+
+const char * prediction_failure_reason_name(PredictionFailureReason reason) noexcept;
+
+// The predictor is intentionally configured in integer nanoseconds.  This
+// keeps replay timestamps exact and avoids a second floating-point time base.
+// horizon_ns may be zero when an explicitly enabled zero-horizon diagnostic is
+// desired.  The default-disabled configuration must not emit predictions.
+struct PredictionConfig
+{
+  bool enabled{false};
+  std::int64_t horizon_ns{0};
+  std::int64_t max_horizon_ns{500'000'000};
+
+  std::optional<std::string> validate() const;
+};
+
+struct PredictionResult
+{
+  bool valid{false};
+  std::uint64_t track_id{0};
+  std::int64_t source_stamp_ns{-1};
+  std::int64_t horizon_ns{0};
+  double horizon_s{0.0};
+  std::int64_t predicted_stamp_ns{-1};
+  std::optional<double> predicted_relative_yaw_rad;
+  std::optional<double> predicted_relative_pitch_rad;
+  PredictionFailureReason failure_reason{PredictionFailureReason::Disabled};
+  std::string reason;
+  // These flags are immutable safety evidence; no caller may promote this
+  // result to a production control command.
+  bool test_only{true};
+  bool production_ready{false};
+};
+
+// Constant-velocity, relative-angle-only baseline for deterministic replay.
+// It owns no wall clock and has no connection to Selector, Aimer, RobotCtrl,
+// quaternion, world coordinates, or ballistic/fire logic.
+class OfflinePredictor final
+{
+public:
+  explicit OfflinePredictor(PredictionConfig config = {});
+
+  PredictionResult predict(
+    const std::optional<TrackedTarget> & selected,
+    std::int64_t frame_stamp_ns);
+
+  PredictionResult predict(
+    const TrackedTarget & selected,
+    std::int64_t frame_stamp_ns)
+  {
+    return predict(std::optional<TrackedTarget>(selected), frame_stamp_ns);
+  }
+
+  void reset() noexcept;
+  const PredictionConfig & config() const noexcept;
+
+private:
+  PredictionConfig config_;
+  std::optional<std::int64_t> last_source_stamp_ns_;
+};
+
+// Optional synthetic replay helper.  It compares a valid prediction with a
+// later measured relative-angle observation at exactly the predicted stamp.
+// It is explicitly diagnostic/test-only and cannot imply real hit rate.
+struct SyntheticPredictionError
+{
+  bool valid{false};
+  bool synthetic{true};
+  std::uint64_t track_id{0};
+  std::int64_t predicted_stamp_ns{-1};
+  std::optional<double> yaw_error_rad;
+  std::optional<double> pitch_error_rad;
+  std::string reason;
+};
+
+SyntheticPredictionError diagnose_synthetic_prediction_error(
+  const PredictionResult & prediction,
+  const TargetObservation & measured_future) noexcept;
+
 class SafeOfflineAimer final
 {
 public:
@@ -336,7 +438,8 @@ cv::Mat annotate_offline_frame(
   const std::vector<pnp::PoseObservation> & observations,
   const TrackerUpdate & tracked,
   const std::optional<TrackedTarget> & selected,
-  const AimerOutput & aimed);
+  const AimerOutput & aimed,
+  const PredictionResult * prediction = nullptr);
 
 }  // namespace rm_auto_aim::offline
 

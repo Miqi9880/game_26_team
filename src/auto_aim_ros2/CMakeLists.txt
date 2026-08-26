@@ -114,6 +114,10 @@ if(BUILD_TESTING)
     test/offline_tracker_replay_test.cpp
   )
   ament_auto_add_gtest(
+    offline_predictor_test
+    test/offline_predictor_test.cpp
+  )
+  ament_auto_add_gtest(
     ros_backend_test
     test/ros_backend_test.cpp
   )

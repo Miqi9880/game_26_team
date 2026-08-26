@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -56,7 +58,8 @@ private:
 std::uint32_t TemporaryFile::counter_ = 0U;
 
 pid_t launch_process(
-  const std::vector<std::string> & arguments, const std::string & stdout_path = "")
+  const std::vector<std::string> & arguments, const std::string & stdout_path = "",
+  const std::string & stderr_path = "")
 {
   const pid_t pid = fork();
   if (pid != 0) {
@@ -66,6 +69,13 @@ pid_t launch_process(
   if (!stdout_path.empty()) {
     const int output = open(stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (output < 0 || dup2(output, STDOUT_FILENO) < 0) {
+      _exit(126);
+    }
+    close(output);
+  }
+  if (!stderr_path.empty()) {
+    const int output = open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (output < 0 || dup2(output, STDERR_FILENO) < 0) {
       _exit(126);
     }
     close(output);
@@ -107,6 +117,13 @@ bool parses_as_json(const std::string & path)
   return parser > 0 && wait_for_process(parser) == 0;
 }
 
+std::string read_file(const std::string & path)
+{
+  std::ifstream input(path, std::ios::binary);
+  return std::string(
+    std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
 bool json_has_overall(const std::string & path, const std::string & status)
 {
   const pid_t parser = launch_process(
@@ -136,7 +153,7 @@ std::vector<std::string> direct_arguments(
   const std::string & output, const std::string & duration)
 {
   return {
-    PREFLIGHT_EXECUTABLE_PATH, "--duration", duration, "--timeout", "0.4",
+    PREFLIGHT_EXECUTABLE_PATH, "--duration", duration, "--timeout", "1.0",
     "--vehicle-profile", "new_turtle", "--assume-shared-clock-domain",
     "--format", "json", "--output", output,
   };
@@ -167,9 +184,10 @@ public:
   {
     sensor_msgs::msg::Image image;
     image.header.stamp.sec = stamp;
+    image.header.frame_id = "camera_optical_frame";
     image.width = 2U;
     image.height = 2U;
-    image.encoding = "bgr8";
+    image.encoding = "rgb8";
     image.step = 6U;
     image.data.resize(12U);
     if (scenario_ == InputScenario::InvalidImage) {
@@ -182,6 +200,7 @@ public:
 
     sensor_msgs::msg::CameraInfo info;
     info.header.stamp.sec = stamp;
+    info.header.frame_id = "camera_optical_frame";
     info.width = 2U;
     info.height = 2U;
     info.distortion_model = "plumb_bob";
@@ -205,6 +224,13 @@ public:
       vision.yaw = 181.0F;
     }
     vision_->publish(vision);
+  }
+
+  bool subscribers_ready() const
+  {
+    return image_->get_subscription_count() > 0U &&
+           camera_info_->get_subscription_count() > 0U &&
+           vision_->get_subscription_count() > 0U;
   }
 
 private:
@@ -236,11 +262,16 @@ int run_with_publishers(
   bool graph_checked = !verify_graph;
   std::int32_t stamp = 1;
   int status = 0;
+  const auto publish_deadline = std::chrono::steady_clock::now() + 900ms;
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (std::chrono::steady_clock::now() < deadline &&
     waitpid(process, &status, WNOHANG) == 0)
   {
-    publisher->publish(stamp++);
+    if (publisher->subscribers_ready() &&
+      std::chrono::steady_clock::now() < publish_deadline)
+    {
+      publisher->publish(stamp++);
+    }
     executor.spin_some();
     if (verify_graph) {
       try {
@@ -320,10 +351,64 @@ TEST(ProcessContractTest, SigintReturnsOneThirtyAndStillWritesJson)
   EXPECT_TRUE(parses_as_json(output.path()));
 }
 
+TEST(ProcessContractTest, InvalidParameterReturnsTwoWithReadableDiagnostic)
+{
+  TemporaryFile error_output("invalid_parameter");
+  const pid_t process = launch_process(
+    {PREFLIGHT_EXECUTABLE_PATH, "--duration", "0"}, "", error_output.path());
+  ASSERT_GT(process, 0);
+  EXPECT_EQ(wait_for_process(process), 2);
+  EXPECT_NE(
+    read_file(error_output.path()).find("--duration has an invalid numeric value"),
+    std::string::npos);
+}
+
+TEST(ProcessContractTest, SigtermWritesReportAndLeavesNoProcess)
+{
+  TemporaryFile output("sigterm");
+  const pid_t process = launch_process(direct_arguments(output.path(), "30"));
+  ASSERT_GT(process, 0);
+  std::this_thread::sleep_for(300ms);
+  ASSERT_EQ(kill(process, SIGTERM), 0);
+  EXPECT_EQ(wait_for_process(process), 143);
+  EXPECT_TRUE(parses_as_json(output.path()));
+  errno = 0;
+  EXPECT_EQ(kill(process, 0), -1);
+  EXPECT_EQ(errno, ESRCH);
+}
+
+TEST(ProcessContractTest, RepeatedStopIsIdempotentAndLeavesNoProcess)
+{
+  TemporaryFile output("repeated_stop");
+  const pid_t process = launch_process(direct_arguments(output.path(), "30"));
+  ASSERT_GT(process, 0);
+  std::this_thread::sleep_for(300ms);
+  ASSERT_EQ(kill(process, SIGINT), 0);
+  ASSERT_EQ(kill(process, SIGINT), 0);
+  EXPECT_EQ(wait_for_process(process), 130);
+  errno = 0;
+  EXPECT_EQ(kill(process, 0), -1);
+  EXPECT_EQ(errno, ESRCH);
+}
+
+TEST(ProcessContractTest, ForcedExitIsReapedAndLeavesNoProcess)
+{
+  TemporaryFile output("forced_exit");
+  const pid_t process = launch_process(direct_arguments(output.path(), "30"));
+  ASSERT_GT(process, 0);
+  std::this_thread::sleep_for(300ms);
+  ASSERT_EQ(kill(process, SIGKILL), 0);
+  EXPECT_EQ(wait_for_process(process), 137);
+  errno = 0;
+  EXPECT_EQ(kill(process, 0), -1);
+  EXPECT_EQ(errno, ESRCH);
+}
+
 TEST(ProcessContractTest, ValidPublishersReturnZeroAndGraphHasOnlyThreeSubscriptions)
 {
   TemporaryFile output("pass");
-  EXPECT_EQ(run_with_publishers(InputScenario::Valid, output.path(), true), 0);
+  EXPECT_EQ(run_with_publishers(InputScenario::Valid, output.path(), true), 0)
+    << read_file(output.path());
   EXPECT_TRUE(parses_as_json(output.path()));
   EXPECT_TRUE(json_has_overall(output.path(), "WARN"));
 }
@@ -335,7 +420,7 @@ TEST(ProcessContractTest, InvalidImageFailsThroughExecutable)
   EXPECT_TRUE(parses_as_json(output.path()));
   EXPECT_TRUE(json_has_overall(output.path(), "FAIL"));
   EXPECT_TRUE(
-    json_has_failing_finding(output.path(), "image.step", "cannot be represented"));
+    json_has_failing_finding(output.path(), "image.step", "width * 3"));
 }
 
 TEST(ProcessContractTest, InvalidCameraInfoFailsThroughExecutable)

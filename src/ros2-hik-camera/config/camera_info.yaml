@@ -1,3 +1,5 @@
+# UNVERIFIED FORMAT EXAMPLE ONLY. Do not use this file as formal calibration.
+# The camera launch default intentionally does not load it.
 image_width: 1440
 image_height: 1080
 camera_name: narrow_stereo

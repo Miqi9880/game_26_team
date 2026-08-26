@@ -12,12 +12,16 @@ namespace
 {
 ImageSample image(std::int64_t stamp_sec = 1)
 {
-  return ImageSample{HeaderStamp{stamp_sec, 0U, true}, 2U, 2U, "bgr8", 6U, 12U};
+  return ImageSample{
+    HeaderStamp{stamp_sec, 0U, true}, "camera_optical_frame",
+    2U, 2U, "rgb8", 6U, 12U,
+  };
 }
 
-CameraInfoSample camera_info()
+CameraInfoSample camera_info(std::int64_t stamp_sec = 1)
 {
   return CameraInfoSample{
+    HeaderStamp{stamp_sec, 0U, true}, "camera_optical_frame",
     2U, 2U, "plumb_bob",
     {100.0, 0.0, 1.0, 0.0, 100.0, 1.0, 0.0, 0.0, 1.0},
     {0.0, 0.0, 0.0, 0.0, 0.0},
@@ -50,7 +54,7 @@ void observe_normal(PreflightAnalyzer * analyzer)
   for (int index = 0; index < 2; ++index) {
     const double arrival_s = 0.1 + static_cast<double>(index) * 0.1;
     analyzer->observe_image(image(index + 1), arrival_s);
-    analyzer->observe_camera_info(camera_info(), arrival_s);
+    analyzer->observe_camera_info(camera_info(index + 1), arrival_s);
     analyzer->observe_vision(vision(index + 1), arrival_s);
   }
 }
@@ -105,6 +109,121 @@ TEST(PreflightAnalyzerTest, EmptyImageAndBadStepFailWithoutException)
   EXPECT_EQ(finding(report, "image.data_length")->status, Status::Fail);
 }
 
+TEST(PreflightAnalyzerTest, CameraContractRejectsWrongEncodingStrideAndShortData)
+{
+  PreflightAnalyzer encoding_analyzer({}, 0.0);
+  auto wrong_encoding = image();
+  wrong_encoding.encoding = "bgr8";
+  encoding_analyzer.observe_image(wrong_encoding, 0.1);
+  EXPECT_EQ(
+    finding(encoding_analyzer.build_report(0.2), "image.encoding")->status,
+    Status::Fail);
+
+  PreflightAnalyzer stride_analyzer({}, 0.0);
+  auto wrong_stride = image();
+  wrong_stride.step = 7U;
+  wrong_stride.data_size = 14U;
+  stride_analyzer.observe_image(wrong_stride, 0.1);
+  EXPECT_EQ(
+    finding(stride_analyzer.build_report(0.2), "image.step")->status,
+    Status::Fail);
+
+  PreflightAnalyzer data_analyzer({}, 0.0);
+  auto short_data = image();
+  short_data.data_size = 11U;
+  data_analyzer.observe_image(short_data, 0.1);
+  EXPECT_EQ(
+    finding(data_analyzer.build_report(0.2), "image.data_length")->status,
+    Status::Fail);
+}
+
+TEST(PreflightAnalyzerTest, PairedFramesRequireExactStampDimensionsAndFrameId)
+{
+  PreflightAnalyzer timestamp_analyzer({}, 0.0);
+  timestamp_analyzer.observe_image(image(1), 0.1);
+  timestamp_analyzer.observe_camera_info(camera_info(2), 0.1);
+  EXPECT_EQ(
+    finding(
+      timestamp_analyzer.build_report(0.2),
+      "image_camera.timestamp_pairing")->status,
+    Status::Fail);
+
+  PreflightAnalyzer dimensions_analyzer({}, 0.0);
+  dimensions_analyzer.observe_image(image(1), 0.1);
+  auto wrong_dimensions = camera_info(1);
+  wrong_dimensions.width = 3U;
+  dimensions_analyzer.observe_camera_info(wrong_dimensions, 0.1);
+  EXPECT_EQ(
+    finding(dimensions_analyzer.build_report(0.2), "image_camera.dimensions")->status,
+    Status::Fail);
+
+  PreflightAnalyzer frame_analyzer({}, 0.0);
+  frame_analyzer.observe_image(image(1), 0.1);
+  auto wrong_frame = camera_info(1);
+  wrong_frame.frame_id = "other_camera_frame";
+  frame_analyzer.observe_camera_info(wrong_frame, 0.1);
+  const auto frame_report = frame_analyzer.build_report(0.2);
+  EXPECT_EQ(finding(frame_report, "camera_info.frame_id")->status, Status::Fail);
+  EXPECT_EQ(finding(frame_report, "image_camera.frame_id")->status, Status::Fail);
+}
+
+TEST(PreflightAnalyzerTest, PairingGraceAllowsOnlyOneFinalInFlightMessage)
+{
+  PreflightAnalyzer final_tail({}, 0.0);
+  final_tail.observe_image(image(1), 0.1);
+  final_tail.observe_camera_info(camera_info(1), 0.1);
+  final_tail.observe_image(image(2), 0.15);
+  EXPECT_EQ(
+    finding(final_tail.build_report(0.2), "image_camera.timestamp_pairing")->status,
+    Status::Warn);
+
+  PreflightAnalyzer multiple_unmatched({}, 0.0);
+  multiple_unmatched.observe_image(image(1), 0.1);
+  multiple_unmatched.observe_camera_info(camera_info(1), 0.1);
+  multiple_unmatched.observe_image(image(2), 0.15);
+  multiple_unmatched.observe_camera_info(camera_info(3), 0.15);
+  EXPECT_EQ(
+    finding(
+      multiple_unmatched.build_report(0.2),
+      "image_camera.timestamp_pairing")->status,
+    Status::Fail);
+
+  PreflightAnalyzer middle_gap({}, 0.0);
+  middle_gap.observe_image(image(2), 0.1);
+  middle_gap.observe_camera_info(camera_info(2), 0.1);
+  middle_gap.observe_image(image(1), 0.15);
+  EXPECT_EQ(
+    finding(middle_gap.build_report(0.2), "image_camera.timestamp_pairing")->status,
+    Status::Fail);
+}
+
+TEST(PreflightAnalyzerTest, ImageAndCameraInfoUnsetTimestampsFail)
+{
+  PreflightAnalyzer analyzer({}, 0.0);
+  analyzer.observe_image(image(0), 0.1);
+  analyzer.observe_camera_info(camera_info(0), 0.1);
+  const auto report = analyzer.build_report(0.2);
+  EXPECT_EQ(
+    finding(report, "header.timestamp_monotonic", kImageTopic)->status,
+    Status::Fail);
+  EXPECT_EQ(
+    finding(report, "header.timestamp_monotonic", kCameraInfoTopic)->status,
+    Status::Fail);
+  EXPECT_EQ(finding(report, "image_camera.timestamp_pairing")->status, Status::Fail);
+}
+
+TEST(PreflightAnalyzerTest, GraphContractRejectsWrongTypeAndQos)
+{
+  PreflightAnalyzer analyzer({}, 0.0);
+  analyzer.observe_topic_publishers(
+    kImageTopic, kExpectedImageType,
+    {PublisherEndpointSample{
+        "std_msgs/msg/String", "reliable", "volatile", "keep_last", 10U}});
+  const auto report = analyzer.build_report(0.1);
+  EXPECT_EQ(finding(report, "topic.type", kImageTopic)->status, Status::Fail);
+  EXPECT_EQ(finding(report, "topic.qos", kImageTopic)->status, Status::Fail);
+}
+
 TEST(PreflightAnalyzerTest, TypedEncodingRowWidthOverflowFailsClosed)
 {
   PreflightAnalyzer analyzer({}, 0.0);
@@ -117,12 +236,10 @@ TEST(PreflightAnalyzerTest, TypedEncodingRowWidthOverflowFailsClosed)
   EXPECT_NO_THROW(analyzer.observe_image(sample, 0.1));
 
   const auto report = analyzer.build_report(0.2);
-  EXPECT_EQ(finding(report, "image.encoding")->status, Status::Pass);
+  EXPECT_EQ(finding(report, "image.encoding")->status, Status::Fail);
   EXPECT_EQ(finding(report, "image.step")->status, Status::Fail);
   EXPECT_EQ(finding(report, "image.data_length")->status, Status::Fail);
-  EXPECT_NE(
-    finding(report, "image.step")->reason.find("cannot be represented"),
-    std::string::npos);
+  EXPECT_NE(finding(report, "image.step")->reason.find("width * 3"), std::string::npos);
 }
 
 TEST(PreflightAnalyzerTest, TypedEncodingNumericOverflowFailsClosed)

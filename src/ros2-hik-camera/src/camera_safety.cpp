@@ -1,5 +1,6 @@
 #include "hik_camera/camera_safety.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -80,6 +81,56 @@ bool calculateRgb8BufferSize(
 
   buffer_size = pixel_count * channels;
   return true;
+}
+
+ContractValidationResult validateCameraInfoContract(
+  const CameraInfoContractSample & sample)
+{
+  if (sample.width == 0U || sample.height == 0U) {
+    return {false, "CameraInfo width and height must both be positive"};
+  }
+  if (!std::all_of(
+      sample.k.begin(), sample.k.end(), [](double value) {
+        return std::isfinite(value);
+      }))
+  {
+    return {false, "CameraInfo K contains a non-finite value"};
+  }
+  if (!(sample.k[0] > 0.0) || !(sample.k[4] > 0.0) ||
+    std::abs(sample.k[8]) <= 1e-12)
+  {
+    return {false, "CameraInfo K requires positive fx/fy and non-zero K[8]"};
+  }
+  if (!std::all_of(
+      sample.d.begin(), sample.d.end(), [](double value) {
+        return std::isfinite(value);
+      }))
+  {
+    return {false, "CameraInfo D contains a non-finite value"};
+  }
+
+  std::size_t expected_d_size = 0U;
+  if (sample.distortion_model == "plumb_bob") {
+    expected_d_size = 5U;
+  } else if (sample.distortion_model == "rational_polynomial") {
+    expected_d_size = 8U;
+  } else if (sample.distortion_model == "equidistant") {
+    expected_d_size = 4U;
+  } else {
+    return {false, "CameraInfo distortion_model is empty or unsupported"};
+  }
+  if (sample.d.size() != expected_d_size) {
+    return {false, "CameraInfo D length does not match distortion_model"};
+  }
+  return {true, "CameraInfo satisfies the ROS input contract"};
+}
+
+bool cameraInfoMatchesFrame(
+  const CameraInfoContractSample & sample,
+  std::uint32_t frame_width,
+  std::uint32_t frame_height)
+{
+  return sample.width == frame_width && sample.height == frame_height;
 }
 
 bool isFiniteInRange(double value, double minimum, double maximum)

@@ -120,7 +120,7 @@ std::optional<std::array<double, 2>> pitch_limits(const std::string & profile)
 
 bool timed_topic(const std::string & topic)
 {
-  return topic == kImageTopic || topic == kVisionTopic;
+  return topic == kImageTopic || topic == kCameraInfoTopic || topic == kVisionTopic;
 }
 
 enum class EncodingWidthStatus : std::uint8_t
@@ -226,6 +226,9 @@ PreflightAnalyzer::PreflightAnalyzer(PreflightConfig config, double start_s)
   if (!std::isfinite(config_.sync_tolerance_ms) || config_.sync_tolerance_ms < 0.0) {
     throw std::invalid_argument("sync_tolerance_ms must be finite and non-negative");
   }
+  if (config_.expected_frame_id.empty()) {
+    throw std::invalid_argument("expected_frame_id must not be empty");
+  }
   stats_.emplace(kImageTopic, TopicStats{});
   stats_.emplace(kCameraInfoTopic, TopicStats{});
   stats_.emplace(kVisionTopic, TopicStats{});
@@ -278,9 +281,54 @@ void PreflightAnalyzer::observe_common(
   stats.last_stamp_ns = current;
 }
 
+void PreflightAnalyzer::pair_frame(
+  bool image, const HeaderStamp & stamp, const FrameMetadata & metadata)
+{
+  const auto timestamp = stamp_ns(stamp);
+  if (!timestamp.has_value() || *timestamp == 0) {
+    return;
+  }
+
+  auto & own = image ? unmatched_images_ : unmatched_camera_info_;
+  auto & other = image ? unmatched_camera_info_ : unmatched_images_;
+  const auto range = other.equal_range(*timestamp);
+  if (range.first == range.second) {
+    own.emplace(*timestamp, metadata);
+    return;
+  }
+
+  const auto counterpart = range.first->second;
+  other.erase(range.first);
+  last_matched_stamp_ns_ = timestamp;
+  if (image) {
+    validate_pair(metadata, counterpart);
+  } else {
+    validate_pair(counterpart, metadata);
+  }
+}
+
+void PreflightAnalyzer::validate_pair(
+  const FrameMetadata & image, const FrameMetadata & camera_info)
+{
+  ++matched_pairs_;
+  if (image.width != camera_info.width || image.height != camera_info.height) {
+    ++dimension_mismatches_;
+  }
+  if (image.frame_id != camera_info.frame_id) {
+    ++frame_id_mismatches_;
+  }
+}
+
 void PreflightAnalyzer::observe_image(const ImageSample & sample, double arrival_s)
 {
   observe_common(kImageTopic, &sample.stamp, arrival_s);
+  const bool frame_id_valid = sample.frame_id == config_.expected_frame_id;
+  record(
+    "image.frame_id", frame_id_valid ? Status::Pass : Status::Fail,
+    "image.frame_id", kImageTopic,
+    frame_id_valid ? "Image frame_id matches the configured camera frame" :
+    "Image frame_id is empty or does not match --expected-frame-id",
+    {{"actual", sample.frame_id}, {"expected", config_.expected_frame_id}});
   const bool dimensions_valid = sample.width > 0U && sample.height > 0U;
   record(
     "image.dimensions", dimensions_valid ? Status::Pass : Status::Fail,
@@ -288,54 +336,41 @@ void PreflightAnalyzer::observe_image(const ImageSample & sample, double arrival
     dimensions_valid ? "Image dimensions are positive" :
     "Image width and height must both be positive",
     {{"width", std::to_string(sample.width)}, {"height", std::to_string(sample.height)}});
-  if (dimensions_valid) {
-    latest_image_size_ = std::array<std::uint32_t, 2>{{sample.width, sample.height}};
-  }
+  pair_frame(
+    true, sample.stamp,
+    FrameMetadata{sample.frame_id, sample.width, sample.height, arrival_s});
 
-  const auto encoding = encoding_width(sample.encoding);
-  const auto pixel_bytes = encoding.bytes;
-  if (sample.encoding.empty()) {
-    record(
-      "image.encoding", Status::Fail, "image.encoding", kImageTopic,
-      "Image encoding is empty");
-  } else if (encoding.status == EncodingWidthStatus::Invalid) {
-    record(
-      "image.encoding", Status::Fail, "image.encoding", kImageTopic,
-      encoding.reason, {{"encoding", sample.encoding}});
-  } else if (!pixel_bytes.has_value()) {
-    record(
-      "image.encoding", Status::Warn, "image.encoding", kImageTopic,
-      "Encoding byte width is unknown; minimum row width cannot be checked",
-      {{"encoding", sample.encoding}});
-  } else {
-    record(
-      "image.encoding", Status::Pass, "image.encoding", kImageTopic,
-      "Encoding has a known byte width",
-      {{"encoding", sample.encoding}, {"bytes_per_pixel", size_value(*pixel_bytes)}});
-  }
+  const bool encoding_valid = sample.encoding == kExpectedImageEncoding;
+  record(
+    "image.encoding", encoding_valid ? Status::Pass : Status::Fail,
+    "image.encoding", kImageTopic,
+    encoding_valid ? "Image encoding matches the camera contract" :
+    "Image encoding must be exactly rgb8 for this camera-to-detector contract",
+    {{"actual", sample.encoding}, {"expected", kExpectedImageEncoding}});
 
   bool row_width_representable = true;
-  bool step_valid = sample.step > 0U && encoding.status != EncodingWidthStatus::Invalid;
+  bool step_valid = dimensions_valid && encoding_valid && sample.step > 0U;
   std::uint64_t minimum_step = 0U;
-  if (pixel_bytes.has_value() && sample.width > 0U) {
-    if (*pixel_bytes >
+  constexpr std::size_t rgb8_bytes_per_pixel = 3U;
+  if (sample.width > 0U) {
+    if (rgb8_bytes_per_pixel >
       std::numeric_limits<std::uint64_t>::max() /
       static_cast<std::uint64_t>(sample.width))
     {
       row_width_representable = false;
     } else {
-      minimum_step = static_cast<std::uint64_t>(sample.width) * *pixel_bytes;
+      minimum_step = static_cast<std::uint64_t>(sample.width) * rgb8_bytes_per_pixel;
       row_width_representable =
         minimum_step <= std::numeric_limits<std::uint32_t>::max();
     }
-    step_valid = step_valid && row_width_representable && sample.step >= minimum_step;
+    step_valid = step_valid && row_width_representable && sample.step == minimum_step;
   }
   const std::string step_reason = !row_width_representable ?
     "Encoded row width cannot be represented by sensor_msgs/Image step" :
-    "Image step must be positive and cover one encoded row";
+    "Image step must equal width * 3 for packed rgb8";
   record(
     "image.step", step_valid ? Status::Pass : Status::Fail, "image.step", kImageTopic,
-    step_valid ? "Image step is structurally valid" :
+    step_valid ? "Image step equals width * 3 for packed rgb8" :
     step_reason,
     {{"step", std::to_string(sample.step)}, {"minimum_step", integer(minimum_step)}});
 
@@ -353,7 +388,14 @@ void PreflightAnalyzer::observe_image(const ImageSample & sample, double arrival
 void PreflightAnalyzer::observe_camera_info(
   const CameraInfoSample & sample, double arrival_s)
 {
-  observe_common(kCameraInfoTopic, nullptr, arrival_s);
+  observe_common(kCameraInfoTopic, &sample.stamp, arrival_s);
+  const bool frame_id_valid = sample.frame_id == config_.expected_frame_id;
+  record(
+    "camera.frame_id", frame_id_valid ? Status::Pass : Status::Fail,
+    "camera_info.frame_id", kCameraInfoTopic,
+    frame_id_valid ? "CameraInfo frame_id matches the configured camera frame" :
+    "CameraInfo frame_id is empty or does not match --expected-frame-id",
+    {{"actual", sample.frame_id}, {"expected", config_.expected_frame_id}});
   const bool dimensions_valid = sample.width > 0U && sample.height > 0U;
   record(
     "camera.dimensions", dimensions_valid ? Status::Pass : Status::Fail,
@@ -361,9 +403,9 @@ void PreflightAnalyzer::observe_camera_info(
     dimensions_valid ? "CameraInfo dimensions are positive" :
     "CameraInfo width and height must both be positive",
     {{"width", std::to_string(sample.width)}, {"height", std::to_string(sample.height)}});
-  if (dimensions_valid) {
-    latest_camera_size_ = std::array<std::uint32_t, 2>{{sample.width, sample.height}};
-  }
+  pair_frame(
+    false, sample.stamp,
+    FrameMetadata{sample.frame_id, sample.width, sample.height, arrival_s});
 
   const bool k_valid = sample.k.size() == 9U && finite_values(sample.k) &&
     sample.k[0] > 0.0 && sample.k[4] > 0.0 && std::abs(sample.k[8]) > 1e-12;
@@ -392,8 +434,8 @@ void PreflightAnalyzer::observe_camera_info(
       expected_length = 4U;
     }
     if (!expected_length.has_value()) {
-      d_status = Status::Warn;
-      d_reason = "Unknown distortion_model; D is finite but its length is unverified";
+      d_status = Status::Fail;
+      d_reason = "Unknown distortion_model; D format cannot satisfy the input contract";
     } else if (sample.d.size() != *expected_length) {
       d_status = Status::Fail;
       d_reason = "D length does not match the declared distortion model";
@@ -405,6 +447,64 @@ void PreflightAnalyzer::observe_camera_info(
   record(
     "camera.d", d_status, "camera_info.D", kCameraInfoTopic, d_reason,
     {{"distortion_model", sample.distortion_model}, {"length", size_value(sample.d.size())}});
+}
+
+void PreflightAnalyzer::observe_topic_publishers(
+  const std::string & topic, const std::string & expected_type,
+  const std::vector<PublisherEndpointSample> & publishers)
+{
+  const bool publisher_count_valid = publishers.size() == 1U;
+  record(
+    "graph.publisher_count." + topic,
+    publisher_count_valid ? Status::Pass : Status::Fail,
+    "topic.publisher_count", topic,
+    publisher_count_valid ? "Exactly one publisher was discovered on the required topic" :
+    "Expected exactly one publisher; check topic name, remapping, startup, and duplicate sources",
+    {{"count", size_value(publishers.size())}});
+
+  const bool type_valid = !publishers.empty() && std::all_of(
+    publishers.begin(), publishers.end(), [&](const PublisherEndpointSample & publisher) {
+      return publisher.topic_type == expected_type;
+    });
+  record(
+    "graph.type." + topic, type_valid ? Status::Pass : Status::Fail,
+    "topic.type", topic,
+    type_valid ? "Publisher type matches the required ROS message type" :
+    "Required topic has no publisher or exposes the wrong ROS message type",
+    {{"expected", expected_type}});
+
+  const bool delivery_qos_valid = !publishers.empty() && std::all_of(
+    publishers.begin(), publishers.end(), [](const PublisherEndpointSample & publisher) {
+      return publisher.reliability == "best_effort" &&
+      publisher.durability == "volatile";
+    });
+  const bool queue_qos_available = !publishers.empty() && std::all_of(
+    publishers.begin(), publishers.end(), [](const PublisherEndpointSample & publisher) {
+      return publisher.history != "unknown" && publisher.depth != 0U;
+    });
+  const bool queue_qos_valid = queue_qos_available && std::all_of(
+    publishers.begin(), publishers.end(), [](const PublisherEndpointSample & publisher) {
+      return publisher.history == "keep_last" && publisher.depth == 5U;
+    });
+  const auto qos_status = !delivery_qos_valid || (queue_qos_available && !queue_qos_valid) ?
+    Status::Fail : queue_qos_available ? Status::Pass : Status::Warn;
+  std::map<std::string, std::string> qos_details{
+    {"publishers", size_value(publishers.size())}};
+  if (publishers.size() == 1U) {
+    qos_details.emplace("actual_reliability", publishers.front().reliability);
+    qos_details.emplace("actual_durability", publishers.front().durability);
+    qos_details.emplace("actual_history", publishers.front().history);
+    qos_details.emplace("actual_depth", size_value(publishers.front().depth));
+  }
+  record(
+    "graph.qos." + topic, qos_status,
+    "topic.qos", topic,
+    qos_status == Status::Pass ? "Publisher QoS matches SensorDataQoS" :
+    qos_status == Status::Warn ?
+    "Publisher is best_effort/volatile, but this DDS graph does not expose history/depth; "
+    "verify keep_last depth 5 with ros2 topic info -v" :
+    "Publisher QoS must be SensorDataQoS: best_effort, volatile, keep_last, depth 5",
+    std::move(qos_details));
 }
 
 void PreflightAnalyzer::observe_vision(const VisionSample & sample, double arrival_s)
@@ -560,8 +660,10 @@ std::vector<Finding> PreflightAnalyzer::runtime_findings(double now_s) const
       stamp_status = Status::Fail;
       stamp_reason = "Header timestamp moved backwards";
     } else if (stats.unset_timestamps > 0U) {
-      stamp_status = Status::Warn;
-      stamp_reason = "One or more Header timestamps were zero/unset";
+      stamp_status = topic == kVisionTopic ? Status::Warn : Status::Fail;
+      stamp_reason = topic == kVisionTopic ?
+        "One or more Vision Header timestamps were zero/unset" :
+        "Image and CameraInfo Header timestamps must be non-zero";
     } else if (stats.duplicate_timestamps > 0U) {
       stamp_status = Status::Warn;
       stamp_reason = "Duplicate Header timestamps were observed";
@@ -582,23 +684,82 @@ std::vector<Finding> PreflightAnalyzer::runtime_findings(double now_s) const
   return result;
 }
 
-std::vector<Finding> PreflightAnalyzer::relationship_findings() const
+std::vector<Finding> PreflightAnalyzer::relationship_findings(double now_s) const
 {
   std::vector<Finding> result;
-  if (latest_image_size_.has_value() && latest_camera_size_.has_value()) {
-    const bool match = latest_image_size_ == latest_camera_size_;
-    result.push_back(
-      Finding{
-        match ? Status::Pass : Status::Fail, "image_camera.dimensions", "cross_topic",
-        match ? "Image and CameraInfo dimensions match" :
-        "Image and CameraInfo dimensions do not match",
-        {
-          {"image", std::to_string((*latest_image_size_)[0]) + "x" +
-            std::to_string((*latest_image_size_)[1])},
-          {"camera_info", std::to_string((*latest_camera_size_)[0]) + "x" +
-            std::to_string((*latest_camera_size_)[1])},
-        }});
-  }
+  const auto image_count = stats_.at(kImageTopic).count;
+  const auto camera_info_count = stats_.at(kCameraInfoTopic).count;
+  constexpr double pairing_delivery_grace_s = 0.1;
+  const auto stale_count = [&](const auto & unmatched) {
+      return static_cast<std::size_t>(std::count_if(
+               unmatched.begin(), unmatched.end(), [&](const auto & entry) {
+                 return now_s - entry.second.arrival_s > pairing_delivery_grace_s;
+               }));
+    };
+  const auto stale_images = stale_count(unmatched_images_);
+  const auto stale_camera_info = stale_count(unmatched_camera_info_);
+  const auto unmatched_count = unmatched_images_.size() + unmatched_camera_info_.size();
+  const auto unmatched_is_final_tail = [&]() {
+      if (unmatched_count == 0U) {
+        return true;
+      }
+      if (unmatched_count != 1U || stale_images != 0U || stale_camera_info != 0U ||
+        !last_matched_stamp_ns_.has_value())
+      {
+        return false;
+      }
+      const auto unmatched_stamp = !unmatched_images_.empty() ?
+        unmatched_images_.begin()->first : unmatched_camera_info_.begin()->first;
+      return unmatched_stamp > *last_matched_stamp_ns_;
+    }();
+  const auto & image_stats = stats_.at(kImageTopic);
+  const auto & camera_stats = stats_.at(kCameraInfoTopic);
+  const bool timestamps_well_formed =
+    image_stats.invalid_timestamps == 0U && image_stats.unset_timestamps == 0U &&
+    camera_stats.invalid_timestamps == 0U && camera_stats.unset_timestamps == 0U;
+  const bool base_pairing_valid = matched_pairs_ > 0U && timestamps_well_formed;
+  const auto pairing_status = !base_pairing_valid || !unmatched_is_final_tail ?
+    Status::Fail : unmatched_count == 0U ? Status::Pass : Status::Warn;
+  result.push_back(
+    Finding{
+      pairing_status,
+      "image_camera.timestamp_pairing", "cross_topic",
+      pairing_status == Status::Pass ?
+      "Every Image has a CameraInfo with the exact same non-zero Header timestamp" :
+      pairing_status == Status::Warn ?
+      "One final message is still within the DDS delivery grace; repeat or extend observation" :
+      "Image and CameraInfo require one-to-one exact non-zero Header timestamp pairing",
+      {
+        {"images", size_value(image_count)},
+        {"camera_info", size_value(camera_info_count)},
+        {"matched", size_value(matched_pairs_)},
+        {"unmatched_images", size_value(unmatched_images_.size())},
+        {"unmatched_camera_info", size_value(unmatched_camera_info_.size())},
+        {"stale_unmatched_images", size_value(stale_images)},
+        {"stale_unmatched_camera_info", size_value(stale_camera_info)},
+        {"unmatched_is_final_tail", unmatched_is_final_tail ? "true" : "false"},
+        {"delivery_grace_ms", "100"},
+      }});
+
+  const bool dimensions_match = matched_pairs_ > 0U && dimension_mismatches_ == 0U;
+  result.push_back(
+    Finding{
+      dimensions_match ? Status::Pass : Status::Fail,
+      "image_camera.dimensions", "cross_topic",
+      dimensions_match ? "Paired Image and CameraInfo dimensions match" :
+      "A timestamp-paired Image and CameraInfo have different dimensions or no pair exists",
+      {{"matched", size_value(matched_pairs_)},
+        {"mismatches", size_value(dimension_mismatches_)}}});
+
+  const bool frame_ids_match = matched_pairs_ > 0U && frame_id_mismatches_ == 0U;
+  result.push_back(
+    Finding{
+      frame_ids_match ? Status::Pass : Status::Fail,
+      "image_camera.frame_id", "cross_topic",
+      frame_ids_match ? "Paired Image and CameraInfo frame_id values match" :
+      "A timestamp-paired Image and CameraInfo have different frame_id values or no pair exists",
+      {{"matched", size_value(matched_pairs_)},
+        {"mismatches", size_value(frame_id_mismatches_)}}});
 
   const auto image_stamp = stats_.at(kImageTopic).last_stamp_ns;
   const auto vision_stamp = stats_.at(kVisionTopic).last_stamp_ns;
@@ -647,7 +808,7 @@ Report PreflightAnalyzer::build_report(double now_s) const
   }
   const auto runtime = runtime_findings(now_s);
   report.findings.insert(report.findings.end(), runtime.begin(), runtime.end());
-  const auto relationships = relationship_findings();
+  const auto relationships = relationship_findings(now_s);
   report.findings.insert(report.findings.end(), relationships.begin(), relationships.end());
 
   report.overall = Status::Pass;
@@ -667,7 +828,8 @@ std::string format_report_text(const Report & report)
   stream << "configuration: timeout=" << report.config.timeout_s
          << "s, vehicle_profile=" << report.config.vehicle_profile
          << ", shared_clock_domain=" << std::boolalpha
-         << report.config.shared_clock_domain << '\n';
+         << report.config.shared_clock_domain
+         << ", expected_frame_id=" << report.config.expected_frame_id << '\n';
   for (const auto & finding : report.findings) {
     stream << '[' << status_name(finding.status) << "] " << finding.topic << ' '
            << finding.check << ": " << finding.reason;
@@ -704,7 +866,9 @@ std::string format_report_json(const Report & report)
          << ", \"vehicle_profile\": \"" << json_escape(report.config.vehicle_profile)
          << "\", \"shared_clock_domain_declared\": "
          << (report.config.shared_clock_domain ? "true" : "false")
-         << ", \"sync_tolerance_ms\": " << report.config.sync_tolerance_ms << "},\n"
+         << ", \"sync_tolerance_ms\": " << report.config.sync_tolerance_ms
+         << ", \"expected_frame_id\": \""
+         << json_escape(report.config.expected_frame_id) << "\"},\n"
          << "  \"findings\": [\n";
   for (std::size_t index = 0; index < report.findings.size(); ++index) {
     const auto & finding = report.findings[index];

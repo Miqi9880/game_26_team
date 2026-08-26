@@ -72,16 +72,20 @@ public:
       declare_parameter("use_sensor_data_qos", true);
     const auto qos = use_sensor_data_qos ?
       rmw_qos_profile_sensor_data : rmw_qos_profile_default;
-    camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
+    camera_pub_ = image_transport::create_camera_publisher(this, "/image_raw", qos);
 
     camera_serial_ = declare_parameter<std::string>("camera_serial", "");
-    image_msg_.header.frame_id = "camera_optical_frame";
+    image_msg_.header.frame_id =
+      declare_parameter<std::string>("frame_id", "camera_optical_frame");
+    if (image_msg_.header.frame_id.empty()) {
+      throw std::invalid_argument("frame_id must not be empty");
+    }
     image_msg_.encoding = "rgb8";
 
     try {
+      loadCameraInfo();
       initializeCamera();
       declareParameters();
-      loadCameraInfo();
 
       params_callback_handle_ = add_on_set_parameters_callback(
         std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
@@ -221,12 +225,12 @@ private:
     const int status = MV_CC_GetFloatValue(camera_handle_, sdk_name, &value);
     if (status != MV_OK) {
       throw std::runtime_error(
-        std::string("MV_CC_GetFloatValue(") + sdk_name + ") failed with SDK status " +
-        formatSdkStatus(status));
+              std::string("MV_CC_GetFloatValue(") + sdk_name + ") failed with SDK status " +
+              formatSdkStatus(status));
     }
     if (!isFiniteInRange(value.fCurValue, value.fMin, value.fMax)) {
       throw std::runtime_error(
-        std::string("SDK returned invalid range for ") + sdk_name);
+              std::string("SDK returned invalid range for ") + sdk_name);
     }
     return value;
   }
@@ -309,8 +313,8 @@ private:
       MV_CC_SetFloatValue(camera_handle_, sdk_name, static_cast<float>(value));
     if (status != MV_OK) {
       throw std::runtime_error(
-        std::string("MV_CC_SetFloatValue(") + sdk_name + ") failed with SDK status " +
-        formatSdkStatus(status));
+              std::string("MV_CC_SetFloatValue(") + sdk_name + ") failed with SDK status " +
+              formatSdkStatus(status));
     }
 
     RCLCPP_INFO(
@@ -323,19 +327,40 @@ private:
     camera_info_manager_ =
       std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
 
-    const auto camera_info_url =
-      declare_parameter("camera_info_url", "package://hik_camera/config/camera_info.yaml");
-    if (!camera_info_manager_->validateURL(camera_info_url)) {
-      RCLCPP_WARN(get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+    camera_info_url_ = declare_parameter<std::string>("camera_info_url", "");
+    if (camera_info_url_.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "camera_info_url is empty; publishing explicitly uncalibrated CameraInfo until a "
+        "verified calibration is supplied");
       return;
     }
-
-    if (!camera_info_manager_->loadCameraInfo(camera_info_url)) {
-      RCLCPP_WARN(get_logger(), "Unable to load camera info from: %s", camera_info_url.c_str());
-      return;
+    if (camera_info_url_ == "package://hik_camera/config/camera_info.yaml") {
+      throw std::invalid_argument(
+              "the checked-in camera_info.yaml is an unverified format example and cannot be "
+              "loaded as formal calibration");
+    }
+    if (!camera_info_manager_->validateURL(camera_info_url_)) {
+      throw std::invalid_argument("invalid camera_info_url: " + camera_info_url_);
+    }
+    if (!camera_info_manager_->loadCameraInfo(camera_info_url_)) {
+      throw std::runtime_error("unable to load camera_info_url: " + camera_info_url_);
     }
 
     camera_info_msg_ = camera_info_manager_->getCameraInfo();
+    camera_info_contract_ = CameraInfoContractSample{
+      camera_info_msg_.width, camera_info_msg_.height,
+      camera_info_msg_.distortion_model, camera_info_msg_.k, camera_info_msg_.d,
+    };
+    const auto validation = validateCameraInfoContract(camera_info_contract_);
+    if (!validation.valid) {
+      throw std::invalid_argument(
+              "camera_info_url does not satisfy the input contract: " + validation.reason);
+    }
+    camera_info_calibrated_ = true;
+    RCLCPP_INFO(
+      get_logger(), "Loaded CameraInfo from explicit URL %s for %ux%u",
+      camera_info_url_.c_str(), camera_info_msg_.width, camera_info_msg_.height);
   }
 
   rcl_interfaces::msg::SetParametersResult parametersCallback(
@@ -350,6 +375,7 @@ private:
       if (parameter.get_name() == "camera_serial" ||
         parameter.get_name() == "camera_name" ||
         parameter.get_name() == "camera_info_url" ||
+        parameter.get_name() == "frame_id" ||
         parameter.get_name() == "use_sensor_data_qos")
       {
         result.successful = false;
@@ -522,6 +548,20 @@ private:
       return false;
     }
 
+    if (camera_info_calibrated_ &&
+      !cameraInfoMatchesFrame(camera_info_contract_, width, height))
+    {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Rejecting %ux%u image because verified CameraInfo is for %ux%u",
+        width, height, camera_info_contract_.width, camera_info_contract_.height);
+      return false;
+    }
+    if (!camera_info_calibrated_) {
+      camera_info_msg_.width = width;
+      camera_info_msg_.height = height;
+    }
+
     image_msg_.header.stamp = now();
     image_msg_.height = height;
     image_msg_.width = width;
@@ -641,12 +681,15 @@ private:
   MV_IMAGE_BASIC_INFO img_info_{};
   std::string camera_serial_;
   std::string camera_name_;
+  std::string camera_info_url_;
+  CameraInfoContractSample camera_info_contract_;
   std::map<std::string, ParameterRange> parameter_ranges_;
   std::atomic<bool> handle_created_{false};
   std::atomic<bool> device_open_{false};
   std::atomic<bool> grabbing_{false};
   std::atomic<bool> stop_requested_{false};
   std::atomic<int> failure_count_{0};
+  bool camera_info_calibrated_{false};
   std::thread capture_thread_;
 };
 

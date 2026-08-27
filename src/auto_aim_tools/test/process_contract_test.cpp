@@ -363,6 +363,47 @@ TEST(ProcessContractTest, InvalidParameterReturnsTwoWithReadableDiagnostic)
     std::string::npos);
 }
 
+TEST(ProcessContractTest, RecorderResourceLimitsRejectInvalidPositiveIntegers)
+{
+  const std::array<std::string, 3> invalid_values = {
+    "-1", "1trailing", std::to_string(std::numeric_limits<std::size_t>::max()) + "0"};
+  const std::array<std::string, 2> options = {
+    "--max-frames", "--max-buffered-image-bytes"};
+
+  std::size_t case_index = 0U;
+  for (const auto & option : options) {
+    for (const auto & invalid_value : invalid_values) {
+      const std::filesystem::path output =
+        "/tmp/auto_aim_tools_recorder_invalid_limit_" + std::to_string(getpid()) + "_" +
+        std::to_string(case_index++);
+      TemporaryFile error_output("recorder_invalid_limit");
+      std::vector<std::string> arguments = {
+        CALIBRATION_DATASET_RECORDER_EXECUTABLE_PATH,
+        "--config", "/does/not/need/to/exist.yaml",
+        "--output", output.string(),
+        "--max-frames", "1",
+        "--max-buffered-image-bytes", "1",
+        "--timeout-s", "0.1",
+      };
+      for (std::size_t index = 0U; index < arguments.size(); ++index) {
+        if (arguments[index] == option) {
+          arguments[index + 1U] = invalid_value;
+          break;
+        }
+      }
+
+      const pid_t process = launch_process(arguments, "", error_output.path());
+      ASSERT_GT(process, 0);
+      EXPECT_EQ(wait_for_process(process), 1) << option << '=' << invalid_value;
+      EXPECT_NE(
+        read_file(error_output.path()).find(
+          option + " must be a positive decimal integer"),
+        std::string::npos) << option << '=' << invalid_value;
+      EXPECT_FALSE(std::filesystem::exists(output)) << output;
+    }
+  }
+}
+
 TEST(ProcessContractTest, SigtermWritesReportAndLeavesNoProcess)
 {
   TemporaryFile output("sigterm");

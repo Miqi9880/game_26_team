@@ -16,13 +16,14 @@ struct Options
   std::string config_path;
   std::string image_list_path;
   std::string report_path;
+  std::string dataset_manifest_path;
 };
 
 void usage()
 {
   std::cerr <<
     "Usage: auto_aim_camera_calibrate --config CONFIG.yaml --image-list IMAGES.txt "
-    "--report REPORT.yaml\n"
+    "--report REPORT.yaml [--dataset-manifest DATASET_MANIFEST.yaml]\n"
     "\n"
     "Reads local raw images only. The output is evidence_only and is never a "
     "production PnP configuration.\n";
@@ -45,6 +46,8 @@ Options parse_options(int argc, char ** argv)
       result.image_list_path = require_value("--image-list");
     } else if (argument == "--report") {
       result.report_path = require_value("--report");
+    } else if (argument == "--dataset-manifest") {
+      result.dataset_manifest_path = require_value("--dataset-manifest");
     } else if (argument == "--help" || argument == "-h") {
       usage();
       std::exit(0);
@@ -70,8 +73,13 @@ void reject_report_input_aliases(const Options & options)
   const auto report = std::filesystem::path(options.report_path).lexically_normal();
   const auto config = std::filesystem::path(options.config_path).lexically_normal();
   const auto manifest = std::filesystem::path(options.image_list_path).lexically_normal();
-  if (report == config || report == manifest) {
-    throw std::invalid_argument("--report must not overwrite --config or --image-list");
+  const auto dataset_manifest =
+    std::filesystem::path(options.dataset_manifest_path).lexically_normal();
+  if (report == config || report == manifest ||
+    (!options.dataset_manifest_path.empty() && report == dataset_manifest))
+  {
+    throw std::invalid_argument(
+            "--report must not overwrite --config, --image-list, or --dataset-manifest");
   }
   if (std::filesystem::exists(report) && std::filesystem::is_directory(report)) {
     throw std::invalid_argument("--report must name a file, not a directory");
@@ -80,20 +88,6 @@ void reject_report_input_aliases(const Options & options)
   if (!parent.empty() && !std::filesystem::exists(parent)) {
     throw std::invalid_argument("parent directory of --report does not exist: " + parent.string());
   }
-}
-
-std::vector<std::string> resolve_image_paths(
-  const std::string & manifest_path,
-  const std::vector<std::string> & entries)
-{
-  const auto base = std::filesystem::path(manifest_path).parent_path();
-  std::vector<std::string> result;
-  result.reserve(entries.size());
-  for (const auto & entry : entries) {
-    const auto path = std::filesystem::path(entry);
-    result.push_back((path.is_absolute() ? path : base / path).lexically_normal().string());
-  }
-  return result;
 }
 
 }  // namespace
@@ -105,12 +99,15 @@ int main(int argc, char ** argv)
     require_absolute_path(options.config_path, "--config");
     require_absolute_path(options.image_list_path, "--image-list");
     require_absolute_path(options.report_path, "--report");
+    if (!options.dataset_manifest_path.empty()) {
+      require_absolute_path(options.dataset_manifest_path, "--dataset-manifest");
+    }
     reject_report_input_aliases(options);
 
     const auto config = rm_auto_aim::camera_calibration::load_calibration_input(options.config_path);
-    const auto manifest_entries = rm_auto_aim::camera_calibration::load_image_manifest(
-      options.image_list_path);
-    const auto image_paths = resolve_image_paths(options.image_list_path, manifest_entries);
+    const auto image_paths =
+      rm_auto_aim::camera_calibration::load_verified_calibration_images(
+      config, options.config_path, options.dataset_manifest_path, options.image_list_path);
     const auto result = rm_auto_aim::camera_calibration::run_image_calibration(config, image_paths);
     rm_auto_aim::camera_calibration::write_evidence_report(result, options.report_path);
 

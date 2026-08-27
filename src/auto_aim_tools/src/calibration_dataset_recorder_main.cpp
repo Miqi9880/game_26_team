@@ -1,5 +1,6 @@
 #include "auto_aim_tools/calibration_dataset_recorder_node.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -34,6 +35,18 @@ void usage()
     "publisher.\n";
 }
 
+std::size_t parse_positive_size(const std::string & value, const char * option)
+{
+  std::size_t parsed = 0U;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+  if (value.empty() || result.ec != std::errc{} ||
+    result.ptr != value.data() + value.size() || parsed == 0U)
+  {
+    throw std::invalid_argument(std::string(option) + " must be a positive decimal integer");
+  }
+  return parsed;
+}
+
 Options parse_options(int argc, char ** argv)
 {
   Options options;
@@ -50,11 +63,12 @@ Options parse_options(int argc, char ** argv)
     } else if (argument == "--output") {
       options.output = value("--output");
     } else if (argument == "--max-frames") {
-      options.max_frames = std::stoull(value("--max-frames"));
+      options.max_frames = parse_positive_size(value("--max-frames"), "--max-frames");
     } else if (argument == "--timeout-s") {
       options.timeout_s = std::stod(value("--timeout-s"));
     } else if (argument == "--max-buffered-image-bytes") {
-      options.max_buffered_image_bytes = std::stoull(value("--max-buffered-image-bytes"));
+      options.max_buffered_image_bytes = parse_positive_size(
+        value("--max-buffered-image-bytes"), "--max-buffered-image-bytes");
     } else if (argument == "--help" || argument == "-h") {
       usage();
       std::exit(0);

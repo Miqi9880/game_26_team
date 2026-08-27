@@ -109,8 +109,13 @@ if(BUILD_TESTING)
   target_compile_options(process_contract_test PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_definitions(process_contract_test PRIVATE
     PREFLIGHT_EXECUTABLE_PATH="$<TARGET_FILE:ros_input_preflight>"
+    CALIBRATION_DATASET_RECORDER_EXECUTABLE_PATH="$<TARGET_FILE:auto_aim_calibration_dataset_recorder>"
   )
-  add_dependencies(process_contract_test ros_input_preflight)
+  add_dependencies(
+    process_contract_test
+    ros_input_preflight
+    auto_aim_calibration_dataset_recorder
+  )
   ament_target_dependencies(process_contract_test
     auto_aim_interfaces
     rclcpp

@@ -194,6 +194,9 @@ void append_config_errors(const DatasetConfig & config, std::vector<std::string>
   if (config.source_mode == "ros" && !config.camera_info_required) {
     errors->push_back("ros_mode_requires_camera_info");
   }
+  if (config.source_mode == "ros" && config.timestamp_source != "ros_header") {
+    errors->push_back("ros_timestamp_source_must_be_ros_header");
+  }
   if (config.timestamp_source.empty()) {
     errors->push_back("timestamp_source_missing");
   }
@@ -483,6 +486,9 @@ DatasetConfig load_ros_config(const std::filesystem::path & config_path)
   if (!config.camera_info_required) {
     throw std::runtime_error("ROS recorder requires camera_info_required: true");
   }
+  if (config.timestamp_source != "ros_header") {
+    throw std::runtime_error("ROS recorder requires source.timestamp_source: ros_header");
+  }
   return config;
 }
 
@@ -642,6 +648,13 @@ DatasetResult build_dataset(
   root["metadata"]["operator"] = request.config.metadata.operator_identifier;
   root["summary"]["record_count"] = request.frames.size();
   root["summary"]["archived_image_count"] = archived_image_count;
+  root["summary"]["received_image_count"] = request.received_image_count;
+  root["summary"]["received_camera_info_count"] = request.received_camera_info_count;
+  root["summary"]["peak_unpaired_image_count"] = request.peak_unpaired_image_count;
+  root["summary"]["peak_unpaired_image_bytes"] = request.peak_unpaired_image_bytes;
+  root["summary"]["buffered_image_bytes"] = request.buffered_image_bytes;
+  root["limits"]["image_count"] = request.image_count_limit;
+  root["limits"]["image_bytes"] = request.image_bytes_limit;
   root["rejection_reasons"] = string_sequence(result.rejection_reasons);
 
   YAML::Node records(YAML::NodeType::Sequence);

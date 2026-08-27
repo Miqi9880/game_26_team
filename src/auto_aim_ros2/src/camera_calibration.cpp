@@ -129,7 +129,7 @@ std::optional<std::string> optional_string(
   }
 }
 
-std::string sha256_file(const std::string & path)
+std::string sha256_file_impl(const std::string & path)
 {
 #ifdef AUTO_AIM_HAS_OPENSSL
   std::ifstream input(path, std::ios::binary);
@@ -427,6 +427,11 @@ bool protected_camera_info_path(const std::string & path)
 
 }  // namespace
 
+std::string sha256_file(const std::string & path)
+{
+  return sha256_file_impl(path);
+}
+
 std::optional<std::string> CalibrationInput::validate() const
 {
   if (schema_version != kSchemaVersion) {
@@ -582,6 +587,96 @@ void verify_dataset_manifest(
             "dataset_manifest_sha256 mismatch: expected " +
             *input.metadata.dataset_manifest_sha256 + ", actual " + actual);
   }
+}
+
+std::vector<std::string> load_verified_calibration_images(
+  const CalibrationInput & input, const std::string & calibration_input_path,
+  const std::string & manifest_path, const std::string & image_list_path)
+{
+  verify_dataset_manifest(input, manifest_path);
+  const auto listed_images = load_image_manifest(image_list_path);
+  if (!input.metadata.dataset_manifest.has_value()) {
+    const auto base = std::filesystem::path(image_list_path).parent_path();
+    std::vector<std::string> result;
+    result.reserve(listed_images.size());
+    for (const auto & entry : listed_images) {
+      const auto path = std::filesystem::path(entry);
+      result.push_back((path.is_absolute() ? path : base / path).lexically_normal().string());
+    }
+    return result;
+  }
+
+  const auto config_directory = std::filesystem::path(calibration_input_path).parent_path();
+  const auto declared = std::filesystem::path(*input.metadata.dataset_manifest);
+  const auto declared_manifest =
+    (declared.is_absolute() ? declared : config_directory / declared).lexically_normal();
+  const auto supplied_manifest = std::filesystem::path(manifest_path).lexically_normal();
+  std::error_code path_error;
+  if (!std::filesystem::equivalent(declared_manifest, supplied_manifest, path_error) || path_error) {
+    throw std::runtime_error(
+            "--dataset-manifest does not match metadata.dataset_manifest resolved from the calibration input");
+  }
+
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(manifest_path);
+  } catch (const YAML::Exception & error) {
+    throw std::runtime_error("cannot parse linked dataset manifest: " + std::string(error.what()));
+  }
+  if (!root.IsMap() || required_string(root, "manifest_type", "dataset manifest") !=
+    "calibration_dataset_evidence" ||
+    required_string(root, "status", "dataset manifest") != "accepted")
+  {
+    throw std::runtime_error("linked dataset manifest must be accepted calibration_dataset_evidence");
+  }
+  const auto records = required_node(root, "records", "dataset manifest");
+  if (!records.IsSequence()) {
+    throw std::runtime_error("dataset manifest records must be a sequence");
+  }
+
+  const auto dataset_directory = supplied_manifest.parent_path();
+  std::vector<std::string> authoritative_entries;
+  std::vector<std::string> authoritative_paths;
+  authoritative_entries.reserve(records.size());
+  authoritative_paths.reserve(records.size());
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    const auto record = records[index];
+    const auto location = "dataset manifest records[" + std::to_string(index) + "]";
+    if (!record.IsMap() || required_string(record, "status", location) != "accepted") {
+      throw std::runtime_error(location + " is not an accepted record");
+    }
+    const auto image_path_text = required_string(record, "image_path", location);
+    const auto expected_sha256 = required_string(record, "sha256", location);
+    if (!valid_sha256(expected_sha256)) {
+      throw std::runtime_error(location + ".sha256 is not a lowercase SHA-256");
+    }
+    const auto relative = std::filesystem::path(image_path_text);
+    if (relative.is_absolute() || relative.empty() || relative.lexically_normal() != relative) {
+      throw std::runtime_error(location + ".image_path must be a normalized relative path");
+    }
+    for (const auto & component : relative) {
+      if (component == "..") {
+        throw std::runtime_error(location + ".image_path escapes the dataset directory");
+      }
+    }
+    const auto archived = (dataset_directory / relative).lexically_normal();
+    if (std::filesystem::is_symlink(archived) || !std::filesystem::is_regular_file(archived)) {
+      throw std::runtime_error(location + ".image_path is not a regular file: " + archived.string());
+    }
+    const auto actual_sha256 = sha256_file(archived.string());
+    if (actual_sha256 != expected_sha256) {
+      throw std::runtime_error(
+              location + ".sha256 mismatch: expected " + expected_sha256 +
+              ", actual " + actual_sha256);
+    }
+    authoritative_entries.push_back(relative.generic_string());
+    authoritative_paths.push_back(archived.string());
+  }
+  if (listed_images != authoritative_entries) {
+    throw std::runtime_error(
+            "--image-list does not exactly match the ordered accepted records in dataset manifest");
+  }
+  return authoritative_paths;
 }
 
 std::vector<std::string> load_image_manifest(const std::string & image_list_path)

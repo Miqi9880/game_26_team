@@ -24,7 +24,8 @@ public:
   CalibrationDatasetRecorderNode(
     calibration_dataset::DatasetConfig config,
     std::filesystem::path output_directory, std::size_t max_frames,
-    std::chrono::milliseconds timeout, std::string git_commit);
+    std::chrono::milliseconds timeout, std::string git_commit,
+    std::size_t max_buffered_image_bytes = 256U * 1024U * 1024U);
 
   bool finished() const;
   std::optional<calibration_dataset::DatasetResult> result() const;
@@ -40,17 +41,22 @@ private:
     const builtin_interfaces::msg::Time & stamp) noexcept;
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & message);
   void camera_info_callback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & message);
+  bool publishers_valid_locked();
+  void update_unpaired_peak_locked();
   void finish_locked(const std::string & reason);
 
   calibration_dataset::DatasetRequest request_;
   std::filesystem::path output_directory_;
   std::size_t max_frames_{0};
+  std::size_t max_buffered_image_bytes_{0};
   std::size_t paired_frames_{0};
+  std::size_t unpaired_image_bytes_{0};
   std::chrono::milliseconds timeout_{0};
   std::string git_commit_;
   std::chrono::steady_clock::time_point started_;
   mutable std::mutex mutex_;
   bool finished_{false};
+  bool publisher_graph_validated_{false};
   std::optional<calibration_dataset::DatasetResult> result_;
   std::multimap<std::int64_t, PendingImage> pending_images_;
   std::multimap<std::int64_t, calibration_dataset::CameraInfoEvidence> pending_camera_info_;

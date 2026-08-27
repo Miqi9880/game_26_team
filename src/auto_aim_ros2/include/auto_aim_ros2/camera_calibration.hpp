@@ -124,6 +124,17 @@ CalibrationInput load_calibration_input(const std::string & yaml_path);
 void verify_dataset_manifest(
   const CalibrationInput & input, const std::string & manifest_path);
 
+// For linked inputs, the accepted records in dataset_manifest.yaml are the
+// authority. The declared manifest path, image-list entries, archive paths,
+// and every PNG SHA-256 are verified before any image is decoded. Legacy
+// unlinked schema-v1 inputs retain the image-list-only behavior.
+std::vector<std::string> load_verified_calibration_images(
+  const CalibrationInput & input, const std::string & calibration_input_path,
+  const std::string & manifest_path, const std::string & image_list_path);
+
+// SHA-256 over exact file bytes, shared by manifest verification and tests.
+std::string sha256_file(const std::string & path);
+
 // Reads one image path per non-empty line.  An empty manifest is returned as
 // an empty vector so the caller can still write a rejected evidence report.
 std::vector<std::string> load_image_manifest(const std::string & image_list_path);

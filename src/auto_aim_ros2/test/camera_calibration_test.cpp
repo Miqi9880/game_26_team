@@ -112,6 +112,23 @@ void write_manifest(const std::filesystem::path & path, const std::vector<std::s
   }
 }
 
+void write_linked_dataset_manifest(
+  const std::filesystem::path & path, const std::string & image_path,
+  const std::string & sha256)
+{
+  YAML::Node root(YAML::NodeType::Map);
+  root["manifest_type"] = "calibration_dataset_evidence";
+  root["status"] = "accepted";
+  YAML::Node record(YAML::NodeType::Map);
+  record["status"] = "accepted";
+  record["image_path"] = image_path;
+  record["sha256"] = sha256;
+  root["records"].push_back(record);
+  std::ofstream output(path, std::ios::binary);
+  ASSERT_TRUE(output.good());
+  output << root;
+}
+
 }  // namespace
 
 TEST(CameraCalibrationInput, StrictEvidenceOnlyValidation)
@@ -349,4 +366,58 @@ TEST(CameraCalibration, LinkedDatasetHashIsArchivedInEvidenceReport)
   EXPECT_EQ(
     yaml["input"]["metadata"]["dataset_manifest"].as<std::string>(),
     "dataset_manifest.yaml");
+}
+
+TEST(CameraCalibration, LinkedDatasetRejectsReplacedImageListAndPng)
+{
+  TemporaryDirectory temporary;
+  const auto images = temporary.path() / "images";
+  std::filesystem::create_directory(images);
+  const auto archived = images / "frame_000001.png";
+  ASSERT_TRUE(cv::imwrite(archived.string(), cv::Mat::zeros(8, 8, CV_8UC3)));
+  const auto archived_sha = calibration::sha256_file(archived.string());
+
+  const auto manifest = temporary.path() / "dataset_manifest.yaml";
+  write_linked_dataset_manifest(manifest, "images/frame_000001.png", archived_sha);
+  auto input = load_fixture();
+  input.metadata.dataset_manifest = "dataset_manifest.yaml";
+  input.metadata.dataset_manifest_sha256 = calibration::sha256_file(manifest.string());
+  const auto config_path = temporary.path() / "calibration_input.yaml";
+  auto config_yaml = YAML::LoadFile(CAMERA_CALIBRATION_TEST_CONFIG_PATH);
+  config_yaml["metadata"]["dataset_manifest"] = *input.metadata.dataset_manifest;
+  config_yaml["metadata"]["dataset_manifest_sha256"] =
+    *input.metadata.dataset_manifest_sha256;
+  std::ofstream(config_path) << config_yaml;
+
+  const auto image_list = temporary.path() / "images.txt";
+  write_manifest(image_list, {"images/frame_000001.png"});
+  const auto verified = calibration::load_verified_calibration_images(
+    input, config_path.string(), manifest.string(), image_list.string());
+  ASSERT_EQ(verified.size(), 1U);
+  EXPECT_EQ(std::filesystem::path(verified.front()), archived);
+
+  write_manifest(image_list, {"images/alternate_board.png"});
+  EXPECT_THROW(
+    calibration::load_verified_calibration_images(
+      input, config_path.string(), manifest.string(), image_list.string()),
+    std::runtime_error);
+  const auto report = temporary.path() / "must_not_exist.yaml";
+  const auto cli_command = [&]() {
+      return std::string("\"") + CAMERA_CALIBRATION_EXECUTABLE_PATH +
+             "\" --config \"" + config_path.string() +
+             "\" --dataset-manifest \"" + manifest.string() +
+             "\" --image-list \"" + image_list.string() +
+             "\" --report \"" + report.string() + "\"";
+    };
+  EXPECT_NE(std::system(cli_command().c_str()), 0);
+  EXPECT_FALSE(std::filesystem::exists(report));
+
+  write_manifest(image_list, {"images/frame_000001.png"});
+  ASSERT_TRUE(cv::imwrite(archived.string(), cv::Mat::ones(8, 8, CV_8UC3)));
+  EXPECT_THROW(
+    calibration::load_verified_calibration_images(
+      input, config_path.string(), manifest.string(), image_list.string()),
+    std::runtime_error);
+  EXPECT_NE(std::system(cli_command().c_str()), 0);
+  EXPECT_FALSE(std::filesystem::exists(report));
 }

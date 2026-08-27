@@ -102,13 +102,21 @@ ros2 run auto_aim_tools auto_aim_calibration_dataset_recorder -- \
   --config /absolute/path/ros_dataset_config.yaml \
   --output /absolute/path/dataset_run_002 \
   --max-frames 20 \
-  --timeout-s 30
+  --timeout-s 30 \
+  --max-buffered-image-bytes 268435456
 ~~~
 
-节点只订阅 /image_raw 和 /camera_info，QoS 为 SensorDataQoS。每个 Image 必须有完全相同且
-非零规范时间戳的 CameraInfo；不使用时间容差。Image 必须是 packed rgb8，
-step == width * 3 且 data.size() == step * height。达到 --max-frames 后停止；超时、中断、
-输入缺失或未配对消息会写 rejected manifest 并返回非零。ROS rgb8 按原像素无损写入
+节点只订阅 /image_raw 和 /camera_info，QoS 为 SensorDataQoS。开始采集和采集过程中，两个
+输入 topic 都必须恰有一个消息类型正确、best-effort/volatile 的 publisher。每个 Image 必须有
+完全相同且非零规范时间戳的 CameraInfo；不使用时间容差。ROS 录制的 timestamp_source 只能是
+工具可验证的 ros_header，其他硬件时间声明会在采集前拒绝。Image 必须是 packed rgb8，
+step == width * 3 且 data.size() == step * height。
+
+--max-frames 同时限制总接收并保存的 Image 数和目标配对数；达到配对数时正常停止，下一条超过
+总帧上限的 Image 会在复制前立即停止并写 rejected manifest。--max-buffered-image-bytes（默认
+256 MiB）独立限制内存中的原始 Image 字节，超过上限同样在复制前拒绝。manifest 的
+summary/limits 记录总接收数、缓存数/字节数和未配对峰值。超时、中断、publisher 数量/类型/QoS
+变化、输入缺失或未配对消息都会写 rejected manifest 并返回非零。ROS rgb8 按原像素无损写入
 PNG，记录的 SHA-256 针对归档 PNG 字节；width、height、encoding、step、data size 等
 字段描述原始 ROS message。
 
@@ -154,7 +162,10 @@ ros2 run auto_aim_ros2 auto_aim_camera_calibrate -- \
   --report /absolute/path/dataset_run_001/camera_intrinsic_report.yaml
 ~~~
 
-哈希不一致、缺少已声明的 manifest 或额外传入未声明 manifest 都会在求解前失败。旧的
+哈希不一致、缺少已声明的 manifest 或额外传入未声明 manifest 都会在求解前失败。有关联时，
+metadata.dataset_manifest 必须解析到实际传入的同一文件；manifest 中按顺序排列的 accepted
+records 是唯一权威图像集。标定器要求 images.txt 与这些相对路径逐项完全一致，并在读取图像前
+复算每个归档 PNG 的 SHA-256；替换 image-list、路径或 PNG 内容都会拒绝。旧的
 schema v1 配置没有这两个可选 metadata 字段时仍兼容原命令。标定报告继续保持
 profile: evidence_only、production_ready: false，并归档已验证的 dataset_manifest_sha256。
 候选 K/D 不得写入正式 camera_info.yaml 或 PnP production profile。

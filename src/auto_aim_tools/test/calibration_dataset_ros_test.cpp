@@ -1,5 +1,6 @@
 #include "auto_aim_tools/calibration_dataset_recorder_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -171,6 +172,156 @@ TEST_F(CalibrationDatasetRosTest, MissingCameraInfoTimesOutToInputEvidence)
   EXPECT_EQ(manifest["status"].as<std::string>(), "rejected");
   ASSERT_GT(manifest["records"].size(), 0U);
   EXPECT_FALSE(manifest["records"][0]["camera_info"]["present"].as<bool>());
+}
+
+TEST_F(CalibrationDatasetRosTest, HighRateMissingCameraInfoIsHardBoundedByMaxFrames)
+{
+  TemporaryDirectory temporary;
+  auto recorder = std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+    ros_config(1), temporary.path() / "dataset", 1, 2s, "abcdef0");
+  auto publisher_node = std::make_shared<rclcpp::Node>("calibration_dataset_bounded_pub");
+  auto image_publisher = publisher_node->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::SensorDataQoS());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(recorder);
+  executor.add_node(publisher_node);
+
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  std::int32_t stamp = 100;
+  while (!recorder->finished() && std::chrono::steady_clock::now() < deadline) {
+    image_publisher->publish(image(stamp++, 45));
+    executor.spin_some();
+  }
+  ASSERT_TRUE(recorder->finished());
+  const auto result = recorder->result();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->accepted);
+  const auto manifest = YAML::LoadFile(result->manifest_path.string());
+  EXPECT_EQ(manifest["summary"]["record_count"].as<std::size_t>(), 1U);
+  EXPECT_EQ(manifest["summary"]["peak_unpaired_image_count"].as<std::size_t>(), 1U);
+  EXPECT_EQ(manifest["summary"]["peak_unpaired_image_bytes"].as<std::size_t>(), 36U);
+  EXPECT_EQ(manifest["limits"]["image_count"].as<std::size_t>(), 1U);
+  const auto reasons = manifest["rejection_reasons"];
+  ASSERT_TRUE(reasons.IsSequence());
+  EXPECT_TRUE(std::any_of(
+    reasons.begin(), reasons.end(), [](const YAML::Node & reason) {
+      return reason.as<std::string>() == "image_count_limit_exceeded";
+    }));
+}
+
+TEST_F(CalibrationDatasetRosTest, MultipleImagePublishersImmediatelyRejectEvidence)
+{
+  TemporaryDirectory temporary;
+  auto recorder = std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+    ros_config(1), temporary.path() / "dataset", 1, 2s, "abcdef0");
+  auto first = std::make_shared<rclcpp::Node>("calibration_dataset_first_pub");
+  auto second = std::make_shared<rclcpp::Node>("calibration_dataset_second_pub");
+  auto camera_node = std::make_shared<rclcpp::Node>("calibration_dataset_camera_pub");
+  auto first_image = first->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::SensorDataQoS());
+  auto second_image = second->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::SensorDataQoS());
+  auto camera = camera_node->create_publisher<sensor_msgs::msg::CameraInfo>(
+    "/camera_info", rclcpp::SensorDataQoS());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(recorder);
+  executor.add_node(first);
+  executor.add_node(second);
+  executor.add_node(camera_node);
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (!recorder->finished() && std::chrono::steady_clock::now() < deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(recorder->finished());
+  const auto result = recorder->result();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->accepted);
+  const auto manifest = YAML::LoadFile(result->manifest_path.string());
+  EXPECT_EQ(manifest["records"].size(), 0U);
+  EXPECT_TRUE(std::any_of(
+    manifest["rejection_reasons"].begin(), manifest["rejection_reasons"].end(),
+    [](const YAML::Node & reason) {
+      return reason.as<std::string>() == "publisher_count_not_one:/image_raw=2";
+    }));
+  (void)first_image;
+  (void)second_image;
+  (void)camera;
+}
+
+TEST_F(CalibrationDatasetRosTest, ImageByteLimitRejectsBeforeCopyingOversizedFrame)
+{
+  TemporaryDirectory temporary;
+  auto recorder = std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+    ros_config(1), temporary.path() / "dataset", 1, 2s, "abcdef0", 35U);
+  auto publisher_node = std::make_shared<rclcpp::Node>("calibration_dataset_byte_limit_pub");
+  auto image_publisher = publisher_node->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::SensorDataQoS());
+  auto camera_publisher = publisher_node->create_publisher<sensor_msgs::msg::CameraInfo>(
+    "/camera_info", rclcpp::SensorDataQoS());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(recorder);
+  executor.add_node(publisher_node);
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (!recorder->finished() && std::chrono::steady_clock::now() < deadline) {
+    image_publisher->publish(image(300, 45));
+    executor.spin_some();
+  }
+  ASSERT_TRUE(recorder->finished());
+  const auto result = recorder->result();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->accepted);
+  const auto manifest = YAML::LoadFile(result->manifest_path.string());
+  EXPECT_EQ(manifest["records"].size(), 0U);
+  EXPECT_EQ(manifest["limits"]["image_bytes"].as<std::size_t>(), 35U);
+  EXPECT_TRUE(std::any_of(
+    manifest["rejection_reasons"].begin(), manifest["rejection_reasons"].end(),
+    [](const YAML::Node & reason) {
+      return reason.as<std::string>() == "image_bytes_limit_exceeded";
+    }));
+  (void)camera_publisher;
+}
+
+TEST_F(CalibrationDatasetRosTest, ReliablePublisherQosIsRejected)
+{
+  TemporaryDirectory temporary;
+  auto recorder = std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+    ros_config(1), temporary.path() / "dataset", 1, 2s, "abcdef0");
+  auto publisher_node = std::make_shared<rclcpp::Node>("calibration_dataset_wrong_qos_pub");
+  auto image_publisher = publisher_node->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::QoS(5).reliable().durability_volatile());
+  auto camera_publisher = publisher_node->create_publisher<sensor_msgs::msg::CameraInfo>(
+    "/camera_info", rclcpp::SensorDataQoS());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(recorder);
+  executor.add_node(publisher_node);
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (!recorder->finished() && std::chrono::steady_clock::now() < deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(recorder->finished());
+  const auto result = recorder->result();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->accepted);
+  EXPECT_TRUE(std::any_of(
+    result->rejection_reasons.begin(), result->rejection_reasons.end(),
+    [](const std::string & reason) {
+      return reason == "publisher_qos_mismatch:/image_raw";
+    }));
+  (void)image_publisher;
+  (void)camera_publisher;
+}
+
+TEST_F(CalibrationDatasetRosTest, UnsupportedTimestampClaimIsRejectedBeforeRecording)
+{
+  TemporaryDirectory temporary;
+  auto config = ros_config(1);
+  config.timestamp_source = "mcu_time";
+  EXPECT_THROW(
+    std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+      config, temporary.path() / "dataset", 1, 2s, "abcdef0"),
+    std::invalid_argument);
 }
 
 TEST_F(CalibrationDatasetRosTest, EmptyInputAndRepeatedStopAreIdempotent)

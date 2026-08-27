@@ -1,5 +1,6 @@
 #include "auto_aim_tools/calibration_dataset_recorder_node.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -26,7 +27,8 @@ calibration_dataset::HeaderStamp camera_stamp(const builtin_interfaces::msg::Tim
 CalibrationDatasetRecorderNode::CalibrationDatasetRecorderNode(
   calibration_dataset::DatasetConfig config,
   std::filesystem::path output_directory, std::size_t max_frames,
-  std::chrono::milliseconds timeout, std::string git_commit)
+  std::chrono::milliseconds timeout, std::string git_commit,
+  std::size_t max_buffered_image_bytes)
 : Node(
     "auto_aim_calibration_dataset_recorder",
     rclcpp::NodeOptions()
@@ -35,6 +37,7 @@ CalibrationDatasetRecorderNode::CalibrationDatasetRecorderNode(
     .enable_rosout(false)),
   output_directory_(std::move(output_directory)),
   max_frames_(max_frames),
+  max_buffered_image_bytes_(max_buffered_image_bytes),
   timeout_(timeout),
   git_commit_(std::move(git_commit)),
   started_(std::chrono::steady_clock::now())
@@ -42,16 +45,21 @@ CalibrationDatasetRecorderNode::CalibrationDatasetRecorderNode(
   if (config.source_mode != "ros" || !config.camera_info_required) {
     throw std::invalid_argument("recorder requires ROS config with camera_info_required=true");
   }
+  if (config.timestamp_source != "ros_header") {
+    throw std::invalid_argument("ROS recorder timestamp_source must be ros_header");
+  }
   if (output_directory_.empty() || std::filesystem::exists(output_directory_)) {
     throw std::invalid_argument("recorder output must be a new directory");
   }
-  if (max_frames_ == 0U || timeout_.count() <= 0) {
-    throw std::invalid_argument("max_frames and timeout must be positive");
+  if (max_frames_ == 0U || max_buffered_image_bytes_ == 0U || timeout_.count() <= 0) {
+    throw std::invalid_argument("max_frames, max_buffered_image_bytes and timeout must be positive");
   }
   if (config.min_views <= 0 || max_frames_ < static_cast<std::size_t>(config.min_views)) {
     throw std::invalid_argument("max_frames must be at least the configured min_views");
   }
   request_.config = std::move(config);
+  request_.image_count_limit = max_frames_;
+  request_.image_bytes_limit = max_buffered_image_bytes_;
 
   const auto qos = rclcpp::SensorDataQoS();
   image_subscription_ = create_subscription<sensor_msgs::msg::Image>(
@@ -68,6 +76,9 @@ CalibrationDatasetRecorderNode::CalibrationDatasetRecorderNode(
     std::chrono::milliseconds(20),
     [this]() {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!finished_) {
+        publishers_valid_locked();
+      }
       if (!finished_ && std::chrono::steady_clock::now() - started_ >= timeout_) {
         finish_locked("input_timeout");
       }
@@ -94,6 +105,19 @@ void CalibrationDatasetRecorderNode::image_callback(
   if (finished_) {
     return;
   }
+  ++request_.received_image_count;
+  publishers_valid_locked();
+  if (finished_) {
+    return;
+  }
+  if (request_.frames.size() >= max_frames_) {
+    finish_locked("image_count_limit_exceeded");
+    return;
+  }
+  if (message->data.size() > max_buffered_image_bytes_ - request_.buffered_image_bytes) {
+    finish_locked("image_bytes_limit_exceeded");
+    return;
+  }
   calibration_dataset::FrameInput frame;
   frame.source_image = "ros:/image_raw";
   frame.stamp = image_stamp(message->header.stamp);
@@ -116,12 +140,15 @@ void CalibrationDatasetRecorderNode::image_callback(
   }
   const auto frame_index = request_.frames.size();
   request_.frames.push_back(std::move(frame));
+  request_.buffered_image_bytes += message->data.size();
   if (!timestamp.has_value()) {
     request_.frames.back().input_errors.push_back("image_timestamp_not_canonical_nonzero");
   } else {
     const auto camera = pending_camera_info_.find(*timestamp);
     if (camera == pending_camera_info_.end()) {
       pending_images_.emplace(*timestamp, PendingImage{frame_index});
+      unpaired_image_bytes_ += message->data.size();
+      update_unpaired_peak_locked();
       return;
     }
     request_.frames.back().camera_info = camera->second;
@@ -137,6 +164,11 @@ void CalibrationDatasetRecorderNode::camera_info_callback(
   const sensor_msgs::msg::CameraInfo::ConstSharedPtr & message)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (finished_) {
+    return;
+  }
+  ++request_.received_camera_info_count;
+  publishers_valid_locked();
   if (finished_) {
     return;
   }
@@ -161,11 +193,63 @@ void CalibrationDatasetRecorderNode::camera_info_callback(
   }
   const auto frame_index = image->second.frame_index;
   pending_images_.erase(image);
+  unpaired_image_bytes_ -= request_.frames.at(frame_index).rgb8.size();
   request_.frames.at(frame_index).camera_info = std::move(camera);
   ++paired_frames_;
   if (paired_frames_ >= max_frames_) {
     finish_locked({});
   }
+}
+
+bool CalibrationDatasetRecorderNode::publishers_valid_locked()
+{
+  const auto validate = [this](const char * topic, const char * expected_type) {
+      const auto endpoints = get_publishers_info_by_topic(topic);
+      if (endpoints.size() > 1U) {
+        finish_locked(std::string("publisher_count_not_one:") + topic + "=" +
+          std::to_string(endpoints.size()));
+        return false;
+      }
+      if (endpoints.size() == 1U && endpoints.front().topic_type() != expected_type) {
+        finish_locked(std::string("publisher_type_mismatch:") + topic + "=" +
+          endpoints.front().topic_type());
+        return false;
+      }
+      if (endpoints.size() == 1U) {
+        const auto qos = endpoints.front().qos_profile();
+        if (qos.reliability() != rclcpp::ReliabilityPolicy::BestEffort ||
+          qos.durability() != rclcpp::DurabilityPolicy::Volatile)
+        {
+          finish_locked(std::string("publisher_qos_mismatch:") + topic);
+          return false;
+        }
+      }
+      return endpoints.size() == 1U;
+    };
+  const bool image_valid = validate("/image_raw", "sensor_msgs/msg/Image");
+  if (finished_) {
+    return false;
+  }
+  const bool camera_valid = validate("/camera_info", "sensor_msgs/msg/CameraInfo");
+  if (finished_) {
+    return false;
+  }
+  if (image_valid && camera_valid) {
+    publisher_graph_validated_ = true;
+    return true;
+  }
+  if (publisher_graph_validated_) {
+    finish_locked("required_publisher_disappeared");
+  }
+  return false;
+}
+
+void CalibrationDatasetRecorderNode::update_unpaired_peak_locked()
+{
+  request_.peak_unpaired_image_count =
+    std::max(request_.peak_unpaired_image_count, pending_images_.size());
+  request_.peak_unpaired_image_bytes =
+    std::max(request_.peak_unpaired_image_bytes, unpaired_image_bytes_);
 }
 
 void CalibrationDatasetRecorderNode::finish_locked(const std::string & reason)

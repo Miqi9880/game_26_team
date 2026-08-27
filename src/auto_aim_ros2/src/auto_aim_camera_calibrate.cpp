@@ -90,20 +90,6 @@ void reject_report_input_aliases(const Options & options)
   }
 }
 
-std::vector<std::string> resolve_image_paths(
-  const std::string & manifest_path,
-  const std::vector<std::string> & entries)
-{
-  const auto base = std::filesystem::path(manifest_path).parent_path();
-  std::vector<std::string> result;
-  result.reserve(entries.size());
-  for (const auto & entry : entries) {
-    const auto path = std::filesystem::path(entry);
-    result.push_back((path.is_absolute() ? path : base / path).lexically_normal().string());
-  }
-  return result;
-}
-
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -119,11 +105,9 @@ int main(int argc, char ** argv)
     reject_report_input_aliases(options);
 
     const auto config = rm_auto_aim::camera_calibration::load_calibration_input(options.config_path);
-    rm_auto_aim::camera_calibration::verify_dataset_manifest(
-      config, options.dataset_manifest_path);
-    const auto manifest_entries = rm_auto_aim::camera_calibration::load_image_manifest(
-      options.image_list_path);
-    const auto image_paths = resolve_image_paths(options.image_list_path, manifest_entries);
+    const auto image_paths =
+      rm_auto_aim::camera_calibration::load_verified_calibration_images(
+      config, options.config_path, options.dataset_manifest_path, options.image_list_path);
     const auto result = rm_auto_aim::camera_calibration::run_image_calibration(config, image_paths);
     rm_auto_aim::camera_calibration::write_evidence_report(result, options.report_path);
 

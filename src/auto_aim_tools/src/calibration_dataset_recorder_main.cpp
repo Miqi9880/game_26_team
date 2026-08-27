@@ -20,6 +20,7 @@ struct Options
   std::filesystem::path config;
   std::filesystem::path output;
   std::size_t max_frames{0};
+  std::size_t max_buffered_image_bytes{256U * 1024U * 1024U};
   double timeout_s{0.0};
 };
 
@@ -27,7 +28,8 @@ void usage()
 {
   std::cerr <<
     "Usage: auto_aim_calibration_dataset_recorder --config CONFIG.yaml "
-    "--output DATASET_DIR --max-frames COUNT --timeout-s SECONDS\n"
+    "--output DATASET_DIR --max-frames COUNT --timeout-s SECONDS "
+    "[--max-buffered-image-bytes BYTES]\n"
     "Subscribes only to /image_raw and /camera_info. It never opens a camera or creates a "
     "publisher.\n";
 }
@@ -51,6 +53,8 @@ Options parse_options(int argc, char ** argv)
       options.max_frames = std::stoull(value("--max-frames"));
     } else if (argument == "--timeout-s") {
       options.timeout_s = std::stod(value("--timeout-s"));
+    } else if (argument == "--max-buffered-image-bytes") {
+      options.max_buffered_image_bytes = std::stoull(value("--max-buffered-image-bytes"));
     } else if (argument == "--help" || argument == "-h") {
       usage();
       std::exit(0);
@@ -59,7 +63,7 @@ Options parse_options(int argc, char ** argv)
     }
   }
   if (options.config.empty() || options.output.empty() || options.max_frames == 0U ||
-    options.timeout_s <= 0.0)
+    options.timeout_s <= 0.0 || options.max_buffered_image_bytes == 0U)
   {
     throw std::invalid_argument(
             "--config, --output, positive --max-frames and positive --timeout-s are required");
@@ -84,7 +88,7 @@ int main(int argc, char ** argv)
       config, options->output, options->max_frames,
       std::chrono::milliseconds(
         static_cast<std::int64_t>(options->timeout_s * 1000.0)),
-      AUTO_AIM_DATASET_GIT_COMMIT);
+      AUTO_AIM_DATASET_GIT_COMMIT, options->max_buffered_image_bytes);
     rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(node);
     while (rclcpp::ok() && !node->finished()) {

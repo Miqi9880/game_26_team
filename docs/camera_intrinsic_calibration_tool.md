@@ -64,7 +64,10 @@ dataset_manifest_sha256，必须额外传入：
 ~~~
 
 工具会在读取图像和执行标定前对 manifest 实际字节复算 SHA-256；缺少 manifest、哈希
-不一致或向未声明关联的旧配置额外传入 manifest 都会直接失败。由
+不一致或向未声明关联的旧配置额外传入 manifest 都会直接失败。有关联时，metadata 中的相对
+manifest 路径必须解析到实际传入文件，accepted records 是权威且有序的图像集；images.txt
+必须逐项完全一致，每个归档 PNG 的相对路径和 SHA-256 也会在解码前复核。因此替换 image-list、
+替换 PNG 或借用其他数据集都会 fail-closed。由
 auto_aim_calibration_dataset 生成的 calibration_input.yaml 始终启用此验证链，标定报告
 会归档已验证的 dataset_manifest_sha256。
 

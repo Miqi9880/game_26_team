@@ -17,6 +17,11 @@ struct Options
   std::string csv_path{""};
 };
 
+void print_usage(std::ostream & stream)
+{
+  stream << "Usage: auto_aim_dry_run [--frames N] [--mock-target] [--csv PATH]\n";
+}
+
 Options parse_options(int argc, char ** argv)
 {
   Options options;
@@ -28,8 +33,11 @@ Options parse_options(int argc, char ** argv)
       options.frames = std::atoi(argv[++i]);
     } else if (arg == "--csv" && i + 1 < argc) {
       options.csv_path = argv[++i];
+    } else if (arg == "--help" || arg == "-h") {
+      print_usage(std::cout);
+      std::exit(0);
     } else {
-      std::cerr << "Usage: auto_aim_dry_run [--frames N] [--mock-target] [--csv PATH]\n";
+      print_usage(std::cerr);
       std::exit(2);
     }
   }

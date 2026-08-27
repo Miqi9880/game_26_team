@@ -2,10 +2,11 @@
 """Fail-closed, read-only audits for detector and PnP profile contracts.
 
 The C++ detector and PnP loaders remain the runtime source of truth.  This
-module is a preflight gate around those contracts: it does not load OpenVINO,
-run a camera, or infer semantics from file names/class numbers.  The checks
-mirror the explicitly documented schema and add provenance/hash checks that
-are deliberately outside the runtime loader.
+module is a preflight gate around those contracts: it may read OpenVINO model
+metadata, but never compiles a model, runs inference, uses hardware, runs a
+camera, or infers semantics from file names/class numbers.  The checks mirror
+the explicitly documented schema and add provenance/hash checks that are
+deliberately outside the runtime loader.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ except Exception:  # pragma: no cover - exercised only on minimal hosts.
 STATUS_CODES = {"PASS": 0, "WARN": 2, "FAIL": 1}
 _SEVERITY = {"PASS": 0, "WARN": 1, "FAIL": 2}
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_INTEGER_TEXT_RE = re.compile(r"^[+-]?[0-9]+$")
 
 
 def status_code(status: str) -> int:
@@ -96,6 +98,69 @@ def _strict_int(value: Any) -> bool:
     """Return true only for a YAML/JSON integer, excluding boolean aliases."""
 
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _numeric_mapping_key(value: Any) -> Optional[int]:
+    """Return an integer only to detect aliases among class-map keys.
+
+    String keys are never accepted as class identifiers, but their integer
+    spelling must still be normalized here so YAML ``1`` and ``\"1\"`` cannot
+    silently overwrite one another during a later conversion.
+    """
+
+    if _strict_int(value):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if _INTEGER_TEXT_RE.fullmatch(text):
+            try:
+                return int(text)
+            except ValueError:
+                # Python can reject deliberately enormous integer strings;
+                # they remain invalid keys and must not crash the audit.
+                return None
+    return None
+
+
+def _normalize_class_mapping(
+    mapping: Mapping[Any, Any],
+    result: "AuditResult",
+    *,
+    field: str,
+) -> tuple[dict[int, str], bool]:
+    """Validate class-map keys without coercion or collision overwrite.
+
+    The returned map contains only unambiguous, strict integer keys. A caller
+    must not use it as an authoritative contract when ``keys_valid`` is false.
+    """
+
+    normalized: dict[int, str] = {}
+    seen_normalized: set[int] = set()
+    keys_valid = True
+    for key, value in mapping.items():
+        normalized_key = _numeric_mapping_key(key)
+        key_is_strict_integer = _strict_int(key)
+        if not key_is_strict_integer:
+            result.fail(
+                "class_mapping_key",
+                "class_to_armor_type keys must be integer ids, not boolean or numeric-string aliases",
+                field=field,
+            )
+            keys_valid = False
+        if normalized_key is None:
+            continue
+        if normalized_key in seen_normalized:
+            result.fail(
+                "class_mapping_duplicate_key",
+                "class_to_armor_type keys must not normalize to the same integer id",
+                field=field,
+            )
+            keys_valid = False
+            continue
+        seen_normalized.add(normalized_key)
+        if key_is_strict_integer:
+            normalized[normalized_key] = str(value)
+    return normalized, keys_valid
 
 
 def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
@@ -392,21 +457,47 @@ def _runtime_element_type(port: Any) -> str:
 
 
 def _runtime_layout(port: Any) -> Optional[str]:
-    """Read an explicitly assigned OpenVINO layout, if the API exposes it."""
+    """Read an explicitly assigned OpenVINO layout, if the API exposes it.
 
-    getter = getattr(port, "get_layout", None)
-    if not callable(getter):
-        return None
-    try:
-        value = getter()
-    except Exception:
-        return None
-    text = str(value).strip()
-    if not text or text in {"[]", "?", "{?}"}:
-        return None
-    # Layout's string representation can be ``[N,C,H,W]`` in some releases.
-    text = text.strip("[]").replace(",", "").replace(" ", "")
-    return text.upper() or None
+    OpenVINO Python releases differ on whether layout is exposed directly on
+    ``Output`` or on its owning node. Probe both locations without deriving an
+    axis order from the tensor shape.
+    """
+
+    candidates = [port]
+    get_node = getattr(port, "get_node", None)
+    if callable(get_node):
+        try:
+            node = get_node()
+        except Exception:
+            node = None
+        if node is not None:
+            candidates.append(node)
+    for candidate in candidates:
+        getter = getattr(candidate, "get_layout", None)
+        if not callable(getter):
+            continue
+        try:
+            value = getter()
+        except Exception:
+            continue
+        if value is None:
+            continue
+        empty = getattr(value, "empty", None)
+        try:
+            empty = empty() if callable(empty) else empty
+        except Exception:
+            empty = None
+        if empty is True:
+            continue
+        text = str(value).strip()
+        if not text or text in {"[]", "[...]", "?", "{?}", "..."}:
+            continue
+        # Layout's string representation can be ``[N,C,H,W]`` in some releases.
+        text = text.strip("[]").replace(",", "").replace(" ", "")
+        if text:
+            return text.upper()
+    return None
 
 
 def _runtime_static_shape(port: Any) -> tuple[Optional[list[int]], Optional[str]]:
@@ -794,7 +885,7 @@ def _audit_model_contract(
         shape = _require_sequence(input_node, "shape", result, "input", 4)
         if shape is not None:
             result.values["input_shape"] = shape
-            if shape != [1, 3, shape[2], shape[3]] or not all(isinstance(item, int) and item > 0 for item in shape[2:]):
+            if shape[0] != 1 or shape[1] != 3 or not all(_strict_int(item) and item > 0 for item in shape):
                 result.fail("input_shape", "input.shape must be [1,3,height,width] with positive dimensions", field="input.shape")
         layout = _require_string(input_node, "layout", result, "input")
         if layout != "NCHW":
@@ -831,7 +922,7 @@ def _audit_model_contract(
         shape = _require_sequence(output_node, "shape", result, "output", 3)
         if shape is not None:
             result.values["output_shape"] = shape
-            if shape[0] != 1 or not all(isinstance(item, int) and item > 0 for item in shape):
+            if shape[0] != 1 or not all(_strict_int(item) and item > 0 for item in shape):
                 result.fail("output_shape", "output.shape must be [1,rows,columns] with positive dimensions", field="output.shape")
         layout = _require_string(output_node, "layout", result, "output")
         if layout != "NRC":
@@ -852,7 +943,7 @@ def _audit_model_contract(
             columns = output_node["shape"][2]
             for offset_key, count_key in (("color_logits_offset", "color_class_count"), ("armor_logits_offset", "armor_class_count")):
                 offset, count = output_node.get(offset_key), output_node.get(count_key)
-                if isinstance(columns, int) and isinstance(offset, int) and isinstance(count, int) and (offset + count > columns or count <= 0):
+                if _strict_int(columns) and _strict_int(offset) and _strict_int(count) and (offset + count > columns or count <= 0):
                     result.fail("tensor_range", f"{offset_key}+{count_key} must fit output columns", field=f"output.{offset_key}")
 
     postprocess = _require_map(root, "postprocess", result)
@@ -890,19 +981,19 @@ def _audit_model_contract(
         if not isinstance(mapping, Mapping):
             result.fail("class_mapping", "semantics.class_to_armor_type must be an explicit map", field="semantics.class_to_armor_type")
         else:
-            normalized: dict[int, str] = {}
-            for key, value in mapping.items():
-                try:
-                    class_id = int(key)
-                except (TypeError, ValueError):
-                    result.fail("class_mapping_key", "class_to_armor_type keys must be integer ids", field="semantics.class_to_armor_type")
-                    continue
-                normalized[class_id] = str(value)
+            normalized, mapping_keys_valid = _normalize_class_mapping(
+                mapping, result, field="semantics.class_to_armor_type"
+            )
+            mapping_valid = mapping_keys_valid
+            for value in normalized.values():
                 if str(value) not in {"small", "large"}:
                     result.fail("class_mapping_value", "class_to_armor_type values must be small or large", field="semantics.class_to_armor_type", value=value)
-            if isinstance(armor_count, int) and set(normalized) != set(range(armor_count)):
+                    mapping_valid = False
+            if not _strict_int(armor_count) or set(normalized) != set(range(armor_count)):
                 result.fail("class_mapping_incomplete", "class_to_armor_type must map every armor class exactly once", field="semantics.class_to_armor_type")
-            result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized.items())}
+                mapping_valid = False
+            if mapping_valid:
+                result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized.items())}
 
     # Keep the human-readable contract distinct from the small software golden
     # fixture.  The latter proves only deterministic preprocessing mechanics;
@@ -1435,16 +1526,15 @@ def audit_pnp_config(
     armor_geometry = _require_map(root, "armor_geometry", result)
     mapping = root.get("class_to_armor_type")
     normalized_mapping: dict[int, str] = {}
+    mapping_valid = False
     if isinstance(mapping, Mapping):
-        for key, value in mapping.items():
-            try:
-                class_id = int(key)
-            except (TypeError, ValueError):
-                result.fail("class_mapping_key", "class_to_armor_type keys must be integer ids", field="class_to_armor_type")
-                continue
-            normalized_mapping[class_id] = str(value)
-            if str(value) not in {"small", "large"}:
+        normalized_mapping, mapping_valid = _normalize_class_mapping(
+            mapping, result, field="class_to_armor_type"
+        )
+        for value in normalized_mapping.values():
+            if value not in {"small", "large"}:
                 result.fail("class_mapping_value", "class_to_armor_type values must be small or large", field="class_to_armor_type")
+                mapping_valid = False
     else:
         result.fail("class_mapping_missing", "PnP class_to_armor_type must be explicit", field="class_to_armor_type")
     if expected_class_mapping is not None and normalized_mapping != {int(k): str(v) for k, v in expected_class_mapping.items()}:
@@ -1554,7 +1644,8 @@ def audit_pnp_config(
     result.values["pnp_source"] = (camera or {}).get("source")
     if not result.profile_version:
         result.fail("pnp_provenance", "PnP camera/calibration version is required", field="camera.version")
-    result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized_mapping.items())}
+    if mapping_valid:
+        result.values["class_to_armor_type"] = {str(key): value for key, value in sorted(normalized_mapping.items())}
     result.values["schema_source"] = "docs/pnp_config_schema.md + PnpStage loader contract"
     if profile == "test_only":
         result.values["fixture_marker"] = "test_only/synthetic_fixture/not_competition_evidence"

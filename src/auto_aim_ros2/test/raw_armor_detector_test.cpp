@@ -25,6 +25,7 @@ using rm_auto_aim::detector::load_model_profile;
 using rm_auto_aim::detector::sigmoid_probability;
 using rm_auto_aim::detector::validate_input_shape;
 using rm_auto_aim::detector::validate_output_shape;
+using rm_auto_aim::detector::validate_runtime_layout;
 
 class ScopedTemporaryPath
 {
@@ -323,6 +324,21 @@ TEST(RawArmorDetection, RejectsUnexpectedModelShapes)
   EXPECT_FALSE(validate_output_shape({1, 25200, 22}, config).has_value());
 }
 
+TEST(RawArmorDetection, RuntimeLayoutsRequireExplicitMatchingAxisOrder)
+{
+  EXPECT_FALSE(validate_runtime_layout("[N,C,H,W]", "NCHW", "input").has_value());
+  EXPECT_FALSE(validate_runtime_layout("[N,R,C]", "NRC", "output").has_value());
+  EXPECT_FALSE(validate_runtime_layout("NHWC", {}, "input").has_value());
+
+  const auto missing = validate_runtime_layout({}, "NCHW", "input");
+  ASSERT_TRUE(missing.has_value());
+  EXPECT_NE(missing->find("unavailable"), std::string::npos);
+
+  const auto mismatch = validate_runtime_layout("[N,H,W,C]", "NCHW", "input");
+  ASSERT_TRUE(mismatch.has_value());
+  EXPECT_NE(mismatch->find("does not match profile"), std::string::npos);
+}
+
 TEST(ModelProfile, TestOnlyRequiresExplicitOptIn)
 {
   EXPECT_THROW(load_model_profile(MODEL_PROFILE_TEST_CONFIG_PATH), std::runtime_error);
@@ -359,6 +375,8 @@ TEST(ModelProfile, ConvertsOnlyValidatedProfileToDetectorConfig)
   EXPECT_EQ(config.expected_output_columns, 22U);
   EXPECT_EQ(config.expected_input_element_type, "f32");
   EXPECT_EQ(config.expected_output_element_type, "f32");
+  EXPECT_EQ(config.expected_input_layout, "NCHW");
+  EXPECT_EQ(config.expected_output_layout, "NRC");
   EXPECT_EQ(config.color_logits_offset, 9U);
   EXPECT_EQ(config.armor_logits_offset, 13U);
   ASSERT_EQ(config.class_to_armor_type.size(), 9U);

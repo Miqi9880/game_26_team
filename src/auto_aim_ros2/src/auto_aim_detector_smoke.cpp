@@ -134,10 +134,15 @@ int main(int argc, char ** argv)
     std::cout << "model=" << options.model_path << " profile=" << profile_label <<
       " device=" << options.device << '\n';
     std::cout << "input_shape=";
-    for (const auto value : info.input_shape) std::cout << value << ' ';
-    std::cout << "type=" << info.input_element_type << " output_shape=";
-    for (const auto value : info.output_shape) std::cout << value << ' ';
-    std::cout << "type=" << info.output_element_type << '\n';
+    for (const auto value : info.input_shape) {
+      std::cout << value << ' ';
+    }
+    std::cout << "type=" << info.input_element_type << " layout=" << info.input_layout <<
+      " output_shape=";
+    for (const auto value : info.output_shape) {
+      std::cout << value << ' ';
+    }
+    std::cout << "type=" << info.output_element_type << " layout=" << info.output_layout << '\n';
 
     cv::VideoCapture video(options.video_path);
     if (!video.isOpened()) {

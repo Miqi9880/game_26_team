@@ -16,7 +16,11 @@ It validates the profile before any OpenVINO model is loaded.  A profile with
 the old repository, a model cache, or a model filename.  The conversion helper
 `detector_config_from_model_profile()` copies the validated tensor and
 post-processing contract into `DetectorConfig`; the detector then validates the
-actual IR input/output shape and element type again at OpenVINO initialization.
+actual IR input/output shape, element type, and port layout again at OpenVINO
+initialization. A profile-bound model must expose a non-empty OpenVINO input
+layout matching `NCHW` and output layout matching `NRC`; layout is never
+inferred from rank or dimensions, and a missing or mismatched layout is
+rejected before compilation.
 For `profile: production`, schema version 2 requires an explicit OpenVINO IR
 manifest containing distinct XML and BIN members.  Each member has its own
 absolute local path and syntactically valid SHA-256 declaration.  The runtime
@@ -222,7 +226,7 @@ production use.
 ## Verification and bring-up order
 
 1. Record the exact XML/BIN artifact pair, each path and SHA-256, plus the
-   input/output shapes and element types.
+   input/output shapes, element types, and explicit port layouts.
 2. Record preprocessing (image encoding, color order, resize/padding and
    normalization) and verify it against annotated frames.
 3. Record every class/color/type semantic and the four-point order; reject

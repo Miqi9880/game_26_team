@@ -177,6 +177,21 @@ std::string shape_string(const std::vector<std::size_t> & shape)
   return stream.str();
 }
 
+std::string canonical_layout_string(const std::string & value)
+{
+  std::string result;
+  result.reserve(value.size());
+  for (const unsigned char character : value) {
+    if (std::isspace(character) != 0 || character == '[' || character == ']' ||
+      character == ',')
+    {
+      continue;
+    }
+    result.push_back(static_cast<char>(std::toupper(character)));
+  }
+  return result;
+}
+
 std::string profile_context(const std::string & path, const std::string & field)
 {
   return path + ": missing or invalid required field '" + field + "'";
@@ -739,6 +754,8 @@ DetectorConfig detector_config_from_model_profile(
   result.device = std::move(device);
   result.expected_input_element_type = profile.input_element_type;
   result.expected_output_element_type = profile.output_element_type;
+  result.expected_input_layout = profile.input_layout;
+  result.expected_output_layout = profile.output_layout;
   result.input_width = static_cast<int>(profile.input_shape[3]);
   result.input_height = static_cast<int>(profile.input_shape[2]);
   result.expected_output_rows = profile.output_shape[1];
@@ -792,6 +809,29 @@ std::optional<std::string> validate_input_shape(
   if (shape != expected) {
     return "expected static NCHW input shape " + shape_string(expected) + ", got " +
            shape_string(shape);
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> validate_runtime_layout(
+  const std::string & actual_layout,
+  const std::string & expected_layout,
+  const std::string & port_name)
+{
+  if (expected_layout.empty()) {
+    return std::nullopt;
+  }
+  const auto expected = canonical_layout_string(expected_layout);
+  if (expected.empty()) {
+    return "expected " + port_name + " layout must not be empty";
+  }
+  const auto actual = canonical_layout_string(actual_layout);
+  if (actual.empty()) {
+    return "model " + port_name + " layout is unavailable; refusing to infer axis order";
+  }
+  if (actual != expected) {
+    return "model " + port_name + " layout does not match profile: expected " +
+           expected + ", got " + actual;
   }
   return std::nullopt;
 }
@@ -1000,6 +1040,24 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
     if (const auto error = validate_output_shape(output_shape, impl_->config); error.has_value()) {
       throw std::runtime_error(*error);
     }
+    const auto input_layout = ov::layout::get_layout(model->input());
+    const auto output_layout = ov::layout::get_layout(model->output());
+    const auto input_layout_text =
+      input_layout.empty() ? std::string{} : input_layout.to_string();
+    const auto output_layout_text =
+      output_layout.empty() ? std::string{} : output_layout.to_string();
+    if (const auto error = validate_runtime_layout(
+        input_layout_text, impl_->config.expected_input_layout, "input");
+      error.has_value())
+    {
+      throw std::runtime_error(*error);
+    }
+    if (const auto error = validate_runtime_layout(
+        output_layout_text, impl_->config.expected_output_layout, "output");
+      error.has_value())
+    {
+      throw std::runtime_error(*error);
+    }
     // The detector always supplies an explicitly constructed FP32 NCHW
     // tensor.  Do not let an unprofiled/direct DetectorConfig clear its
     // string expectation and defer a type mismatch until the first frame.
@@ -1032,6 +1090,8 @@ OpenVinoYoloDetector::OpenVinoYoloDetector(DetectorConfig config)
     impl_->info.output_shape = output_shape;
     impl_->info.input_element_type = model->input().get_element_type().to_string();
     impl_->info.output_element_type = model->output().get_element_type().to_string();
+    impl_->info.input_layout = input_layout_text;
+    impl_->info.output_layout = output_layout_text;
 
     impl_->compiled_model = impl_->core.compile_model(
       model, impl_->config.device,

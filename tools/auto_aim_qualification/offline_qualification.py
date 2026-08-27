@@ -197,9 +197,11 @@ def qualify_offline(
 ) -> dict[str, Any]:
     """Run the profile→CSV→report→manifest admission checks.
 
-    No detector or pipeline is launched by this function.  A pre-existing CSV
-    is treated as evidence and is parsed by the PR #16 module.  Callers that
-    have no CSV receive an explicit ``pipeline_execution_unavailable`` finding.
+    No detector or pipeline is launched by this function. The profile audit
+    may read OpenVINO model metadata, but never compiles a model, runs
+    inference, or uses hardware. A pre-existing CSV is treated as evidence and
+    is parsed by the PR #16 module. Callers that have no CSV receive an
+    explicit ``pipeline_execution_unavailable`` finding.
     """
 
     mode = mode if mode in {"evidence_only", "strict"} else "evidence_only"
@@ -531,7 +533,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"**Status:** `{status}`  ",
         f"**Mode:** `{report.get('mode', 'evidence_only')}`",
         "",
-        "This is a read-only admission report. It never connects to ROS, OpenVINO, a camera, serial, a gimbal, or a shooter.",
+        "This is a read-only admission report. It may read OpenVINO model metadata, but never compiles a model, runs inference, uses hardware, or connects to ROS, a camera, serial, a gimbal, or a shooter.",
         "",
         "## Fixed safety boundary",
         "",

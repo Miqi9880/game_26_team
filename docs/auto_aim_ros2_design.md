@@ -103,7 +103,7 @@ ROS 适配层会拒绝负数、未设置或超出规范范围的时间戳，并�
 - 发布 `/Robot_ctrl_data`：`auto_aim_interfaces/msg/RobotCtrl`
 
 `backend=offline_reference` 必须接收 `offline_model_profile` 参数。节点先校验版本化模型
-profile，再检查 OpenVINO 实际模型的 shape 和 element type；没有 profile 时直接拒绝启动，
+profile，再检查 OpenVINO 实际模型的 shape、element type 和 port layout；没有 profile 时直接拒绝启动，
 不再允许 CSV 标记为未审查的 `unprofiled_legacy_reference`。模型 profile 不能替代 PnP
 标定配置。
 ROS CSV 目前将 `backend`、`calibration_profile`、`model_profile`、
@@ -171,7 +171,7 @@ input  = FP32 [1, 3, 640, 640]
 output = FP32 [1, 25200, 22]
 ```
 
-该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape 和 element type；推理时再次检查输出 shape。生产 profile 必须使用 schema-v2 的 OpenVINO IR manifest：runtime `offline_model_path` 作为 XML 路径，必须与 `model.artifacts.xml.path` 一致；manifest 的 `model.artifacts.bin.path` 也必须匹配、存在且可读。两个文件各自的 SHA-256 都在 OpenVINO 初始化前验证，随后运行时显式调用 `read_model(xml, bin)`，不允许 OpenVINO 自动发现同名 BIN。不同路径、替换 BIN 或同 shape/type 的未审查 artifact 都会被拒绝。非有限 objectness logit 也会被丢弃，不会通过 `sigmoid(+Inf)=1` 进入检测链路。
+该契约、关键点重排 `[0, 3, 2, 1]`、objectness 阈值 `0.7` 和 NMS 阈值 `0.3` 都是当前参考 YOLOv5 模型的显式配置，不是对新比赛模型的假设。模型构造时会检查文件存在、输入/输出 rank、shape、element type 和 OpenVINO port layout；profile-bound 模型的 layout 必须显式匹配 NCHW/NRC，不能由 shape 推断，缺失或不匹配时会在编译前 fail-closed。推理时再次检查输出 shape。生产 profile 必须使用 schema-v2 的 OpenVINO IR manifest：runtime `offline_model_path` 作为 XML 路径，必须与 `model.artifacts.xml.path` 一致；manifest 的 `model.artifacts.bin.path` 也必须匹配、存在且可读。两个文件各自的 SHA-256 都在 OpenVINO 初始化前验证，随后运行时显式调用 `read_model(xml, bin)`，不允许 OpenVINO 自动发现同名 BIN。不同路径、替换 BIN 或同 shape/type 的未审查 artifact 都会被拒绝。非有限 objectness logit 也会被丢弃，不会通过 `sigmoid(+Inf)=1` 进入检测链路。
 
 运行时预处理同样是显式且可测试的：先按 profile 的 `top_left` 或 `center`
 letterbox 规则生成黑色 BGR canvas，再逐像素构造 FP32 `[1,3,H,W]` NCHW tensor，

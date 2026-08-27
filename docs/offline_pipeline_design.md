@@ -11,9 +11,10 @@ OpenVinoYoloDetector
   → TargetObservation
   → OfflineTracker
   → TargetSelector
-  → SafeOfflineAimer
-  → OfflinePredictor (optional test-only diagnostic)
-  → CSV + PNG
+  ├─→ SafeOfflineAimer (unchanged safe output)
+  ├─→ OfflinePredictor (optional test-only diagnostic)
+  └─→ OfflineBallisticDiagnostic (optional test-only diagnostic)
+       → CSV + PNG evidence
 ```
 
 离线模块独立于 `auto_aim_core` 的简化 `Detection` 接口。后者仍用于 ROS dry-run，不应把 PnP 相对角塞入其中充当正式绝对角。
@@ -93,9 +94,56 @@ predicted_stamp_ns = source_stamp_ns + horizon_ns
 `TargetSelector`，不会替换 `SafeOfflineAimer` 的 selected track，也不会进入 `RobotCtrl`。
 
 CSV 在启用时记录 prediction valid/reason、horizon、源/预测时间戳、relative yaw/pitch rad 及
-派生 degree；默认关闭时 prediction 字段保持空诊断。标注只叠加 test-only 文字，不改变控制输出。
+派生 degree；默认关闭时 CSV 显式记录 `prediction_valid=0`、`prediction_reason=disabled` 和
+不可变的 test-only/production-ready 标志，时间/角度字段保持空，以免把未启用诊断误写成零 horizon。
+标注只叠加 test-only 文字，不改变控制输出。
 `diagnose_synthetic_prediction_error` 只比较合成回放中预测时间戳与未来测量角，结果标记
 `synthetic=true`，不等于真实延迟、命中率或比赛性能。
+
+## OfflineBallisticDiagnostic：无阻力低弹道与 horizon 联合诊断
+
+`OfflineBallisticDiagnostic` 是与 `OfflinePredictor` 并列的、默认关闭的纯离线分支。它不写回
+`TargetSelector`、`SafeOfflineAimer`、`AimCommand`、ROS 或 `RobotCtrl`，不创建 publisher，也不打开
+相机/串口。即使解析解有效，输出也固定为 `test_only=true`、`production_ready=false`、
+`ballistic_control_applied=false`。
+
+核心 `OfflineBallisticSolver` 只接受已经在**枪口弹道坐标系**中的目标点（m）：`x` 前、`y` 左、`z` 上。
+不允许把 OpenCV 相机系或 gimbal 原点静默当成枪口原点。当前离线 PnP 只有 test-only
+camera→gimbal 外参、没有经审查的 gimbal→muzzle 外参，因此 `auto_aim_offline` 在没有
+`--allow-test-gimbal-origin-as-muzzle` 时会报告 `missing_muzzle_transform`。该显式开关只会把已有
+gimbal 位置用于测试，并记录 `origin_assumption=test_only_gimbal_origin`；它不是零枪口偏移、正式外参
+或生产准备结论。没有 gimbal pose 时仍 fail-closed 为 `missing_gimbal_pose`。
+
+启用 CLI 需要同时显式提供：
+
+```text
+--ballistic-diagnostic
+--ballistic-bullet-speed-mps       (> 0 m/s)
+--ballistic-gravity-mps2          (> 0 m/s²)
+--ballistic-system-latency-ms     (显式 0 合法)
+--ballistic-max-flight-time-ms    (> 0)
+```
+
+录像没有严格时间对齐的 `VisionData`，所以不会从 `shoot_speed_mps`、latest VisionData 或任何默认值猜测
+弹速/延迟/重力。所有浮点输入和坐标均检查 finite，时间都转为带溢出检查的整数 ns。
+
+第一版只解独立推导的无空气阻力低弹道。令 `r = sqrt(x² + y²)`、弹速 `v`（m/s）、重力幅值
+`g > 0`（m/s²）、高度 `z`（m），则：
+
+```text
+geometric_yaw   = atan2(y, x)
+geometric_pitch = atan2(z, r)
+D = v⁴ - g * (g * r² + 2 * z * v²)
+tan(ballistic_pitch_low) = (v² - sqrt(D)) / (g * r)
+flight_time_s = r / (v * cos(ballistic_pitch_low))
+gravity_pitch_correction = ballistic_pitch_low - geometric_pitch
+recommended_prediction_horizon_ns = system_latency_ns + flight_time_ns
+```
+
+`D < 0`、后方目标、过小水平距离、非法速度/重力/延迟、非有限值、飞行时间或 ns 溢出、超出显式飞行时间
+上限、以及推荐 horizon 超出 `OfflinePredictor` 的上限都会分别 fail-closed。上限超出时不会截断、不会覆盖
+用户的 `--prediction-horizon-ms`，也不会自动启用 Predictor。解析结果只是可解释的数学诊断，不包含空气阻力、
+经验 pitch offset、枪口偏置、世界坐标、IMU、EKF、车辆模型、自动开火或实际命中率声明。
 
 ## 离线工具输出
 
@@ -103,7 +151,15 @@ CSV 在启用时记录 prediction valid/reason、horizon、源/预测时间戳�
 `--allow-test-profile`，读取 test-only PnP 时传入 `--allow-test-config`。它输出逐帧 CSV 和标注 PNG。
 CSV 记录检测数量、有效 PnP 数量、相机坐标、relative rad、track 状态、track id、lock、可选
 test absolute rad/degree、可选 prediction 诊断、fire 和 test-only 标志。标注图叠加四点、PnP 状态、
-selected track、tracking 状态、相对角、可选 prediction 诊断和 `fire=0`。
+selected track、tracking 状态、相对角、可选 prediction/ballistic 诊断和 `fire=0`。ballistic CSV 字段
+只追加在旧字段之后，包含 enabled/valid/reason、muzzle origin assumption、位置/角度、飞行时间、延迟、
+推荐 horizon、速度/重力及不可变的 test-only/production-ready/control-applied 标志；还显式记录
+`serial_enabled=false`、`dry_run=true`、`allow_fire=false` 与四个零速度/加速度字段。PNG 只叠加
+`ballistic=<reason>` 等文字，不改变瞄点或命令。
+
+`--video` 只接受已有的本地普通文件，拒绝 URI、相机/串口设备和 FIFO；`--csv` 不能别名 model/profile/
+video/PnP 输入，也拒绝已有的非普通文件，避免离线回放误打开硬件或覆盖只读证据。`--annotated-dir`
+不能别名这些输入且若已存在必须为目录。
 
 独立 `offline_tracker_replay_test` 复用同一个 C++ Tracker/Selector，对合成序列检查逐帧
 `stamp_ns`、状态、track id、选择和关联结果。它不复制算法、不依赖模型/视频/OpenVINO/ROS/相机/串口，
@@ -116,7 +172,10 @@ selected track、tracking 状态、相对角、可选 prediction 诊断和 `fire
 
 test-only 内参、装甲尺寸和外参只证明软件链路可以运行，不证明真实距离、角度或命中率。正式模型语义、相机标定、装甲实测尺寸、camera→gimbal 外参、绝对角零点和开火时序仍需单独确认。
 
-本轮只读借鉴 `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/{tracker,target,aimer,solver}.{hpp,cpp}`
+既有 Tracker 增量只读借鉴 `/home/ubuntu22/vision-study/sp_vision_25/tasks/auto_aim/{tracker,target,aimer,solver}.{hpp,cpp}`
 中的 detecting/temp-lost 状态管理、失锁诊断和避免频繁目标替换的工程思路。没有移植其 11 维 EKF、
 世界坐标、四元数、车辆尺寸、固定分辨率、协方差、颜色/车型优先级、弹道、Planner/MPC/Shooter 或任何硬件代码；
 也没有采用其参数作为本项目阈值。
+
+本次 `OfflineBallisticDiagnostic` 增量没有读取或复制同济的 trajectory/aimer 源码、参数、测试数值、
+弹速默认值、offset、车辆模型、EKF、控制或开火逻辑；无阻力公式、坐标约定和测试向量均在本仓库中独立写出。

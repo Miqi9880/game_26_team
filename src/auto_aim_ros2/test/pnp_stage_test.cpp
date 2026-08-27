@@ -1,4 +1,5 @@
 #include "auto_aim_ros2/auto_aim_core.hpp"
+#include "auto_aim_ros2/offline_ballistic.hpp"
 #include "auto_aim_ros2/offline_pipeline.hpp"
 #include "auto_aim_ros2/pnp_stage.hpp"
 #include "auto_aim_ros2/raw_armor_detector.hpp"
@@ -374,7 +375,7 @@ TEST(PnpStage, InvalidPnpCannotCreateLockedOrFireControlOutput)
     rm_auto_aim::pipeline::kFireNone);
 }
 
-TEST(OfflineApiSmoke, SyntheticImageFrameFlowsOnlyToDiagnosticAimerAndPredictor)
+TEST(OfflineApiSmoke, SyntheticImageFrameFlowsOnlyToIndependentDiagnosticBranches)
 {
   const auto config = load_test_configuration();
   PnpStage pnp_stage(config);
@@ -430,7 +431,7 @@ TEST(OfflineApiSmoke, SyntheticImageFrameFlowsOnlyToDiagnosticAimerAndPredictor)
   rm_auto_aim::offline::PredictionConfig prediction_config{};
   prediction_config.enabled = true;
   prediction_config.horizon_ns = 10'000'000;
-  prediction_config.max_horizon_ns = 100'000'000;
+  prediction_config.max_horizon_ns = 1'000'000'000;
   rm_auto_aim::offline::OfflinePredictor predictor(prediction_config);
   const auto prediction = predictor.predict(selected_before, second_frame.stamp_ns);
   ASSERT_TRUE(prediction.valid);
@@ -438,9 +439,37 @@ TEST(OfflineApiSmoke, SyntheticImageFrameFlowsOnlyToDiagnosticAimerAndPredictor)
   EXPECT_FALSE(prediction.production_ready);
   EXPECT_EQ(prediction.track_id, selected_before->track_id);
 
-  // Predictor accepts a const selected target and is not a feedback path into
-  // selection or aiming.  The same tracker evidence therefore yields the
-  // same target and safety command after a prediction diagnostic.
+  rm_auto_aim::offline::BallisticConfig ballistic_config{};
+  ballistic_config.enabled = true;
+  ballistic_config.bullet_speed_mps = 20.0;
+  ballistic_config.gravity_mps2 = 9.81;
+  ballistic_config.system_latency_ns = 10'000'000;
+  ballistic_config.max_flight_time_ns = 1'000'000'000;
+  ballistic_config.max_prediction_horizon_ns = prediction_config.max_horizon_ns;
+  const auto missing_muzzle =
+    rm_auto_aim::offline::OfflineBallisticDiagnostic(ballistic_config).diagnose(
+    selected_before, second_frame.stamp_ns);
+  EXPECT_FALSE(missing_muzzle.valid);
+  EXPECT_EQ(
+    missing_muzzle.failure_reason,
+    rm_auto_aim::offline::BallisticFailureReason::MissingMuzzleTransform);
+
+  ballistic_config.allow_test_gimbal_origin_as_muzzle = true;
+  const auto ballistic =
+    rm_auto_aim::offline::OfflineBallisticDiagnostic(ballistic_config).diagnose(
+    selected_before, second_frame.stamp_ns);
+  ASSERT_TRUE(ballistic.valid);
+  EXPECT_TRUE(ballistic.test_only);
+  EXPECT_FALSE(ballistic.production_ready);
+  EXPECT_EQ(
+    ballistic.origin_assumption,
+    rm_auto_aim::offline::BallisticOriginAssumption::TestOnlyGimbalOrigin);
+  ASSERT_TRUE(ballistic.recommended_prediction_horizon_ns.has_value());
+  EXPECT_GT(*ballistic.recommended_prediction_horizon_ns, prediction_config.horizon_ns);
+
+  // Both diagnostics accept const selected evidence and cannot feed back into
+  // selection or aiming. The same tracker evidence therefore yields the same
+  // target and safety command after prediction/ballistic diagnostics.
   const auto selected_after = selector.select(
     second_update.tracks, static_cast<int>(second_frame.width),
     static_cast<int>(second_frame.height));

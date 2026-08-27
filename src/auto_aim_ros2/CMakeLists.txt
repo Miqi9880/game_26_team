@@ -24,6 +24,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/auto_aim_core.cpp
   src/auto_aim_node.cpp
   src/camera_calibration.cpp
+  src/offline_ballistic.cpp
   src/offline_pipeline.cpp
   src/pnp_stage.cpp
   src/raw_armor_detector.cpp
@@ -114,6 +115,14 @@ if(BUILD_TESTING)
     test/pnp_stage_test.cpp
   )
   ament_auto_add_gtest(
+    offline_ballistic_test
+    test/offline_ballistic_test.cpp
+  )
+  ament_auto_add_gtest(
+    auto_aim_offline_csv_test
+    test/auto_aim_offline_csv_test.cpp
+  )
+  ament_auto_add_gtest(
     offline_pipeline_test
     test/offline_pipeline_test.cpp
   )
@@ -155,6 +164,12 @@ if(BUILD_TESTING)
   # exercise watchdog timeouts.  Give their Python signal/atexit cleanup a
   # realistic budget rather than terminating it before child groups are reaped.
   set_tests_properties(ros_safety_integration_test PROPERTIES TIMEOUT 120)
+  add_test(
+    NAME auto_aim_offline_cli_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/auto_aim_offline_cli_test.py
+      $<TARGET_FILE:auto_aim_offline>
+  )
 endif()
 
 ament_auto_package()

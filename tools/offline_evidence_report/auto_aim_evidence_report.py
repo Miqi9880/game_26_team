@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import stat
 import statistics
 import sys
 from collections import Counter, OrderedDict
@@ -35,6 +36,98 @@ REQUIRED_COLUMNS = (
     "test_only",
 )
 
+# Optional append-only suffix emitted by the test-only ballistic diagnostic.
+# Old CSV fixtures intentionally omit this entire suffix and remain valid.
+#
+# Keep the tuple in the same order as ``auto_aim_offline::write_header`` and
+# ``write_ballistic_fields``.  The prediction flags are an older, independent
+# suffix and must not be used to detect ballistic output: origin/main CSVs
+# already contain those two columns without any ballistic fields.
+BALLISTIC_DIAGNOSTIC_COLUMNS = (
+    "ballistic_enabled",
+    "ballistic_valid",
+    "ballistic_reason",
+    "ballistic_track_id",
+    "ballistic_source_stamp_ns",
+    "ballistic_target_x_m",
+    "ballistic_target_y_m",
+    "ballistic_target_z_m",
+    "ballistic_horizontal_distance_m",
+    "ballistic_geometric_yaw_rad",
+    "ballistic_geometric_pitch_rad",
+    "ballistic_yaw_rad",
+    "ballistic_pitch_rad",
+    "ballistic_gravity_pitch_correction_rad",
+    "ballistic_flight_time_s",
+    "ballistic_flight_time_ns",
+    "ballistic_system_latency_ns",
+    "ballistic_recommended_prediction_horizon_ns",
+    "ballistic_bullet_speed_mps",
+    "ballistic_gravity_mps2",
+    "ballistic_origin_assumption",
+    "ballistic_test_only",
+    "ballistic_production_ready",
+    "ballistic_control_applied",
+)
+
+BALLISTIC_SAFETY_COLUMNS = (
+    "serial_enabled",
+    "dry_run",
+    "allow_fire",
+    "yaw_vel_rad_s",
+    "pitch_vel_rad_s",
+    "yaw_acc_rad_s2",
+    "pitch_acc_rad_s2",
+)
+
+BALLISTIC_COLUMNS = BALLISTIC_DIAGNOSTIC_COLUMNS + BALLISTIC_SAFETY_COLUMNS
+
+# The first column is the schema sentinel.  Presence of prediction or generic
+# safety columns alone does not mean that the ballistic suffix is present.
+BALLISTIC_SENTINEL_COLUMN = "ballistic_enabled"
+
+BALLISTIC_FAILURE_REASONS = frozenset(
+    {
+        "none",
+        "disabled",
+        "no_target",
+        "invalid_track",
+        "not_tracking",
+        "invalid_observation",
+        "negative_timestamp",
+        "timestamp_mismatch",
+        "missing_muzzle_transform",
+        "missing_gimbal_pose",
+        "missing_bullet_speed",
+        "invalid_bullet_speed",
+        "missing_gravity",
+        "invalid_gravity",
+        "missing_system_latency",
+        "negative_system_latency",
+        "invalid_maximum_flight_time",
+        "invalid_maximum_prediction_horizon",
+        "invalid_minimum_horizontal_distance",
+        "non_finite_target_position",
+        "target_behind_muzzle",
+        "horizontal_distance_too_small",
+        "non_finite_discriminant",
+        "discriminant_negative",
+        "non_finite_pitch",
+        "non_finite_flight_time",
+        "flight_time_unrepresentable",
+        "flight_time_overflow",
+        "flight_time_exceeds_maximum",
+        "horizon_overflow",
+        "horizon_exceeds_prediction_maximum",
+        "non_finite_result",
+    }
+)
+
+PREDICTION_COLUMNS = (
+    "prediction_test_only",
+    "prediction_production_ready",
+)
+
 KNOWN_TRACKING_STATES = ("lost", "detecting", "tracking", "temp_lost")
 VALID_TARGET_LOCKS = (49, 50)
 
@@ -50,6 +143,11 @@ INTEGER_COLUMNS = {
     "consecutive_valid",
     "target_lock",
     "fire_command",
+    "ballistic_track_id",
+    "ballistic_source_stamp_ns",
+    "ballistic_flight_time_ns",
+    "ballistic_system_latency_ns",
+    "ballistic_recommended_prediction_horizon_ns",
 }
 FLOAT_COLUMNS = {
     "confidence",
@@ -66,8 +164,36 @@ FLOAT_COLUMNS = {
     "command_pitch_rad",
     "command_yaw_degree",
     "command_pitch_degree",
+    "ballistic_target_x_m",
+    "ballistic_target_y_m",
+    "ballistic_target_z_m",
+    "ballistic_horizontal_distance_m",
+    "ballistic_geometric_yaw_rad",
+    "ballistic_geometric_pitch_rad",
+    "ballistic_yaw_rad",
+    "ballistic_pitch_rad",
+    "ballistic_gravity_pitch_correction_rad",
+    "ballistic_flight_time_s",
+    "ballistic_bullet_speed_mps",
+    "ballistic_gravity_mps2",
+    "yaw_vel_rad_s",
+    "pitch_vel_rad_s",
+    "yaw_acc_rad_s2",
+    "pitch_acc_rad_s2",
 }
-BOOL_COLUMNS = {"selected", "test_only", "absolute_command_valid"}
+BOOL_COLUMNS = {
+    "selected",
+    "test_only",
+    "absolute_command_valid",
+    "ballistic_enabled",
+    "ballistic_valid",
+    "ballistic_test_only",
+    "ballistic_production_ready",
+    "ballistic_control_applied",
+    "serial_enabled",
+    "dry_run",
+    "allow_fire",
+}
 
 @dataclass
 class ParsedRecord:
@@ -142,9 +268,16 @@ def _parse_integer(value: str) -> Optional[int]:
     # int("1.0") is intentionally rejected: CSV integer columns have an
     # unambiguous representation and accepting a float hides schema mistakes.
     try:
-        return int(text, 10)
+        number = int(text, 10)
     except (TypeError, ValueError):
         return None
+    # C++ evidence fields are serialized from signed/unsigned fixed-width
+    # integers.  Reject values outside the signed int64 interchange range
+    # instead of allowing Python's arbitrary-precision integers to conceal a
+    # producer overflow or malformed hand-written CSV.
+    if number < -(1 << 63) or number > (1 << 63) - 1:
+        return None
+    return number
 
 
 def _parse_bool(value: str) -> Optional[bool]:
@@ -215,15 +348,21 @@ def _convert_row(
         else:
             values[name] = converted
 
-    # ``absolute_command_valid`` is optional in older CSVs, but if supplied it
-    # is a bool-like value rather than an arbitrary integer.
-    if "absolute_command_valid" in raw:
-        text = raw["absolute_command_valid"].strip()
-        if text:
-            converted_bool = _parse_bool(text)
-            if converted_bool is None:
-                analysis.error("invalid_boolean", f"invalid boolean {text!r} in absolute_command_valid", row_number, column="absolute_command_valid", value=text)
-            values["absolute_command_valid"] = converted_bool
+    # Optional safety fields are bool-like when present.  Treat any future
+    # ``*_production_ready`` or ``*_test_only`` suffix consistently instead
+    # of silently preserving a dangerous spelling as an opaque string.
+    for name in headers:
+        is_safety_bool = name in BOOL_COLUMNS or name.endswith("_production_ready") or name.endswith("_test_only")
+        if not is_safety_bool or name in REQUIRED_COLUMNS:
+            continue
+        text = raw[name].strip()
+        if not text:
+            values[name] = None
+            continue
+        converted_bool = _parse_bool(text)
+        if converted_bool is None:
+            analysis.error("invalid_boolean", f"invalid boolean {text!r} in {name}", row_number, column=name, value=text)
+        values[name] = converted_bool
 
     for name in FLOAT_COLUMNS:
         if name not in raw:
@@ -260,6 +399,12 @@ def _open_csv(source: Union[str, Path, TextIO]) -> tuple[TextIO, bool, str]:
         stream = source  # type: ignore[assignment]
         return stream, False, _as_name(getattr(stream, "name", ""))
     path = Path(source)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise OSError(f"CSV input must be an existing regular file: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise OSError(f"CSV input must be an existing regular file: {path}")
     # newline="" is required by csv.reader to handle quoted newlines correctly.
     return path.open("r", encoding="utf-8-sig", newline=""), True, _as_name(path)
 
@@ -303,6 +448,25 @@ def analyze_csv(
         missing = [name for name in REQUIRED_COLUMNS if name not in headers]
         if missing:
             analysis.error("missing_required_columns", "required CSV columns are missing", columns=missing)
+        # Only the sentinel starts the optional suffix.  In particular, the
+        # legacy predictor flags and generic safety columns may appear in an
+        # older CSV without any ballistic diagnostics.
+        ballistic_present = BALLISTIC_SENTINEL_COLUMN in headers
+        ballistic_columns_present = [name for name in headers if name.startswith("ballistic_")]
+        if ballistic_columns_present and not ballistic_present:
+            analysis.error(
+                "incomplete_ballistic_columns",
+                "ballistic columns are present without the ballistic_enabled sentinel",
+                columns=ballistic_columns_present,
+            )
+        if ballistic_present:
+            missing_ballistic = [name for name in BALLISTIC_COLUMNS if name not in headers]
+            if missing_ballistic:
+                analysis.error(
+                    "incomplete_ballistic_columns",
+                    "ballistic diagnostic suffix is incomplete",
+                    columns=missing_ballistic,
+                )
         if not headers or all(not name for name in headers):
             analysis.error("empty_header", "CSV header has no named columns")
 
@@ -427,6 +591,37 @@ def _validate_sequence_and_frames(analysis: Analysis) -> None:
         "fire_command",
         "test_only",
         "absolute_command_valid",
+        "ballistic_enabled",
+        "ballistic_valid",
+        "ballistic_reason",
+        "ballistic_track_id",
+        "ballistic_source_stamp_ns",
+        "ballistic_target_x_m",
+        "ballistic_target_y_m",
+        "ballistic_target_z_m",
+        "ballistic_horizontal_distance_m",
+        "ballistic_geometric_yaw_rad",
+        "ballistic_geometric_pitch_rad",
+        "ballistic_yaw_rad",
+        "ballistic_pitch_rad",
+        "ballistic_gravity_pitch_correction_rad",
+        "ballistic_flight_time_s",
+        "ballistic_flight_time_ns",
+        "ballistic_system_latency_ns",
+        "ballistic_recommended_prediction_horizon_ns",
+        "ballistic_bullet_speed_mps",
+        "ballistic_gravity_mps2",
+        "ballistic_origin_assumption",
+        "ballistic_test_only",
+        "ballistic_production_ready",
+        "ballistic_control_applied",
+        "serial_enabled",
+        "dry_run",
+        "allow_fire",
+        "yaw_vel_rad_s",
+        "pitch_vel_rad_s",
+        "yaw_acc_rad_s2",
+        "pitch_acc_rad_s2",
     )
     for frame, rows in groups.items():
         for column in frame_consistent_columns:
@@ -480,6 +675,237 @@ def _validate_sequence_and_frames(analysis: Analysis) -> None:
                     row.row_number,
                     value=pnp_valid,
                 )
+
+        # Optional ballistic/control suffix validation.  Its presence is
+        # detected by the header, so old pre-ballistic CSVs take no path here.
+        if BALLISTIC_SENTINEL_COLUMN in analysis.headers:
+            expected_ballistic_safety = {
+                "ballistic_test_only": True,
+                "ballistic_production_ready": False,
+                "ballistic_control_applied": False,
+            }
+            expected_command_safety = {
+                "serial_enabled": False,
+                "dry_run": True,
+                "allow_fire": False,
+            }
+            zero_motion_columns = (
+                "yaw_vel_rad_s",
+                "pitch_vel_rad_s",
+                "yaw_acc_rad_s2",
+                "pitch_acc_rad_s2",
+            )
+            valid_required = (
+                "ballistic_track_id",
+                "ballistic_source_stamp_ns",
+                "ballistic_target_x_m",
+                "ballistic_target_y_m",
+                "ballistic_target_z_m",
+                "ballistic_horizontal_distance_m",
+                "ballistic_geometric_yaw_rad",
+                "ballistic_geometric_pitch_rad",
+                "ballistic_yaw_rad",
+                "ballistic_pitch_rad",
+                "ballistic_gravity_pitch_correction_rad",
+                "ballistic_flight_time_s",
+                "ballistic_flight_time_ns",
+                "ballistic_system_latency_ns",
+                "ballistic_recommended_prediction_horizon_ns",
+                "ballistic_bullet_speed_mps",
+                "ballistic_gravity_mps2",
+                "ballistic_origin_assumption",
+            )
+            for row in rows:
+                values = row.values
+                enabled = values.get(BALLISTIC_SENTINEL_COLUMN)
+                if enabled is None:
+                    analysis.error(
+                        "incomplete_ballistic_record",
+                        "ballistic_enabled must be an explicit boolean",
+                        row.row_number,
+                    )
+                    continue
+
+                # These fields are emitted for every new-CSV row, including a
+                # disabled diagnostic.  Missing or unsafe values are never
+                # treated as harmless blanks.
+                for name, expected in expected_command_safety.items():
+                    value = values.get(name)
+                    if value is None:
+                        analysis.error(
+                            "incomplete_ballistic_safety",
+                            f"ballistic safety field {name!r} is empty",
+                            row.row_number,
+                            column=name,
+                        )
+                    elif value is not expected:
+                        analysis.error(
+                            "ballistic_safety_violation",
+                            f"ballistic safety field {name!r} must be {expected}",
+                            row.row_number,
+                            column=name,
+                            value=value,
+                        )
+                for name in zero_motion_columns:
+                    value = values.get(name)
+                    if value is None:
+                        analysis.error(
+                            "incomplete_ballistic_safety",
+                            f"ballistic safety motion field {name!r} is empty",
+                            row.row_number,
+                            column=name,
+                        )
+                    elif value != 0.0:
+                        analysis.error(
+                            "ballistic_safety_violation",
+                            f"ballistic safety motion field {name!r} must be zero",
+                            row.row_number,
+                            column=name,
+                            value=value,
+                        )
+
+                for name, expected in expected_ballistic_safety.items():
+                    value = values.get(name)
+                    if value is None:
+                        analysis.error(
+                            "incomplete_ballistic_safety",
+                            f"ballistic safety field {name!r} is empty",
+                            row.row_number,
+                            column=name,
+                        )
+                    elif value is not expected:
+                        analysis.error(
+                            "ballistic_safety_violation",
+                            f"ballistic safety field {name!r} must be {expected}",
+                            row.row_number,
+                            column=name,
+                            value=value,
+                        )
+
+                if enabled is False:
+                    # A disabled row is an explicit marker, not a partially
+                    # populated diagnostic.  The generic command safety
+                    # fields above remain required and checked.
+                    populated = [
+                        name for name in BALLISTIC_DIAGNOSTIC_COLUMNS[1:21]
+                        if values.get(name) is not None
+                    ]
+                    if populated:
+                        analysis.error(
+                            "disabled_ballistic_record",
+                            "disabled ballistic diagnostic must leave diagnostic fields empty",
+                            row.row_number,
+                            columns=populated,
+                        )
+                    continue
+
+                valid = values.get("ballistic_valid")
+                reason = values.get("ballistic_reason")
+                if valid is None or reason is None or not str(reason).strip():
+                    analysis.error(
+                        "incomplete_ballistic_record",
+                        "enabled ballistic diagnostic must include valid and reason",
+                        row.row_number,
+                    )
+                    continue
+                if str(reason) not in BALLISTIC_FAILURE_REASONS:
+                    analysis.error(
+                        "unknown_ballistic_reason",
+                        "ballistic failure reason is not recognized",
+                        row.row_number,
+                        value=reason,
+                    )
+                if valid is True and str(reason) != "none":
+                    analysis.error(
+                        "ballistic_reason_conflict",
+                        "ballistic_valid=true requires ballistic_reason=none",
+                        row.row_number,
+                    )
+                if valid is False and str(reason) == "none":
+                    analysis.error(
+                        "ballistic_reason_conflict",
+                        "ballistic_valid=false cannot use ballistic_reason=none",
+                        row.row_number,
+                    )
+
+                # Any supplied physical scalar must remain finite (conversion
+                # already rejects NaN/Inf) and within the solver's domain,
+                # even when the row is an invalid diagnostic outcome.
+                horizontal = values.get("ballistic_horizontal_distance_m")
+                if horizontal is not None and horizontal <= 0.0:
+                    analysis.error("invalid_ballistic_distance", "horizontal distance must be positive", row.row_number)
+                flight_s = values.get("ballistic_flight_time_s")
+                if flight_s is not None and flight_s <= 0.0:
+                    analysis.error("invalid_ballistic_flight_time", "flight time in seconds must be positive", row.row_number)
+                flight_ns = values.get("ballistic_flight_time_ns")
+                if flight_ns is not None and (not isinstance(flight_ns, int) or flight_ns <= 0):
+                    analysis.error("invalid_ballistic_flight_time", "flight time in nanoseconds must be positive", row.row_number)
+                latency_ns = values.get("ballistic_system_latency_ns")
+                if latency_ns is not None and (not isinstance(latency_ns, int) or latency_ns < 0):
+                    analysis.error("invalid_ballistic_latency", "system latency must be non-negative", row.row_number)
+                horizon_ns = values.get("ballistic_recommended_prediction_horizon_ns")
+                if horizon_ns is not None and (not isinstance(horizon_ns, int) or horizon_ns < 0):
+                    analysis.error("invalid_ballistic_horizon", "recommended horizon must be non-negative", row.row_number)
+                speed = values.get("ballistic_bullet_speed_mps")
+                if speed is not None and speed <= 0.0:
+                    analysis.error("invalid_ballistic_speed", "bullet speed must be positive", row.row_number)
+                gravity = values.get("ballistic_gravity_mps2")
+                if gravity is not None and gravity <= 0.0:
+                    analysis.error("invalid_ballistic_gravity", "gravity magnitude must be positive", row.row_number)
+                if isinstance(flight_ns, int) and isinstance(latency_ns, int) and isinstance(horizon_ns, int):
+                    if horizon_ns != flight_ns + latency_ns:
+                        analysis.error(
+                            "ballistic_horizon_conflict",
+                            "recommended horizon must equal latency plus flight time",
+                            row.row_number,
+                        )
+                if isinstance(flight_s, (int, float)) and isinstance(flight_ns, int):
+                    expected_ns = round(float(flight_s) * 1_000_000_000.0)
+                    if abs(expected_ns - flight_ns) > 2:
+                        analysis.error(
+                            "ballistic_time_unit_conflict",
+                            "flight_time_s and flight_time_ns disagree",
+                            row.row_number,
+                        )
+
+                origin = values.get("ballistic_origin_assumption")
+                if origin is not None and origin not in {"not_evaluated", "muzzle_frame", "test_only_gimbal_origin"}:
+                    analysis.error(
+                        "unknown_ballistic_origin",
+                        "ballistic origin assumption is not recognized",
+                        row.row_number,
+                        value=origin,
+                    )
+
+                if valid is True:
+                    missing_values = [name for name in valid_required if values.get(name) is None]
+                    if missing_values:
+                        analysis.error(
+                            "incomplete_ballistic_record",
+                            "valid ballistic diagnostic is missing required values",
+                            row.row_number,
+                            columns=missing_values,
+                        )
+                    track_id = values.get("ballistic_track_id")
+                    if not isinstance(track_id, int) or track_id <= 0:
+                        analysis.error(
+                            "invalid_ballistic_track",
+                            "valid ballistic diagnostic requires a positive track id",
+                            row.row_number,
+                        )
+                    source_stamp = values.get("ballistic_source_stamp_ns")
+                    if not isinstance(source_stamp, int) or source_stamp < 0:
+                        analysis.error(
+                            "invalid_ballistic_timestamp",
+                            "valid ballistic diagnostic requires a non-negative source timestamp",
+                            row.row_number,
+                        )
+                    if origin in {None, "not_evaluated"}:
+                        analysis.error(
+                            "missing_ballistic_origin",
+                            "valid ballistic diagnostic requires a muzzle origin assumption",
+                            row.row_number,
+                        )
 
 
 def _counter(values: Iterable[Any], *, stringify: bool = True) -> dict[str, int]:
@@ -574,6 +1000,36 @@ def _analyze_from_parsed(analysis: Analysis) -> dict[str, Any]:
     test_values = [item["test_only"] for item in frames if item["test_only"] is not None]
     test_distribution = _counter(test_values)
 
+    ballistic_rows = [row for row in analysis.records if "ballistic_enabled" in row.values]
+    ballistic_enabled_values = [row.values.get("ballistic_enabled") for row in ballistic_rows]
+    ballistic_valid_values = [row.values.get("ballistic_valid") for row in ballistic_rows]
+    ballistic_reasons = [row.values.get("ballistic_reason") for row in ballistic_rows]
+    ballistic_origin_values = [row.values.get("ballistic_origin_assumption") for row in ballistic_rows]
+    ballistic_flight_times = [row.values.get("ballistic_flight_time_s") for row in ballistic_rows]
+    ballistic_pitch_corrections = [
+        row.values.get("ballistic_gravity_pitch_correction_rad") for row in ballistic_rows
+    ]
+    ballistic_horizons = [row.values.get("ballistic_recommended_prediction_horizon_ns") for row in ballistic_rows]
+    ballistic_anomalies: list[str] = []
+    if ballistic_rows:
+        for row in ballistic_rows:
+            values = row.values
+            if values.get("ballistic_test_only") is False:
+                ballistic_anomalies.append("ballistic_test_only_false")
+            if values.get("ballistic_production_ready") is True:
+                ballistic_anomalies.append("ballistic_production_ready_true")
+            if values.get("ballistic_control_applied") is True:
+                ballistic_anomalies.append("ballistic_control_applied")
+            if values.get("serial_enabled") is True:
+                ballistic_anomalies.append("serial_enabled")
+            if values.get("dry_run") is False:
+                ballistic_anomalies.append("dry_run_false")
+            if values.get("allow_fire") is True:
+                ballistic_anomalies.append("allow_fire_true")
+            if values.get("ballistic_valid") is True and values.get("ballistic_reason") != "none":
+                ballistic_anomalies.append("ballistic_valid_reason_conflict")
+        ballistic_anomalies = sorted(set(ballistic_anomalies))
+
     selected_track_ids = [item["track_id"] for item in frames if item["selected"] and item["track_id"] is not None]
     switch_count = sum(1 for previous, current in zip(selected_track_ids, selected_track_ids[1:]) if current != previous)
     lock_loss_count = sum(
@@ -652,12 +1108,39 @@ def _analyze_from_parsed(analysis: Analysis) -> dict[str, Any]:
     false_test_frames = [item["frame"] for item in frames if item["test_only"] is False]
     if false_test_frames:
         safety_anomalies.append("test_only_false")
+    production_ready_true: list[dict[str, Any]] = []
+    test_only_false_values: list[dict[str, Any]] = []
+    for row in analysis.records:
+        for column in analysis.headers:
+            value = row.values.get(column)
+            if (column == "production_ready" or column.endswith("_production_ready")) and value is True:
+                production_ready_true.append({"frame": row.values.get("frame"), "column": column})
+            if (column == "test_only" or column.endswith("_test_only")) and value is False:
+                test_only_false_values.append({"frame": row.values.get("frame"), "column": column})
+    if production_ready_true:
+        safety_anomalies.append("production_ready_true")
+    if test_only_false_values:
+        safety_anomalies.append("test_only_false")
+
+    control_motion: list[dict[str, Any]] = []
+    for row in analysis.records:
+        for column in ("yaw_vel_rad_s", "pitch_vel_rad_s", "yaw_acc_rad_s2", "pitch_acc_rad_s2"):
+            value = row.values.get(column)
+            if isinstance(value, (int, float)) and value != 0.0:
+                control_motion.append({"frame": row.values.get("frame"), "column": column, "value": value})
+    if control_motion:
+        safety_anomalies.append("nonzero_control_motion")
+    safety_anomalies.extend(ballistic_anomalies)
+    safety_anomalies = sorted(set(safety_anomalies))
     safety: dict[str, Any] = {
         "fire_command_distribution": fire_distribution,
         "nonzero_fire_command_values": sorted(nonzero_fire),
         "nonzero_fire_command_count": sum(1 for value in fire_values if isinstance(value, int) and value != 0),
         "test_only_distribution": test_distribution,
         "test_only_false_frames": false_test_frames,
+        "test_only_false_values": test_only_false_values,
+        "production_ready_true": production_ready_true,
+        "nonzero_control_motion": control_motion,
         "input_test_only": bool(test_values) and all(value is True for value in test_values),
         "dry_run": True,
         "serial_enabled": False,
@@ -678,6 +1161,20 @@ def _analyze_from_parsed(analysis: Analysis) -> dict[str, Any]:
             "reprojection_error_px": reprojection_summary,
             "real_distance_accuracy_computed": False,
             "hit_rate_computed": False,
+        },
+        "ballistic_diagnostics": {
+            "present": bool(ballistic_rows),
+            "enabled_distribution": _counter(ballistic_enabled_values),
+            "valid_distribution": _counter(ballistic_valid_values),
+            "reason_distribution": _counter(ballistic_reasons),
+            "origin_assumption_distribution": _counter(ballistic_origin_values),
+            "flight_time_s": _numeric_summary(ballistic_flight_times),
+            "gravity_pitch_correction_rad": _numeric_summary(ballistic_pitch_corrections),
+            "recommended_prediction_horizon_ns": _numeric_summary(ballistic_horizons),
+            "anomalies": ballistic_anomalies,
+            "control_applied": False,
+            "production_ready": False,
+            "physical_hit_rate_computed": False,
         },
         "tracker_target": tracker,
         "safety": safety,
@@ -781,6 +1278,7 @@ def markdown_report(report: Mapping[str, Any]) -> str:
     dp = report.get("detection_pnp", {})
     tracker = report.get("tracker_target", {})
     safety = report.get("safety", {})
+    ballistic = report.get("ballistic_diagnostics", {})
     units = report.get("units", {})
     boundary = report.get("evidence_boundary", {})
     lines = [
@@ -820,11 +1318,24 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         f"- Target switches: {tracker.get('target_switch_count', 0)}; lock losses: {tracker.get('lock_loss_count', 0)}",
         f"- State conflicts / data holes: {tracker.get('state_conflict_count', 0)} / {tracker.get('data_hole_count', 0)}",
         "",
+        "## Ballistic diagnostic (test-only)",
+        "",
+        f"- Present: {ballistic.get('present', False)}",
+        f"- Enabled/valid distribution: {ballistic.get('enabled_distribution', {})} / {ballistic.get('valid_distribution', {})}",
+        f"- Failure reasons: {ballistic.get('reason_distribution', {})}",
+        f"- Origin assumptions: {ballistic.get('origin_assumption_distribution', {})}",
+        f"- Flight time (s): {ballistic.get('flight_time_s')}",
+        f"- Gravity pitch correction (rad): {ballistic.get('gravity_pitch_correction_rad')}",
+        f"- Recommended horizon (ns): {ballistic.get('recommended_prediction_horizon_ns')}",
+        "- Ballistic values are analytic, drag-free, test-only diagnostics; they are not applied to aiming or firing.",
+        "",
         "## Safety",
         "",
         f"- fire_command distribution: {safety.get('fire_command_distribution')}",
         f"- Non-zero fire commands: {safety.get('nonzero_fire_command_values')}",
         f"- test_only=false frames: {safety.get('test_only_false_frames')}",
+        f"- production_ready=true fields: {safety.get('production_ready_true')}",
+        f"- Non-zero control motion fields: {safety.get('nonzero_control_motion')}",
         "- No action is triggered; fire_command is reported only.",
         "- A software lock value is not interpreted as a real gimbal lock.",
         "",
@@ -934,10 +1445,104 @@ def _validate_report_paths(
         )
 
 
-def _write_json_report(report: Mapping[str, Any], path_value: Union[str, Path]) -> None:
+def _validate_report_output_destination(destination: Path) -> None:
+    """Reject special files and link aliases before any report write.
+
+    Evidence reports are intentionally local files.  In particular, a FIFO
+    could block the reporting process and a character device could turn a
+    supposedly read-only analysis into a serial/device write.  ``lstat`` is
+    used so dangling links cannot evade the check.
+    """
+
+    destination = Path(destination)
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise OSError(f"report output cannot be inspected: {destination}") from exc
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError("report output must not be a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("report output must be a regular file")
+        if info.st_nlink > 1:
+            raise OSError("report output must not be a hardlink")
+
+    current = destination.parent
+    while True:
+        try:
+            parent_info = current.lstat()
+        except FileNotFoundError:
+            parent_info = None
+        except OSError as exc:
+            raise OSError(f"report output parent cannot be inspected: {current}") from exc
+        if parent_info is not None:
+            if stat.S_ISLNK(parent_info.st_mode):
+                raise OSError("report output parent must not be a symlink")
+            if not stat.S_ISDIR(parent_info.st_mode):
+                raise OSError("report output parent must be a directory")
+        if current == current.parent:
+            break
+        current = current.parent
+
+
+def _ensure_report_output_parent(destination: Path) -> None:
+    """Create report parents one component at a time without link traversal."""
+
+    parent = Path(destination).parent.absolute()
+    current = Path(parent.anchor) if parent.anchor else Path.cwd()
+    for part in parent.parts:
+        if part == parent.anchor:
+            continue
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise OSError(f"report output parent cannot be inspected: {current}") from exc
+        except OSError as exc:
+            raise OSError(f"report output parent cannot be inspected: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError("report output parent must not be a symlink")
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("report output parent must be a directory")
+
+
+def _write_report_text(path_value: Union[str, Path], payload: str) -> None:
+    """Write one text report only after rechecking its safe destination."""
+
     path = Path(path_value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _validate_report_output_destination(path)
+    _ensure_report_output_parent(path)
+    _validate_report_output_destination(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise OSError(f"unable to write report output: {path}") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _write_json_report(report: Mapping[str, Any], path_value: Union[str, Path]) -> None:
+    _write_report_text(path_value, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_reports(
@@ -958,9 +1563,7 @@ def write_reports(
     if json_path:
         _write_json_report(report, json_path)
     if markdown_path:
-        path = Path(markdown_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(markdown_report(report), encoding="utf-8")
+        _write_report_text(markdown_path, markdown_report(report))
 
 
 def _load_metadata(path: Optional[Union[str, Path]]) -> tuple[dict[str, Any], Optional[str]]:

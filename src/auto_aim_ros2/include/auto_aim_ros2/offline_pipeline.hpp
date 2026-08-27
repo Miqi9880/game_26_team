@@ -15,6 +15,8 @@
 namespace rm_auto_aim::offline
 {
 
+struct BallisticResult;
+
 enum class TrackingState : std::uint8_t
 {
   Lost = 0,
@@ -439,7 +441,8 @@ cv::Mat annotate_offline_frame(
   const TrackerUpdate & tracked,
   const std::optional<TrackedTarget> & selected,
   const AimerOutput & aimed,
-  const PredictionResult * prediction = nullptr);
+  const PredictionResult * prediction = nullptr,
+  const BallisticResult * ballistic = nullptr);
 
 }  // namespace rm_auto_aim::offline
 

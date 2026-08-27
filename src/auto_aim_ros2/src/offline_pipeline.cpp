@@ -1,5 +1,7 @@
 #include "auto_aim_ros2/offline_pipeline.hpp"
 
+#include "auto_aim_ros2/offline_ballistic.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -1453,7 +1455,8 @@ cv::Mat annotate_offline_frame(
   const TrackerUpdate & tracked,
   const std::optional<TrackedTarget> & selected,
   const AimerOutput & aimed,
-  const PredictionResult * prediction)
+  const PredictionResult * prediction,
+  const BallisticResult * ballistic)
 {
   auto result = pnp::PnpStage::annotate(bgr_image, observations);
   if (result.empty()) {
@@ -1488,6 +1491,20 @@ cv::Mat annotate_offline_frame(
     cv::putText(result, prediction_status, cv::Point(12, 78),
       cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(255, 180, 0), 2, cv::LINE_AA);
   }
+  if (ballistic != nullptr) {
+    std::string ballistic_status = "ballistic=" +
+      std::string(ballistic_failure_reason_name(ballistic->failure_reason)) +
+      " origin=" + ballistic_origin_assumption_name(ballistic->origin_assumption);
+    if (ballistic->valid && ballistic->flight_time_s.has_value() &&
+      ballistic->gravity_pitch_correction_rad.has_value())
+    {
+      ballistic_status += " t_s=" + std::to_string(*ballistic->flight_time_s) +
+        " lift_rad=" + std::to_string(*ballistic->gravity_pitch_correction_rad);
+    }
+    cv::putText(
+      result, ballistic_status, cv::Point(12, 103),
+      cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
+  }
   if (aimed.relative_yaw_rad.has_value() && aimed.relative_pitch_rad.has_value()) {
     const auto text = "rel_rad=" + std::to_string(*aimed.relative_yaw_rad) + "," +
       std::to_string(*aimed.relative_pitch_rad);
@@ -1499,7 +1516,8 @@ cv::Mat annotate_offline_frame(
   {
     const auto text = "test_abs_degree=" + std::to_string(*aimed.command_yaw_degree) + "," +
       std::to_string(*aimed.command_pitch_degree);
-    cv::putText(result, text, cv::Point(12, 103), cv::FONT_HERSHEY_SIMPLEX, 0.52,
+    cv::putText(
+      result, text, cv::Point(12, ballistic != nullptr ? 128 : 103), cv::FONT_HERSHEY_SIMPLEX, 0.52,
       cv::Scalar(255, 200, 0), 1, cv::LINE_AA);
   }
   return result;

@@ -12,6 +12,12 @@
 | `yaw_acc_rad_s2` / `pitch_acc_rad_s2` | rad/s² | 当前为 0；不实现加速度模型 |
 | `predicted_relative_yaw_rad` / `predicted_relative_pitch_rad` | rad | `OfflinePredictor` 的 test-only 恒速诊断 |
 | `prediction_horizon_ms` | ms（CSV） | 内部由整数 `horizon_ns` 派生，默认关闭 |
+| `ballistic_geometric_yaw_rad` / `ballistic_geometric_pitch_rad` | rad | 枪口 frame 中 `atan2` 几何量；仅离线诊断 |
+| `ballistic_yaw_rad` / `ballistic_pitch_rad` | rad | 无阻力低弹道解析解；不写入 Aimer 或 RobotCtrl |
+| `ballistic_gravity_pitch_correction_rad` | rad | `ballistic_pitch - geometric_pitch`；非经验 offset |
+| `ballistic_flight_time_s` / `ballistic_flight_time_ns` | s / ns | 飞行时间；ns 为带溢出检查的证据字段 |
+| `ballistic_system_latency_ns` / `ballistic_recommended_prediction_horizon_ns` | ns | 显式 latency 及其与飞行时间的只读和；不覆盖 Predictor |
+| `ballistic_target_{x,y,z}_m` | m | 已在 muzzle frame 的目标位置，x 前/y 左/z 上 |
 
 正式外部接口边界仍是：
 
@@ -53,6 +59,12 @@ yaw 环绕和车型 pitch 预限幅；离线 Aimer 的 relative 输出仍不能�
 `OfflinePredictor` 在 Aimer 之后独立运行，预测值永远不会替换 Aimer 接收的实测 selected track，
 也不会把预测值写入 `AimCommand`。它只把 `current_relative + velocity_rad_s * horizon_s` 写入
 离线 CSV/标注诊断；`production_ready=false`，不产生正式 absolute command。
+
+`OfflineBallisticDiagnostic` 同样与 Aimer 并列而非 Aimer 的一部分。它只接受已经在 muzzle frame 的
+点；当前 CLI 没有正式 gimbal→muzzle 外参，因此不传
+`--allow-test-gimbal-origin-as-muzzle` 时会记录 `missing_muzzle_transform`，而不是把 gimbal 原点当作
+默认枪口原点。即使显式使用 test-only gimbal-origin 假设，解析的 yaw/pitch、重力补偿和推荐 horizon
+都不会改写 `relative_yaw_rad`、`command_*`、`AimCommand`、ROS 或串口字段。
 
 ## 开火约束
 

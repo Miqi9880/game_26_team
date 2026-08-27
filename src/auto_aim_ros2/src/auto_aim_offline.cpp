@@ -1,4 +1,5 @@
 #include "auto_aim_ros2/offline_pipeline.hpp"
+#include "auto_aim_ros2/offline_ballistic.hpp"
 #include "auto_aim_ros2/pnp_stage.hpp"
 #include "auto_aim_ros2/raw_armor_detector.hpp"
 
@@ -13,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
@@ -41,6 +43,12 @@ struct Options
   std::optional<double> test_zero_pitch_degree;
   std::optional<double> prediction_horizon_ms;
   std::optional<double> max_prediction_horizon_ms;
+  bool ballistic_diagnostic{false};
+  std::optional<double> ballistic_bullet_speed_mps;
+  std::optional<double> ballistic_gravity_mps2;
+  std::optional<double> ballistic_system_latency_ms;
+  std::optional<double> ballistic_max_flight_time_ms;
+  bool allow_test_gimbal_origin_as_muzzle{false};
   rm_auto_aim::offline::TrackerConfig tracker_config{};
 };
 
@@ -64,6 +72,12 @@ void usage()
     "  --test-zero-pitch-degree D test-only pitch zero for test_absolute_zero\n"
     "  --prediction-horizon-ms MS  enable test-only prediction (default disabled)\n"
     "  --max-prediction-horizon-ms MS  explicit prediction horizon upper bound\n"
+    "  --ballistic-diagnostic  enable a test-only drag-free ballistic diagnostic\n"
+    "  --ballistic-bullet-speed-mps MPS  explicit test-only bullet speed (> 0)\n"
+    "  --ballistic-gravity-mps2 MPS2  explicit positive gravity magnitude\n"
+    "  --ballistic-system-latency-ms MS  explicit system latency (0 allowed)\n"
+    "  --ballistic-max-flight-time-ms MS  explicit positive ballistic flight-time limit\n"
+    "  --allow-test-gimbal-origin-as-muzzle  explicit test-only origin assumption\n"
     "  --min-detect-count N      tracker lock threshold (default 2)\n"
     "  --max-temp-lost-ms MS     tracker temporary-loss window (default 100)\n"
     "  --max-position-jump-m M   tracker association gate (default 0.75)\n"
@@ -148,6 +162,22 @@ Options parse_options(int argc, char ** argv)
     } else if (argument == "--max-prediction-horizon-ms") {
       result.max_prediction_horizon_ms = parse_double(
         require_value("--max-prediction-horizon-ms"), "--max-prediction-horizon-ms");
+    } else if (argument == "--ballistic-diagnostic") {
+      result.ballistic_diagnostic = true;
+    } else if (argument == "--ballistic-bullet-speed-mps") {
+      result.ballistic_bullet_speed_mps = parse_double(
+        require_value("--ballistic-bullet-speed-mps"), "--ballistic-bullet-speed-mps");
+    } else if (argument == "--ballistic-gravity-mps2") {
+      result.ballistic_gravity_mps2 = parse_double(
+        require_value("--ballistic-gravity-mps2"), "--ballistic-gravity-mps2");
+    } else if (argument == "--ballistic-system-latency-ms") {
+      result.ballistic_system_latency_ms = parse_double(
+        require_value("--ballistic-system-latency-ms"), "--ballistic-system-latency-ms");
+    } else if (argument == "--ballistic-max-flight-time-ms") {
+      result.ballistic_max_flight_time_ms = parse_double(
+        require_value("--ballistic-max-flight-time-ms"), "--ballistic-max-flight-time-ms");
+    } else if (argument == "--allow-test-gimbal-origin-as-muzzle") {
+      result.allow_test_gimbal_origin_as_muzzle = true;
     } else if (argument == "--min-detect-count") {
       result.tracker_config.min_detect_count = parse_int(
         require_value("--min-detect-count"), "--min-detect-count");
@@ -192,6 +222,37 @@ Options parse_options(int argc, char ** argv)
     throw std::invalid_argument(
             "prediction horizon and maximum prediction horizon must not be negative");
   }
+  const bool any_ballistic_argument = result.ballistic_bullet_speed_mps.has_value() ||
+    result.ballistic_gravity_mps2.has_value() || result.ballistic_system_latency_ms.has_value() ||
+    result.ballistic_max_flight_time_ms.has_value() || result.allow_test_gimbal_origin_as_muzzle;
+  if (!result.ballistic_diagnostic && any_ballistic_argument) {
+    throw std::invalid_argument(
+            "ballistic arguments require explicit --ballistic-diagnostic");
+  }
+  if (result.ballistic_diagnostic) {
+    if (!result.ballistic_bullet_speed_mps.has_value()) {
+      throw std::invalid_argument(
+              "--ballistic-diagnostic requires --ballistic-bullet-speed-mps");
+    }
+    if (!result.ballistic_gravity_mps2.has_value()) {
+      throw std::invalid_argument(
+              "--ballistic-diagnostic requires --ballistic-gravity-mps2");
+    }
+    if (!result.ballistic_system_latency_ms.has_value()) {
+      throw std::invalid_argument(
+              "--ballistic-diagnostic requires --ballistic-system-latency-ms");
+    }
+    if (!result.ballistic_max_flight_time_ms.has_value()) {
+      throw std::invalid_argument(
+              "--ballistic-diagnostic requires --ballistic-max-flight-time-ms");
+    }
+    if (*result.ballistic_bullet_speed_mps <= 0.0 || *result.ballistic_gravity_mps2 <= 0.0 ||
+      *result.ballistic_system_latency_ms < 0.0 || *result.ballistic_max_flight_time_ms <= 0.0)
+    {
+      throw std::invalid_argument(
+              "ballistic speed, gravity, and flight limit must be positive; latency must be non-negative");
+    }
+  }
   return result;
 }
 
@@ -204,9 +265,13 @@ std::int64_t milliseconds_to_ns(double milliseconds, const char * name)
   const long double nanoseconds = static_cast<long double>(milliseconds) *
     kNanosecondsPerMillisecond;
   const long double rounded = std::round(nanoseconds);
-  const long double max_nanoseconds =
-    static_cast<long double>(std::numeric_limits<std::int64_t>::max());
-  if (!std::isfinite(nanoseconds) || rounded < 0.0L || rounded > max_nanoseconds) {
+  // Keep the conversion conservative when long double rounds INT64_MAX to
+  // 2^63.  The upper bound is exclusive because 2^63 is not representable
+  // as an int64_t.
+  constexpr long double kInt64ExclusiveUpperBound = 9223372036854775808.0L;
+  if (!std::isfinite(nanoseconds) || rounded < 0.0L ||
+    rounded >= kInt64ExclusiveUpperBound)
+  {
     throw std::invalid_argument(std::string(name) + " is too large for int64 nanoseconds");
   }
   return static_cast<std::int64_t>(rounded);
@@ -230,10 +295,116 @@ std::int64_t frame_period_ns(const Options & options, double video_fps)
   return period_ns;
 }
 
+bool paths_alias(const std::filesystem::path & left, const std::filesystem::path & right)
+{
+  std::error_code error;
+  if (std::filesystem::equivalent(left, right, error)) {
+    return true;
+  }
+  error.clear();
+  const auto normalized_left = std::filesystem::absolute(left, error).lexically_normal();
+  if (error) {
+    return false;
+  }
+  const auto normalized_right = std::filesystem::absolute(right, error).lexically_normal();
+  return !error && normalized_left == normalized_right;
+}
+
+void require_existing_regular_file(
+  const std::filesystem::path & path,
+  const char * label)
+{
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(path, error);
+  if (error || !std::filesystem::is_regular_file(status)) {
+    throw std::runtime_error(
+            std::string(label) + " must be an existing regular local file: " + path.string());
+  }
+}
+
+void validate_output_file_path(
+  const std::filesystem::path & output,
+  const std::vector<std::filesystem::path> & inputs,
+  const char * label)
+{
+  if (output.empty()) {
+    throw std::invalid_argument(std::string(label) + " path must not be empty");
+  }
+  for (const auto & input : inputs) {
+    if (paths_alias(output, input)) {
+      throw std::invalid_argument(
+              std::string(label) + " must not alias an input path: " + output.string());
+    }
+  }
+
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(output, error);
+  if (!error && std::filesystem::exists(status) && !std::filesystem::is_regular_file(status)) {
+    throw std::invalid_argument(
+            std::string(label) + " must be a regular file when it already exists: " + output.string());
+  }
+  if (error && error != std::errc::no_such_file_or_directory) {
+    throw std::runtime_error(
+            "unable to inspect " + std::string(label) + " path: " + output.string());
+  }
+}
+
+void validate_output_directory_path(
+  const std::filesystem::path & output,
+  const std::vector<std::filesystem::path> & inputs,
+  const char * label)
+{
+  if (output.empty()) {
+    throw std::invalid_argument(std::string(label) + " path must not be empty");
+  }
+  for (const auto & input : inputs) {
+    if (paths_alias(output, input)) {
+      throw std::invalid_argument(
+              std::string(label) + " must not alias an input path: " + output.string());
+    }
+  }
+
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(output, error);
+  if (!error && std::filesystem::exists(status) && !std::filesystem::is_directory(status)) {
+    throw std::invalid_argument(
+            std::string(label) + " must be a directory when it already exists: " + output.string());
+  }
+  if (error && error != std::errc::no_such_file_or_directory) {
+    throw std::runtime_error(
+            "unable to inspect " + std::string(label) + " path: " + output.string());
+  }
+}
+
+void validate_offline_io_paths(const Options & options)
+{
+  const std::vector<std::filesystem::path> inputs{
+    options.model_path,
+    options.model_profile_path,
+    options.video_path,
+    options.pnp_config_path,
+  };
+  validate_output_file_path(options.csv_path, inputs, "CSV output");
+  validate_output_directory_path(options.annotated_dir, inputs, "annotated output directory");
+  if (paths_alias(options.csv_path, options.annotated_dir)) {
+    throw std::invalid_argument("CSV output must not alias the annotated output directory");
+  }
+  // Do this before VideoCapture so a URI, camera device, FIFO, or serial
+  // device can never be interpreted as an offline replay input.
+  require_existing_regular_file(options.video_path, "video input");
+}
+
 void write_optional(std::ofstream & csv, const std::optional<double> & value)
 {
   if (value.has_value()) {
     csv << std::setprecision(10) << *value;
+  }
+}
+
+void write_optional_ns(std::ofstream & csv, const std::optional<std::int64_t> & value)
+{
+  if (value.has_value()) {
+    csv << *value;
   }
 }
 
@@ -242,15 +413,17 @@ void write_prediction_fields(
   const rm_auto_aim::offline::PredictionResult * prediction)
 {
   // Keep the schema stable while making the default (no explicit horizon)
-  // visibly empty.  A disabled run must not manufacture a zero-horizon row.
+  // an explicit disabled record.  In particular, do not manufacture a
+  // zero-horizon row or leave a trailing comma that changes the CSV width.
   if (prediction == nullptr) {
-    csv << 0;
-    // prediction_valid plus ten additional fields is the complete
-    // eleven-column prediction suffix.  The caller already emitted the
-    // separating comma, so ten commas terminate the remaining empty fields.
-    for (int index = 0; index < 10; ++index) {
+    // There are seven unavailable numeric/timestamp fields between the
+    // disabled reason and the immutable test-only flags.  Eight separators
+    // create those seven empty fields before the following "1".
+    csv << "0,disabled";
+    for (int index = 0; index < 8; ++index) {
       csv << ',';
     }
+    csv << "1,0";
     return;
   }
 
@@ -283,6 +456,78 @@ void write_prediction_fields(
     (prediction->production_ready ? 1 : 0);
 }
 
+void write_ballistic_fields(
+  std::ofstream & csv,
+  const rm_auto_aim::offline::BallisticResult * ballistic,
+  const rm_auto_aim::offline::AimerOutput & aimed)
+{
+  // The suffix is append-only.  A run without --ballistic-diagnostic records
+  // a disabled marker and leaves physical diagnostic values empty rather than
+  // manufacturing zero-speed, zero-latency, or zero-compensation evidence.
+  // The three immutable test-only/safety flags remain explicit in every row.
+  if (ballistic == nullptr) {
+    csv << 0;
+    // enabled + twenty physical/reason/origin fields are empty; the final
+    // three diagnostic columns retain their invariant values.
+    for (int index = 0; index < 20; ++index) {
+      csv << ',';
+    }
+    csv << ",1,0,0";
+  } else {
+    csv << (ballistic->enabled ? 1 : 0) << ',' << (ballistic->valid ? 1 : 0) << ',' <<
+      rm_auto_aim::offline::ballistic_failure_reason_name(ballistic->failure_reason) << ',';
+    if (ballistic->track_id != 0) {
+      csv << ballistic->track_id;
+    }
+    csv << ',';
+    if (ballistic->source_stamp_ns >= 0) {
+      csv << ballistic->source_stamp_ns;
+    }
+    csv << ',';
+    if (ballistic->target_muzzle_m.has_value()) {
+      csv << std::setprecision(10) << (*ballistic->target_muzzle_m)[0] << ',' <<
+        (*ballistic->target_muzzle_m)[1] << ',' << (*ballistic->target_muzzle_m)[2];
+    } else {
+      csv << ",,";
+    }
+    csv << ',';
+    write_optional(csv, ballistic->horizontal_distance_m);
+    csv << ',';
+    write_optional(csv, ballistic->geometric_yaw_rad);
+    csv << ',';
+    write_optional(csv, ballistic->geometric_pitch_rad);
+    csv << ',';
+    write_optional(csv, ballistic->ballistic_yaw_rad);
+    csv << ',';
+    write_optional(csv, ballistic->ballistic_pitch_rad);
+    csv << ',';
+    write_optional(csv, ballistic->gravity_pitch_correction_rad);
+    csv << ',';
+    write_optional(csv, ballistic->flight_time_s);
+    csv << ',';
+    write_optional_ns(csv, ballistic->flight_time_ns);
+    csv << ',';
+    write_optional_ns(csv, ballistic->system_latency_ns);
+    csv << ',';
+    write_optional_ns(csv, ballistic->recommended_prediction_horizon_ns);
+    csv << ',';
+    write_optional(csv, ballistic->bullet_speed_mps);
+    csv << ',';
+    write_optional(csv, ballistic->gravity_mps2);
+    csv << ',' <<
+      rm_auto_aim::offline::ballistic_origin_assumption_name(ballistic->origin_assumption) << ',' <<
+      (ballistic->test_only ? 1 : 0) << ',' << (ballistic->production_ready ? 1 : 0) << ',' <<
+      (ballistic->ballistic_control_applied ? 1 : 0);
+  }
+  // Record the only command-shaped view this tool exposes, not Tracker's
+  // internal diagnostic velocities carried by AimerOutput.  The safe view
+  // has zero velocity/acceleration by construction.
+  const auto safe_command = aimed.safe_command();
+  csv << ",0,1,0," << std::setprecision(10) << safe_command.yaw_vel_rad_s << ',' <<
+    safe_command.pitch_vel_rad_s << ',' << safe_command.yaw_acc_rad_s2 << ',' <<
+    safe_command.pitch_acc_rad_s2;
+}
+
 const rm_auto_aim::offline::TrackedTarget * find_track(
   const rm_auto_aim::offline::TrackerUpdate & update,
   std::size_t detection_index,
@@ -309,7 +554,16 @@ void write_header(std::ofstream & csv)
     "prediction_valid,prediction_reason,prediction_horizon_ms,prediction_source_stamp_ns,"
     "prediction_stamp_ns,predicted_relative_yaw_rad,predicted_relative_pitch_rad,"
     "predicted_relative_yaw_degree,predicted_relative_pitch_degree,prediction_test_only,"
-    "prediction_production_ready\n";
+    "prediction_production_ready,ballistic_enabled,ballistic_valid,ballistic_reason,"
+    "ballistic_track_id,ballistic_source_stamp_ns,ballistic_target_x_m,ballistic_target_y_m,"
+    "ballistic_target_z_m,ballistic_horizontal_distance_m,ballistic_geometric_yaw_rad,"
+    "ballistic_geometric_pitch_rad,ballistic_yaw_rad,ballistic_pitch_rad,"
+    "ballistic_gravity_pitch_correction_rad,ballistic_flight_time_s,ballistic_flight_time_ns,"
+    "ballistic_system_latency_ns,ballistic_recommended_prediction_horizon_ns,"
+    "ballistic_bullet_speed_mps,ballistic_gravity_mps2,ballistic_origin_assumption,"
+    "ballistic_test_only,ballistic_production_ready,ballistic_control_applied,"
+    "serial_enabled,dry_run,allow_fire,yaw_vel_rad_s,pitch_vel_rad_s,"
+    "yaw_acc_rad_s2,pitch_acc_rad_s2\n";
 }
 
 void write_row(
@@ -323,7 +577,8 @@ void write_row(
   const rm_auto_aim::offline::TrackedTarget * track,
   bool selected,
   const rm_auto_aim::offline::AimerOutput & aimed,
-  const rm_auto_aim::offline::PredictionResult * prediction)
+  const rm_auto_aim::offline::PredictionResult * prediction,
+  const rm_auto_aim::offline::BallisticResult * ballistic)
 {
   csv << frame_index << ',' << stamp_ns << ',' << detection_count << ',' << valid_pnp_count << ',';
   if (pose == nullptr) {
@@ -333,9 +588,11 @@ void write_row(
     }
     // target_lock is field 24; fields 25..29 are the five unavailable
     // command diagnostics before fire_command (field 30).
-    csv << static_cast<int>(aimed.target_lock) << ",,,,," <<
+    csv << static_cast<int>(aimed.target_lock) << ",,,,,," <<
       static_cast<int>(aimed.fire_command) << ",1,";
     write_prediction_fields(csv, prediction);
+    csv << ',';
+    write_ballistic_fields(csv, ballistic, aimed);
     csv << '\n';
     return;
   }
@@ -381,6 +638,8 @@ void write_row(
   write_optional(csv, aimed.command_pitch_degree);
   csv << ',' << static_cast<int>(aimed.fire_command) << ',' << (aimed.test_only ? 1 : 0) << ',';
   write_prediction_fields(csv, prediction);
+  csv << ',';
+  write_ballistic_fields(csv, ballistic, aimed);
   csv << '\n';
 }
 
@@ -390,6 +649,7 @@ int main(int argc, char ** argv)
 {
   try {
     const auto options = parse_options(argc, argv);
+    validate_offline_io_paths(options);
     rm_auto_aim::pnp::ConfigLoadOptions load_options{};
     load_options.allow_test_only = options.allow_test_config;
     rm_auto_aim::pnp::PnpStage pnp_stage(
@@ -428,6 +688,23 @@ int main(int argc, char ** argv)
     }
     rm_auto_aim::offline::OfflinePredictor predictor(prediction_config);
 
+    rm_auto_aim::offline::BallisticConfig ballistic_config{};
+    ballistic_config.enabled = options.ballistic_diagnostic;
+    if (options.ballistic_diagnostic) {
+      ballistic_config.bullet_speed_mps = *options.ballistic_bullet_speed_mps;
+      ballistic_config.gravity_mps2 = *options.ballistic_gravity_mps2;
+      ballistic_config.system_latency_ns = milliseconds_to_ns(
+        *options.ballistic_system_latency_ms, "--ballistic-system-latency-ms");
+      ballistic_config.max_flight_time_ns = milliseconds_to_ns(
+        *options.ballistic_max_flight_time_ms, "--ballistic-max-flight-time-ms");
+      // This is only a bound comparison. It never changes the existing
+      // OfflinePredictor configuration or the user's chosen horizon.
+      ballistic_config.max_prediction_horizon_ns = prediction_config.max_horizon_ns;
+      ballistic_config.allow_test_gimbal_origin_as_muzzle =
+        options.allow_test_gimbal_origin_as_muzzle;
+    }
+    rm_auto_aim::offline::OfflineBallisticDiagnostic ballistic_diagnostic(ballistic_config);
+
     cv::VideoCapture video(options.video_path);
     if (!video.isOpened()) {
       throw std::runtime_error("cannot open video: " + options.video_path);
@@ -442,7 +719,8 @@ int main(int argc, char ** argv)
     std::filesystem::create_directories(options.annotated_dir);
 
     std::cout << "dry_run=true allow_fire=false serial_enabled=false fire_command=0\n";
-    std::cout << "pipeline=detector->pnp->tracker->selector->aimer\n";
+    std::cout << "pipeline=detector->pnp->tracker->selector->aimer"
+      " (optional predictor and ballistic diagnostics are read-only)\n";
     std::cout << "pnp_profile=" << (pnp_stage.config().test_only ? "test_only" : "production") <<
       " model_profile=" << model_profile.model_id << "@" << model_profile.version <<
       " model_profile_kind=" << (model_profile.test_only ? "test_only" : "production") <<
@@ -452,7 +730,12 @@ int main(int argc, char ** argv)
       " prediction=" << (prediction_config.enabled ? "enabled" : "disabled") <<
       " prediction_horizon_ns=" << prediction_config.horizon_ns <<
       " max_prediction_horizon_ns=" << prediction_config.max_horizon_ns <<
-      " prediction_test_only=true production_ready=false\n";
+      " prediction_test_only=true"
+      " ballistic=" << (ballistic_config.enabled ? "enabled" : "disabled") <<
+      " ballistic_test_only=true ballistic_production_ready=false"
+      " ballistic_origin_assumption=" <<
+      (ballistic_config.allow_test_gimbal_origin_as_muzzle ? "test_only_gimbal_origin" : "none") <<
+      " production_ready=false\n";
     if (pnp_stage.config().test_only) {
       std::cout << "warning=test_only calibration/geometry/extrinsic; no physical accuracy claim\n";
     }
@@ -504,6 +787,13 @@ int main(int argc, char ** argv)
       if (prediction_config.enabled) {
         prediction = predictor.predict(selected, stamp_ns);
       }
+      std::optional<rm_auto_aim::offline::BallisticResult> ballistic;
+      if (ballistic_config.enabled) {
+        // The current offline replay has no reviewed gimbal->muzzle transform.
+        // The diagnostic adapter therefore returns missing_muzzle_transform
+        // unless the explicit test-only origin switch was supplied.
+        ballistic = ballistic_diagnostic.diagnose(selected, stamp_ns);
+      }
 
       std::cout << "frame=" << processed << " stamp_ns=" << stamp_ns <<
         " detections=" << detections.size() << " valid_pnp=" << valid_pnp_count <<
@@ -516,25 +806,38 @@ int main(int argc, char ** argv)
           " prediction_reason=" <<
           rm_auto_aim::offline::prediction_failure_reason_name(prediction->failure_reason);
       }
+      if (ballistic.has_value()) {
+        std::cout << " ballistic_valid=" << (ballistic->valid ? "true" : "false") <<
+          " ballistic_reason=" <<
+          rm_auto_aim::offline::ballistic_failure_reason_name(ballistic->failure_reason) <<
+          " ballistic_origin_assumption=" <<
+          rm_auto_aim::offline::ballistic_origin_assumption_name(
+          ballistic->origin_assumption);
+      }
       std::cout << '\n';
 
       if (poses.empty()) {
-        write_row(csv, processed, stamp_ns, 0, 0, 0, nullptr, nullptr, false, aimed,
-          prediction.has_value() ? &*prediction : nullptr);
+        write_row(
+          csv, processed, stamp_ns, 0, 0, 0, nullptr, nullptr, false, aimed,
+          prediction.has_value() ? &*prediction : nullptr,
+          ballistic.has_value() ? &*ballistic : nullptr);
       } else {
         for (std::size_t index = 0; index < poses.size(); ++index) {
           const auto * track = find_track(update, index, stamp_ns);
           const bool is_selected = selected.has_value() && track != nullptr &&
             selected->track_id == track->track_id;
-          write_row(csv, processed, stamp_ns, poses.size(), valid_pnp_count, index,
+          write_row(
+            csv, processed, stamp_ns, poses.size(), valid_pnp_count, index,
             &poses[index], track, is_selected, aimed,
-            prediction.has_value() ? &*prediction : nullptr);
+            prediction.has_value() ? &*prediction : nullptr,
+            ballistic.has_value() ? &*ballistic : nullptr);
         }
       }
 
       const auto annotated = rm_auto_aim::offline::annotate_offline_frame(
         image, poses, update, selected, aimed,
-        prediction.has_value() ? &*prediction : nullptr);
+        prediction.has_value() ? &*prediction : nullptr,
+        ballistic.has_value() ? &*ballistic : nullptr);
       const auto output_path = std::filesystem::path(options.annotated_dir) /
         ("frame_" + std::to_string(processed) + ".png");
       if (annotated.empty() || !cv::imwrite(output_path.string(), annotated)) {

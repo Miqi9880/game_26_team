@@ -54,6 +54,20 @@ metadata:
 候选 K/D，以及 `pnp_camera_fields_for_manual_review`。质量门禁失败（视图数量不足或 RMS
 超过阈值）仍会写出 rejected evidence report，并以非零状态退出。
 
+## 数据集 manifest 关联
+
+旧 schema v1 配置继续兼容原命令。若 metadata 同时声明 dataset_manifest 和
+dataset_manifest_sha256，必须额外传入：
+
+~~~bash
+--dataset-manifest /absolute/path/dataset_manifest.yaml
+~~~
+
+工具会在读取图像和执行标定前对 manifest 实际字节复算 SHA-256；缺少 manifest、哈希
+不一致或向未声明关联的旧配置额外传入 manifest 都会直接失败。由
+auto_aim_calibration_dataset 生成的 calibration_input.yaml 始终启用此验证链，标定报告
+会归档已验证的 dataset_manifest_sha256。
+
 ## 安全边界
 
 报告始终包含：

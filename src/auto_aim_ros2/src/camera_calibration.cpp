@@ -1,11 +1,14 @@
 #include "auto_aim_ros2/camera_calibration.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -15,6 +18,10 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
+
+#ifdef AUTO_AIM_HAS_OPENSSL
+#include <openssl/evp.h>
+#endif
 
 namespace rm_auto_aim::camera_calibration
 {
@@ -76,6 +83,12 @@ bool valid_commit_sha(const std::string & value)
   return std::regex_match(value, kCommitPattern);
 }
 
+bool valid_sha256(const std::string & value)
+{
+  static const std::regex kSha256Pattern(R"(^[0-9a-f]{64}$)");
+  return std::regex_match(value, kSha256Pattern);
+}
+
 YAML::Node required_node(const YAML::Node & parent, const std::string & key, const std::string & path)
 {
   const auto node = parent[key];
@@ -96,6 +109,71 @@ std::string required_string(const YAML::Node & parent, const std::string & key, 
   } catch (const YAML::Exception &) {
     throw std::runtime_error(path + ": field '" + key + "' must be a non-empty string");
   }
+}
+
+std::optional<std::string> optional_string(
+  const YAML::Node & parent, const std::string & key, const std::string & path)
+{
+  const auto node = parent[key];
+  if (!node || node.IsNull()) {
+    return std::nullopt;
+  }
+  try {
+    const auto value = trim_copy(node.as<std::string>());
+    if (value.empty()) {
+      throw std::runtime_error(path + ": field '" + key + "' must not be empty when present");
+    }
+    return value;
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(path + ": field '" + key + "' must be a string when present");
+  }
+}
+
+std::string sha256_file(const std::string & path)
+{
+#ifdef AUTO_AIM_HAS_OPENSSL
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot read dataset manifest: " + path);
+  }
+  EVP_MD_CTX * raw_context = EVP_MD_CTX_new();
+  if (raw_context == nullptr) {
+    throw std::runtime_error("cannot allocate dataset manifest SHA-256 context");
+  }
+  const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(
+    raw_context, &EVP_MD_CTX_free);
+  if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+    throw std::runtime_error("cannot initialize dataset manifest SHA-256");
+  }
+  std::array<char, 16384> buffer{};
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const auto count = input.gcount();
+    if (count > 0 &&
+      EVP_DigestUpdate(context.get(), buffer.data(), static_cast<std::size_t>(count)) != 1)
+    {
+      throw std::runtime_error("dataset manifest SHA-256 update failed");
+    }
+  }
+  if (input.bad()) {
+    throw std::runtime_error("failed while reading dataset manifest: " + path);
+  }
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int size = 0;
+  if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1 || size != 32U) {
+    throw std::runtime_error("dataset manifest SHA-256 finalization failed");
+  }
+  std::ostringstream output;
+  output << std::hex << std::setfill('0');
+  for (unsigned int index = 0; index < size; ++index) {
+    output << std::setw(2) << static_cast<unsigned int>(digest[index]);
+  }
+  return output.str();
+#else
+  (void)path;
+  throw std::runtime_error(
+          "dataset manifest verification unavailable: auto_aim_ros2 was built without OpenSSL");
+#endif
 }
 
 int required_int(const YAML::Node & parent, const std::string & key, const std::string & path)
@@ -392,6 +470,14 @@ std::optional<std::string> CalibrationInput::validate() const
   if (!valid_commit_sha(metadata.code_commit)) {
     return "metadata.code_commit must be a 7 to 64 character hexadecimal commit SHA";
   }
+  if (metadata.dataset_manifest.has_value() != metadata.dataset_manifest_sha256.has_value()) {
+    return "metadata.dataset_manifest and metadata.dataset_manifest_sha256 must appear together";
+  }
+  if (metadata.dataset_manifest_sha256.has_value() &&
+    !valid_sha256(*metadata.dataset_manifest_sha256))
+  {
+    return "metadata.dataset_manifest_sha256 must be 64 lowercase hexadecimal characters";
+  }
   return std::nullopt;
 }
 
@@ -459,11 +545,43 @@ CalibrationInput load_calibration_input(const std::string & yaml_path)
   result.metadata.operator_identifier = required_string(metadata, "operator", "metadata");
   result.metadata.code_commit = required_string(metadata, "code_commit", "metadata");
   result.metadata.dataset_id = required_string(metadata, "dataset_id", "metadata");
+  result.metadata.dataset_manifest = optional_string(metadata, "dataset_manifest", "metadata");
+  result.metadata.dataset_manifest_sha256 =
+    optional_string(metadata, "dataset_manifest_sha256", "metadata");
 
   if (const auto error = result.validate(); error.has_value()) {
     throw std::runtime_error("invalid calibration input " + yaml_path + ": " + *error);
   }
   return result;
+}
+
+void verify_dataset_manifest(
+  const CalibrationInput & input, const std::string & manifest_path)
+{
+  if (const auto error = input.validate(); error.has_value()) {
+    throw std::invalid_argument("invalid calibration input: " + *error);
+  }
+  const bool linked = input.metadata.dataset_manifest.has_value();
+  if (!linked) {
+    if (!manifest_path.empty()) {
+      throw std::invalid_argument(
+              "--dataset-manifest was provided but calibration metadata declares no manifest hash");
+    }
+    return;
+  }
+  if (manifest_path.empty()) {
+    throw std::invalid_argument(
+            "linked calibration input requires --dataset-manifest for SHA-256 verification");
+  }
+  if (!std::filesystem::is_regular_file(manifest_path)) {
+    throw std::invalid_argument("dataset manifest is not a regular file: " + manifest_path);
+  }
+  const auto actual = sha256_file(manifest_path);
+  if (actual != *input.metadata.dataset_manifest_sha256) {
+    throw std::runtime_error(
+            "dataset_manifest_sha256 mismatch: expected " +
+            *input.metadata.dataset_manifest_sha256 + ", actual " + actual);
+  }
 }
 
 std::vector<std::string> load_image_manifest(const std::string & image_list_path)
@@ -661,6 +779,11 @@ void write_evidence_report(const CalibrationResult & result, const std::string &
   metadata["operator"] = result.input.metadata.operator_identifier;
   metadata["code_commit"] = result.input.metadata.code_commit;
   metadata["dataset_id"] = result.input.metadata.dataset_id;
+  if (result.input.metadata.dataset_manifest.has_value()) {
+    metadata["dataset_manifest"] = *result.input.metadata.dataset_manifest;
+    metadata["dataset_manifest_sha256"] = *result.input.metadata.dataset_manifest_sha256;
+    root["dataset_manifest_sha256"] = *result.input.metadata.dataset_manifest_sha256;
+  }
 
   auto summary = root["summary"];
   summary["input_file_count"] = result.image_evidence.size();

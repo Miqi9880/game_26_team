@@ -305,3 +305,48 @@ TEST(CameraCalibration, DoesNotOverwriteCameraInfoYaml)
   EXPECT_THROW(
     calibration::write_evidence_report(result, protected_path.string()), std::invalid_argument);
 }
+
+TEST(CameraCalibration, DatasetManifestSha256IsOptionalButVerifiedWhenDeclared)
+{
+  TemporaryDirectory temporary;
+  const auto manifest = temporary.path() / "dataset_manifest.yaml";
+  {
+    std::ofstream output(manifest, std::ios::binary);
+  }
+  auto input = load_fixture();
+  input.metadata.dataset_manifest = "dataset_manifest.yaml";
+  input.metadata.dataset_manifest_sha256 =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  ASSERT_FALSE(input.validate().has_value());
+  EXPECT_NO_THROW(calibration::verify_dataset_manifest(input, manifest.string()));
+  EXPECT_THROW(calibration::verify_dataset_manifest(input, ""), std::invalid_argument);
+
+  {
+    std::ofstream output(manifest, std::ios::app);
+    output << "changed\n";
+  }
+  EXPECT_THROW(calibration::verify_dataset_manifest(input, manifest.string()), std::runtime_error);
+
+  input.metadata.dataset_manifest_sha256 = "not-a-sha";
+  ASSERT_TRUE(input.validate().has_value());
+}
+
+TEST(CameraCalibration, LinkedDatasetHashIsArchivedInEvidenceReport)
+{
+  TemporaryDirectory temporary;
+  auto input = load_fixture();
+  input.metadata.dataset_manifest = "dataset_manifest.yaml";
+  input.metadata.dataset_manifest_sha256 =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  const auto result = calibration::calibrate_detected_views(input, make_synthetic_views(input));
+  ASSERT_TRUE(result.quality_accepted);
+  const auto report = temporary.path() / "linked.yaml";
+  calibration::write_evidence_report(result, report.string());
+  const auto yaml = YAML::LoadFile(report.string());
+  EXPECT_EQ(
+    yaml["dataset_manifest_sha256"].as<std::string>(),
+    *input.metadata.dataset_manifest_sha256);
+  EXPECT_EQ(
+    yaml["input"]["metadata"]["dataset_manifest"].as<std::string>(),
+    "dataset_manifest.yaml");
+}

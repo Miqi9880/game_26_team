@@ -260,6 +260,15 @@ class QualificationTests(unittest.TestCase):
 
         self.assertEqual(_runtime_layout(FakePort()), "NCHW")
 
+    def test_runtime_empty_layout_is_reported_as_unavailable(self):
+        from tools.auto_aim_qualification.model_profile_audit import _runtime_layout
+
+        class FakePort:
+            def get_layout(self):
+                return "[...]"
+
+        self.assertIsNone(_runtime_layout(FakePort()))
+
     def test_schema_v2_missing_bin_is_explicit_for_test_only_and_production(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

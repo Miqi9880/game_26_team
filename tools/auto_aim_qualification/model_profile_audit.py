@@ -481,8 +481,17 @@ def _runtime_layout(port: Any) -> Optional[str]:
             value = getter()
         except Exception:
             continue
+        if value is None:
+            continue
+        empty = getattr(value, "empty", None)
+        try:
+            empty = empty() if callable(empty) else empty
+        except Exception:
+            empty = None
+        if empty is True:
+            continue
         text = str(value).strip()
-        if not text or text in {"[]", "?", "{?}"}:
+        if not text or text in {"[]", "[...]", "?", "{?}", "..."}:
             continue
         # Layout's string representation can be ``[N,C,H,W]`` in some releases.
         text = text.strip("[]").replace(",", "").replace(" ", "")

@@ -247,6 +247,19 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(observed["status"], "checked")
         self.assertEqual(calls, [(str(xml), str(binary))])
 
+    def test_runtime_layout_falls_back_to_openvino_output_node(self):
+        from tools.auto_aim_qualification.model_profile_audit import _runtime_layout
+
+        class FakeNode:
+            def get_layout(self):
+                return "[N,C,H,W]"
+
+        class FakePort:
+            def get_node(self):
+                return FakeNode()
+
+        self.assertEqual(_runtime_layout(FakePort()), "NCHW")
+
     def test_schema_v2_missing_bin_is_explicit_for_test_only_and_production(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -420,6 +433,17 @@ class QualificationTests(unittest.TestCase):
                     },
                     "runtime_input_layout_mismatch",
                 ),
+                (
+                    {
+                        "status": "checked", "runtime": "openvino", "available": True,
+                        "input_count": 1, "output_count": 1,
+                        "input_shape": [1, 3, 640, 640], "input_shape_error": None,
+                        "output_shape": [1, 25200, 22], "output_shape_error": None,
+                        "input_element_type": "f32", "output_element_type": "f32",
+                        "input_layout": "NCHW", "output_layout": "NCHW",
+                    },
+                    "runtime_output_layout_mismatch",
+                ),
             )
             for observed, expected in cases:
                 with self.subTest(expected=expected):
@@ -430,6 +454,38 @@ class QualificationTests(unittest.TestCase):
                         result = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
                     self.assertEqual(result.status, "FAIL")
                     self.assertIn(expected, {item.code for item in result.findings})
+
+    def test_runtime_layout_unavailable_is_warn_for_evidence_and_fail_for_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "model.xml"
+            artifact.write_bytes(b"test-only-artifact")
+            profile = self._artifact_profile(root, artifact)
+            observed = {
+                "status": "checked", "runtime": "openvino", "available": True,
+                "input_count": 1, "output_count": 1,
+                "input_shape": [1, 3, 640, 640], "input_shape_error": None,
+                "output_shape": [1, 25200, 22], "output_shape_error": None,
+                "input_element_type": "f32", "output_element_type": "f32",
+                "input_layout": None, "output_layout": "NRC",
+            }
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value=observed,
+            ):
+                evidence = audit_model_profile(profile, model_path=artifact, allow_test_only=True)
+            self.assertEqual(evidence.status, "WARN")
+            self.assertIn("runtime_layout_unavailable", {item.code for item in evidence.findings})
+
+            with mock.patch(
+                "tools.auto_aim_qualification.model_profile_audit._inspect_openvino_runtime",
+                return_value=observed,
+            ):
+                strict = audit_model_profile(
+                    profile, model_path=artifact, mode="strict", allow_test_only=True
+                )
+            self.assertEqual(strict.status, "FAIL")
+            self.assertIn("runtime_layout_unavailable", {item.code for item in strict.findings})
 
     def test_report_contains_runtime_contract_preprocessing_and_effective_test_only(self):
         report = qualify_offline(
@@ -453,6 +509,85 @@ class QualificationTests(unittest.TestCase):
         markdown = render_markdown(report)
         self.assertIn("## Model contract evidence", markdown)
         self.assertIn("preprocessing golden: status=`PASS`, software-only=`true`", markdown)
+        self.assertIn("may read OpenVINO model metadata", markdown)
+        self.assertIn("never compiles a model, runs inference, uses hardware", markdown)
+
+    def test_model_input_and_output_shape_reject_boolean_dimensions(self):
+        import yaml
+
+        cases = (
+            ("input", [True, 3, 640, 640], "input_shape"),
+            ("output", [True, 25200, 22], "output_shape"),
+        )
+        for section, shape, expected_code in cases:
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / f"boolean-{section}-shape.yaml"
+                value = yaml.safe_load(self.model_profile.read_text(encoding="utf-8"))
+                value[section]["shape"] = shape
+                path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+                result = audit_model_profile(path, allow_test_only=True)
+
+                self.assertEqual(result.status, "FAIL")
+                self.assertIn(expected_code, {item.code for item in result.findings})
+
+    def test_model_class_mapping_rejects_boolean_and_normalized_duplicate_keys(self):
+        import yaml
+
+        cases = (
+            (
+                "boolean-key",
+                lambda mapping: (mapping.pop(1), mapping.__setitem__(True, "small")),
+                {"class_mapping_key"},
+            ),
+            (
+                "numeric-string-alias",
+                lambda mapping: mapping.__setitem__("1", "large"),
+                {"class_mapping_key", "class_mapping_duplicate_key"},
+            ),
+        )
+        for name, mutate, expected_codes in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / f"{name}.yaml"
+                value = yaml.safe_load(self.model_profile.read_text(encoding="utf-8"))
+                mutate(value["semantics"]["class_to_armor_type"])
+                path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+                result = audit_model_profile(path, allow_test_only=True)
+
+                self.assertEqual(result.status, "FAIL")
+                codes = {item.code for item in result.findings}
+                self.assertTrue(expected_codes <= codes)
+                self.assertNotIn("class_to_armor_type", result.values)
+
+    def test_pnp_class_mapping_rejects_boolean_and_normalized_duplicate_keys(self):
+        import yaml
+
+        cases = (
+            (
+                "boolean-key",
+                lambda mapping: (mapping.pop(1), mapping.__setitem__(True, "small")),
+                {"class_mapping_key"},
+            ),
+            (
+                "numeric-string-alias",
+                lambda mapping: mapping.__setitem__("1", "large"),
+                {"class_mapping_key", "class_mapping_duplicate_key"},
+            ),
+        )
+        for name, mutate, expected_codes in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / f"{name}.yaml"
+                value = yaml.safe_load(self.pnp_config.read_text(encoding="utf-8"))
+                mutate(value["class_to_armor_type"])
+                path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+                result = audit_pnp_config(path, allow_test_only=True)
+
+                self.assertEqual(result.status, "FAIL")
+                codes = {item.code for item in result.findings}
+                self.assertTrue(expected_codes <= codes)
+                self.assertNotIn("class_to_armor_type", result.values)
 
     def test_external_model_hash_cannot_override_profile_hash(self):
         """Both profile and metadata/CLI hash assertions must be checked."""

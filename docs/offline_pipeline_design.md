@@ -2,7 +2,7 @@
 
 ## 范围
 
-本模块只用于旧 YOLOv5 参考模型、录像和 test-only PnP 配置的离线验证。它不创建 ROS publisher，不打开串口，不连接真实相机/云台，也不产生开火请求。未来生产 OpenVINO IR 只能通过 schema-v2 的显式 XML/BIN manifest 接入：两个路径和两个 SHA-256 都必须先验证，加载时显式传入 XML 与 BIN；本模块不会从 XML 文件名推测权重文件。
+本模块只用于旧 YOLOv5 参考模型、录像和 test-only PnP 配置的离线验证。它不创建 ROS publisher，不打开串口，不连接真实相机/云台，也不产生开火请求。未来生产 OpenVINO IR 只能通过 schema-v2 的显式 XML/BIN manifest 接入：两个路径和两个 SHA-256 都必须先验证，加载时显式传入 XML 与 BIN；profile-bound runtime 还必须读取并匹配显式 NCHW/NRC port layout，不能由 tensor shape 推测。本模块不会从 XML 文件名推测权重文件。
 
 ```text
 OpenVinoYoloDetector

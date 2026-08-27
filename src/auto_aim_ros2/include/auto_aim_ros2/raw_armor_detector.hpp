@@ -81,6 +81,12 @@ struct DetectorConfig
   // conversion implicit and unreviewable.
   std::string expected_input_element_type{"f32"};
   std::string expected_output_element_type{"f32"};
+  // Profile-bound models must also expose their declared semantic axis order
+  // through OpenVINO port metadata. Empty values retain the unprofiled
+  // diagnostic smoke path only; `detector_config_from_model_profile()` always
+  // supplies NCHW/NRC from the reviewed profile.
+  std::string expected_input_layout;
+  std::string expected_output_layout;
 
   // The first adapter targets the supplied YOLOv5 IR model.  These values are
   // explicit configuration, not a claim that a future competition model has
@@ -206,6 +212,8 @@ struct ModelInfo
   std::vector<std::size_t> output_shape;
   std::string input_element_type;
   std::string output_element_type;
+  std::string input_layout;
+  std::string output_layout;
 };
 
 // Returns an error description when the model output is not the configured
@@ -223,6 +231,15 @@ std::optional<float> sigmoid_probability(float value) noexcept;
 std::optional<std::string> validate_input_shape(
   const std::vector<std::size_t> & shape,
   const DetectorConfig & config);
+
+// Validate the port layout reported by OpenVINO against an explicit profile
+// layout. The comparison accepts OpenVINO's bracket/comma rendering but never
+// infers an axis order from tensor dimensions. An empty actual layout fails
+// closed whenever the profile supplies an expected layout.
+std::optional<std::string> validate_runtime_layout(
+  const std::string & actual_layout,
+  const std::string & expected_layout,
+  const std::string & port_name);
 
 struct LetterboxResult
 {

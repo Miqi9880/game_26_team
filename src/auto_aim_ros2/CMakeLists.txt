@@ -26,6 +26,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/camera_calibration.cpp
   src/offline_ballistic.cpp
   src/offline_pipeline.cpp
+  src/offline_scenario_benchmark.cpp
   src/pnp_stage.cpp
   src/raw_armor_detector.cpp
   src/ros_image_adapter.cpp
@@ -84,6 +85,15 @@ install(TARGETS auto_aim_offline
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# This executable consumes only directly constructed, test-only synthetic
+# observations.  It does not share the existing offline CSV/evidence parsers.
+add_executable(auto_aim_scenario_benchmark src/auto_aim_scenario_benchmark.cpp)
+target_link_libraries(auto_aim_scenario_benchmark ${PROJECT_NAME})
+target_include_directories(auto_aim_scenario_benchmark PRIVATE include)
+install(TARGETS auto_aim_scenario_benchmark
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 add_executable(auto_aim_camera_calibrate src/auto_aim_camera_calibrate.cpp)
 target_link_libraries(auto_aim_camera_calibrate ${PROJECT_NAME})
 target_include_directories(auto_aim_camera_calibrate PRIVATE include)
@@ -135,6 +145,10 @@ if(BUILD_TESTING)
     test/offline_predictor_test.cpp
   )
   ament_auto_add_gtest(
+    offline_scenario_benchmark_test
+    test/offline_scenario_benchmark_test.cpp
+  )
+  ament_auto_add_gtest(
     ros_backend_test
     test/ros_backend_test.cpp
   )
@@ -169,6 +183,12 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/test/auto_aim_offline_cli_test.py
       $<TARGET_FILE:auto_aim_offline>
+  )
+  add_test(
+    NAME auto_aim_scenario_benchmark_cli_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/auto_aim_scenario_benchmark_cli_test.py
+      $<TARGET_FILE:auto_aim_scenario_benchmark>
   )
 endif()
 

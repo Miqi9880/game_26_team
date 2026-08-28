@@ -2632,11 +2632,32 @@ def _manifest_source_record(
         liveness = root.get("node_liveness")
         valid_liveness = isinstance(liveness, Mapping)
         if valid_liveness:
+            # The release-manifest contract requires the during-sampling
+            # observation and equal expected/observed stop codes.  The E2E
+            # runner also emits before/after and an explicit equality flag;
+            # whenever those optional fields are present, reject a
+            # contradictory value instead of silently accepting a report
+            # whose own liveness evidence says the node died.
+            phase_values_valid = all(
+                liveness.get(key) is True
+                for key in (
+                    "alive_before_sampling",
+                    "alive_during_sampling",
+                    "alive_after_sampling",
+                )
+                if key in liveness
+            )
+            matches_value_valid = (
+                "exit_code_matches" not in liveness or
+                liveness.get("exit_code_matches") is True
+            )
             alive = liveness.get("alive_during_sampling")
             expected_exit = liveness.get("expected_exit_code")
             observed_exit = liveness.get("observed_exit_code")
             valid_liveness = (
-                alive is True
+                phase_values_valid
+                and matches_value_valid
+                and alive is True
                 and _manifest_number(expected_exit) is not None
                 and _manifest_number(observed_exit) is not None
                 and _manifest_number(expected_exit) == _manifest_number(observed_exit)

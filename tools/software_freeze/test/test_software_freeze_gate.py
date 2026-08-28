@@ -717,6 +717,48 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertTrue(any("ARTIFACT" not in item for item in assessed["blockers"]))
 
+    def test_explicit_input_manifest_rejects_contradictory_optional_liveness(self) -> None:
+        """Optional E2E phase/equality fields remain fail-closed when present."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report_path = root / "ros-e2e.json"
+            report_path.write_text(json.dumps({
+                "schema_version": 1,
+                "status": "PASS",
+                "synthetic": True,
+                "test_only": True,
+                "production_ready": False,
+                "safety_assertions": SAFE_DEFAULTS.copy(),
+                "node_liveness": {
+                    "alive_before_sampling": True,
+                    "alive_during_sampling": True,
+                    "alive_after_sampling": False,
+                    "expected_exit_code": 0,
+                    "observed_exit_code": 0,
+                    "exit_code_matches": False,
+                },
+            }), encoding="utf-8")
+            manifest = {
+                "schema": "software-freeze-inputs",
+                "schema_version": 1,
+                "candidate": {
+                    "head": "a" * 40,
+                    "main_baseline": "b" * 40,
+                    "branch": "feature",
+                    "worktree_clean": True,
+                },
+                "inputs": [{
+                    "id": "e2e",
+                    "kind": "ros_e2e",
+                    "path": str(report_path),
+                }],
+            }
+            assessed = build_input_manifest_report(manifest, manifest_path=root / "inputs.json")
+            self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
+            self.assertEqual(assessed["inputs"][0]["status"], "NOT_VERIFIED")
+            self.assertIn("node_liveness evidence missing or contradictory", assessed["inputs"][0]["failure_reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

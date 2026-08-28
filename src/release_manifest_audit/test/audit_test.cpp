@@ -19,6 +19,7 @@ protected:
     root_ = fs::temp_directory_path() / ("release_manifest_audit_" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root_);
+    write(root_ / "ctest.xml", "<Site><Testing><Test Status=\"passed\"></Test></Testing></Site>");
   }
   void TearDown() override { fs::remove_all(root_); }
   void write(const fs::path & path, const std::string & contents)
@@ -40,7 +41,8 @@ std::string config(const std::string & source)
 {
   return std::string("{\"schema_version\":1,\"candidate\":{\"head\":\"") + kHead +
     "\",\"main_baseline\":\"" + kBase +
-    "\",\"branch\":\"fixture\",\"worktree_clean\":true},\"sources\":[{\"id\":\"smoke\",\"kind\":\"release_smoke\",\"path\":\"" + source + "\"}]}";
+    "\",\"branch\":\"fixture\",\"worktree_clean\":true},\"sources\":[{\"id\":\"smoke\",\"kind\":\"release_smoke\",\"path\":\"" + source + "\",\"ctest_xml\":\"" +
+    (fs::path(source).parent_path() / "ctest.xml").string() + "\"}]}";
 }
 
 std::string safe_report(const std::string & status = "PASS")
@@ -105,6 +107,14 @@ TEST_F(AuditTest, ExistingWarnStatusPropagatesAsNotVerified)
   EXPECT_EQ(execute(config((root_ / "warn.json").string())), 2);
 }
 
+TEST_F(AuditTest, AllUnavailableReportStatusesRemainNonPass)
+{
+  for (const auto & report_status : {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}) {
+    write(root_ / "status.json", safe_report(report_status));
+    EXPECT_EQ(execute(config((root_ / "status.json").string()), report_status), 2);
+  }
+}
+
 TEST_F(AuditTest, ArtifactHashMismatchAndAbsentArtifactPropagate)
 {
   write(root_ / "smoke.json", safe_report()); write(root_ / "model.xml", "fixture model");
@@ -116,6 +126,33 @@ TEST_F(AuditTest, ArtifactHashMismatchAndAbsentArtifactPropagate)
   unavailable.insert(unavailable.rfind('}'), ",\"artifacts\":[{\"role\":\"formal_calibration\",\"path\":\"" +
     (root_ / "no-calibration.yaml").string() + "\",\"absence_status\":\"NOT_VERIFIED\"}]");
   EXPECT_EQ(execute(unavailable, "unavailable"), 2);
+  for (const auto & absence_status : {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}) {
+    auto absent = config((root_ / "smoke.json").string());
+    absent.insert(absent.rfind('}'), ",\"artifacts\":[{\"role\":\"missing_" + std::string(absence_status) + "\",\"path\":\"" +
+      (root_ / "missing-artifact").string() + "\",\"absence_status\":\"" + absence_status + "\"}]");
+    EXPECT_EQ(execute(absent, std::string("absent_") + absence_status), 2);
+  }
+  auto invalid_absence = config((root_ / "smoke.json").string());
+  invalid_absence.insert(invalid_absence.rfind('}'), ",\"artifacts\":[{\"role\":\"missing_pass\",\"path\":\"" +
+    (root_ / "missing-artifact").string() + "\",\"absence_status\":\"PASS\"}]");
+  EXPECT_EQ(execute(invalid_absence, "invalid_absence"), 1);
+}
+
+TEST_F(AuditTest, CTestXmlMissingMalformedAndMismatchedFailClosed)
+{
+  write(root_ / "smoke.json", safe_report());
+  auto missing = config((root_ / "smoke.json").string());
+  const auto ctest = (root_ / "ctest.xml").string();
+  missing.replace(missing.find(ctest), ctest.size(), (root_ / "missing.xml").string());
+  EXPECT_EQ(execute(missing, "missing_xml"), 1);
+  write(root_ / "broken.xml", "<Site><Test Status=\"passed\">");
+  auto broken = config((root_ / "smoke.json").string());
+  broken.replace(broken.find(ctest), ctest.size(), (root_ / "broken.xml").string());
+  EXPECT_EQ(execute(broken, "broken_xml"), 1);
+  write(root_ / "mismatch.xml", "<Site><Testing><Test Status=\"failed\"></Test></Testing></Site>");
+  auto mismatch = config((root_ / "smoke.json").string());
+  mismatch.replace(mismatch.find(ctest), ctest.size(), (root_ / "mismatch.xml").string());
+  EXPECT_EQ(execute(mismatch, "mismatch_xml"), 1);
 }
 
 }  // namespace

@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <map>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -179,6 +180,20 @@ enum class Status { Pass, Fail, Unavailable, NotRun, NotVerified };
 const char * name(Status value) { switch (value) { case Status::Pass: return "PASS"; case Status::Fail: return "FAIL"; case Status::Unavailable: return "UNAVAILABLE"; case Status::NotRun: return "NOT_RUN"; case Status::NotVerified: return "NOT_VERIFIED"; } return "FAIL"; }
 Status status(const std::string & value)
 { if (value == "PASS") return Status::Pass; if (value == "FAIL") return Status::Fail; if (value == "UNAVAILABLE") return Status::Unavailable; if (value == "NOT_RUN") return Status::NotRun; if (value == "NOT_VERIFIED") return Status::NotVerified; throw std::runtime_error("unknown status: " + value); }
+bool is_absence_status(Status value)
+{ return value == Status::Unavailable || value == Status::NotRun || value == Status::NotVerified; }
+std::optional<Status> absence_status(const Object & value, std::vector<std::string> * reasons, const std::string & context)
+{
+  const auto declared = optional_text(value, "absence_status");
+  if (!declared) return std::nullopt;
+  try {
+    const auto result = status(*declared);
+    if (is_absence_status(result)) return result;
+  } catch (const std::exception &) {
+  }
+  reasons->push_back(context + " absence_status must be UNAVAILABLE, NOT_RUN, or NOT_VERIFIED");
+  return Status::Fail;
+}
 bool unsafe_claim(const Json & value)
 {
   if (std::holds_alternative<Object>(value)) { for (const auto & [key, child] : std::get<Object>(value)) { const auto lower = [&] { std::string result; for (char c : key) result += static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return result; }(); if ((lower == "production_ready" || lower == "hardware_validation" || lower == "firing_validated" || lower == "gimbal_closed_loop_validated" || lower == "real_hit_rate_computed") && std::holds_alternative<bool>(child) && std::get<bool>(child)) return true; if (unsafe_claim(child)) return true; } }
@@ -203,6 +218,55 @@ bool counts_valid(const Object & root, std::string * why)
   const auto & counts = object(*counts_item, "counts"); const auto & cases = array(*cases_item, "cases"); std::map<std::string, int> actual{{"PASS",0},{"FAIL",0},{"UNAVAILABLE",0},{"NOT_RUN",0},{"NOT_VERIFIED",0}};
   for (const auto & item : cases) { const auto & entry = object(item, "case"); const auto value = text(required(entry, "status", "case"), "case.status"); if (!actual.count(value)) { *why = "case has unknown status"; return false; } ++actual[value]; }
   for (const auto & [key, total] : actual) { const auto * item = find(counts, key); if (!item || !std::holds_alternative<double>(*item) || std::get<double>(*item) != total) { *why = "counts disagree with cases for " + key; return false; } } return true;
+}
+struct CTestCounts { int total{0}; int passed{0}; int failed{0}; int skipped{0}; };
+bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why)
+{
+  std::string xml;
+  try { xml = read_file(path); } catch (const std::exception & exception) { *why = std::string("CTest XML cannot be read: ") + exception.what(); return false; }
+  if (xml.empty()) { *why = "CTest XML is empty"; return false; }
+  const std::regex test_open(R"(<\s*Test\b([^>]*)>)", std::regex::icase);
+  const std::regex test_close(R"(<\s*/\s*Test\s*>)", std::regex::icase);
+  const std::regex status_attribute(R"(\bStatus\s*=\s*([\"'])([^\"']*)\1)", std::regex::icase);
+  const auto begin = std::sregex_iterator(xml.begin(), xml.end(), test_open);
+  const auto end = std::sregex_iterator();
+  const auto openings = static_cast<int>(std::distance(begin, end));
+  const auto closings = static_cast<int>(std::distance(std::sregex_iterator(xml.begin(), xml.end(), test_close), end));
+  if (openings == 0 || openings != closings) { *why = "CTest XML is malformed or contains no complete Test records"; return false; }
+  for (auto it = begin; it != end; ++it) {
+    std::smatch match;
+    const auto attributes = (*it)[1].str();
+    if (!std::regex_search(attributes, match, status_attribute)) { *why = "CTest Test record has no Status attribute"; return false; }
+    std::string value = match[2].str();
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    ++result->total;
+    if (value == "passed") ++result->passed;
+    else if (value == "failed") ++result->failed;
+    else if (value == "notrun" || value == "not_run" || value == "skipped") ++result->skipped;
+    else { *why = "CTest Test record has unsupported Status: " + value; return false; }
+  }
+  return true;
+}
+bool ctest_matches_report(const Object & root, const fs::path & path, std::string * why)
+{
+  const auto * counts_item = find(root, "counts"); const auto * cases_item = find(root, "cases");
+  if (!counts_item && !cases_item) return true;
+  if (!counts_item || !cases_item) { *why = "CTest-backed report must provide both counts and cases"; return false; }
+  const auto & counts = object(*counts_item, "counts");
+  CTestCounts actual;
+  if (!ctest_counts(path, &actual, why)) return false;
+  const auto number = [&](const std::string & key, int expected) {
+    const auto * item = find(counts, key);
+    return item && std::holds_alternative<double>(*item) && std::get<double>(*item) == expected;
+  };
+  if (!number("PASS", actual.passed) || !number("FAIL", actual.failed) ||
+      !number("NOT_RUN", actual.skipped) || !number("UNAVAILABLE", 0) || !number("NOT_VERIFIED", 0)) {
+    *why = "report counts disagree with CTest XML (PASS/FAIL/NOT_RUN and non-CTest statuses)";
+    return false;
+  }
+  const auto & cases = array(*cases_item, "cases");
+  if (static_cast<int>(cases.size()) != actual.total) { *why = "report case total disagrees with CTest XML"; return false; }
+  return true;
 }
 
 struct Source { std::string id; std::string kind; fs::path path; std::string digest; Status result{Status::Fail}; std::vector<std::string> reasons; };
@@ -229,9 +293,9 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
     const auto & source_config = object(declaration, "source"); Source source;
     source.id = text(required(source_config, "id", "source"), "source.id"); source.kind = text(required(source_config, "kind", "source"), "source.kind"); source.path = text(required(source_config, "path", "source"), "source.path");
     if (!ids.insert(source.id).second) throw std::runtime_error("duplicate source id: " + source.id);
-    const auto absence = optional_text(source_config, "absence_status");
+    const auto absence = absence_status(source_config, &source.reasons, "source");
     std::error_code file_error; const bool regular = fs::is_regular_file(source.path, file_error); const auto size = regular ? fs::file_size(source.path, file_error) : 0U;
-    if (file_error || !regular || size == 0U) { if (!absence) { source.result = Status::Fail; source.reasons.push_back(file_error ? "source cannot be read" : "missing or empty required source"); } else { source.result = status(*absence); source.reasons.push_back("source unavailable: explicit " + *absence); } sources.push_back(std::move(source)); continue; }
+    if (file_error || !regular || size == 0U) { if (!absence) { source.result = Status::Fail; source.reasons.push_back(file_error ? "source cannot be read" : "missing or empty required source"); } else { source.result = *absence; source.reasons.push_back("source unavailable: explicit " + std::string(name(*absence))); } sources.push_back(std::move(source)); continue; }
     try {
       source.digest = sha256(source.path); if (const auto expected = optional_text(source_config, "sha256")) { if (!sha256_text(*expected) || source.digest != *expected) source.reasons.push_back("declared SHA-256 mismatch"); }
       const auto root = object(Parser(read_file(source.path)).parse(), "source JSON");
@@ -239,18 +303,34 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       const auto report_status = find(root, "status"); if (!report_status) source.reasons.push_back("missing report status"); else {
         const auto report_text = text(*report_status, "status");
         if (report_text == "WARN") { source.result = Status::NotVerified; source.reasons.push_back("source reports WARN; cannot count as release PASS"); }
-        else { try { if (status(report_text) == Status::Fail) source.reasons.push_back("source reports FAIL"); } catch (...) { source.reasons.push_back("unknown report status"); } }
+        else { try { const auto reported = status(report_text); if (reported == Status::Fail) source.reasons.push_back("source reports FAIL"); else if (reported != Status::Pass) { source.result = reported; source.reasons.push_back("source reports " + report_text + "; cannot count as release PASS"); } } catch (...) { source.reasons.push_back("unknown report status"); } }
       }
       if (unsafe_claim(Json(root))) source.reasons.push_back("production or hardware claim detected");
       std::string reason; if (!safe_fields(root, &reason)) source.reasons.push_back(reason);
       if (source.kind == "scenario_benchmark" || source.kind == "evidence" || source.kind == "calibration" || source.kind == "qualification") { if (!expected_synthetic(root, &reason)) source.reasons.push_back(reason); }
       if (!counts_valid(root, &reason)) source.reasons.push_back(reason);
+      if (const auto ctest_path = optional_text(source_config, "ctest_xml")) {
+        if (!ctest_matches_report(root, *ctest_path, &reason)) source.reasons.push_back(reason);
+      } else if (find(root, "counts") || find(root, "cases")) {
+        source.reasons.push_back("CTest-backed report requires explicit ctest_xml");
+      }
       const auto commit_key = source.kind == "ros_e2e" ? "candidate_commit" : "commit";
       if (const auto * commit = find(root, commit_key); commit && text(*commit, commit_key) != head) source.reasons.push_back("candidate Git SHA mismatch");
       if (const auto * source_base = find(root, "baseline_main"); source_base && text(*source_base, "baseline_main") != baseline) source.reasons.push_back("main baseline SHA mismatch");
       if (source.kind == "ros_e2e") { const auto * live = find(root, "node_liveness"); if (!live || !std::holds_alternative<Object>(*live)) { source.result = Status::NotVerified; source.reasons.push_back("node_liveness evidence missing; E2E cannot count as PASS"); } else { const auto & evidence = std::get<Object>(*live); const auto * alive = find(evidence, "alive_during_sampling"); const auto * expected_exit = find(evidence, "expected_exit_code"); const auto * observed_exit = find(evidence, "observed_exit_code"); if (!alive || !expected_exit || !observed_exit || !std::holds_alternative<bool>(*alive) || !std::get<bool>(*alive) || !std::holds_alternative<double>(*expected_exit) || !std::holds_alternative<double>(*observed_exit) || std::get<double>(*expected_exit) != std::get<double>(*observed_exit)) { source.result = Status::NotVerified; source.reasons.push_back("node_liveness evidence contradicts sampling or expected exit"); } } }
-      if (source.result != Status::NotVerified) source.result = source.reasons.empty() ? Status::Pass : Status::Fail;
-      if (source.result == Status::NotVerified && std::any_of(source.reasons.begin(), source.reasons.end(), [](const std::string & item) { return item != "node_liveness evidence missing; E2E cannot count as PASS" && item != "node_liveness evidence contradicts sampling or expected exit" && item != "source reports WARN; cannot count as release PASS"; })) source.result = Status::Fail;
+      const auto non_fatal_status_reason = [](const std::string & item) {
+        return item == "node_liveness evidence missing; E2E cannot count as PASS" ||
+               item == "node_liveness evidence contradicts sampling or expected exit" ||
+               item == "source reports WARN; cannot count as release PASS" ||
+               item.find("source reports UNAVAILABLE; cannot count as release PASS") == 0U ||
+               item.find("source reports NOT_RUN; cannot count as release PASS") == 0U ||
+               item.find("source reports NOT_VERIFIED; cannot count as release PASS") == 0U;
+      };
+      if (is_absence_status(source.result)) {
+        if (std::any_of(source.reasons.begin(), source.reasons.end(), [&](const std::string & item) { return !non_fatal_status_reason(item); })) source.result = Status::Fail;
+      } else {
+        source.result = source.reasons.empty() ? Status::Pass : Status::Fail;
+      }
     } catch (const std::exception & exception) { source.result = Status::Fail; source.reasons.push_back(std::string("unreadable or malformed source: ") + exception.what()); }
     sources.push_back(std::move(source));
   }
@@ -260,8 +340,8 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       const auto & item = object(declaration, "artifact"); Artifact artifact;
       artifact.role = text(required(item, "role", "artifact"), "artifact.role"); artifact.path = text(required(item, "path", "artifact"), "artifact.path");
       if (!roles.insert(artifact.role).second) throw std::runtime_error("duplicate artifact role: " + artifact.role);
-      const auto absence = optional_text(item, "absence_status"); std::error_code file_error; const bool regular = fs::is_regular_file(artifact.path, file_error); const auto size = regular ? fs::file_size(artifact.path, file_error) : 0U;
-      if (file_error || !regular || size == 0U) { artifact.result = absence ? status(*absence) : Status::Fail; artifact.reasons.push_back(absence ? "artifact unavailable: explicit " + *absence : "missing or empty required artifact"); } else {
+      const auto absence = absence_status(item, &artifact.reasons, "artifact"); std::error_code file_error; const bool regular = fs::is_regular_file(artifact.path, file_error); const auto size = regular ? fs::file_size(artifact.path, file_error) : 0U;
+      if (file_error || !regular || size == 0U) { artifact.result = absence ? *absence : Status::Fail; artifact.reasons.push_back(absence ? "artifact unavailable: explicit " + std::string(name(*absence)) : "missing or empty required artifact"); } else {
         artifact.digest = sha256(artifact.path); if (const auto expected = optional_text(item, "sha256")) { if (!sha256_text(*expected) || artifact.digest != *expected) artifact.reasons.push_back("declared SHA-256 mismatch"); }
         artifact.result = artifact.reasons.empty() ? Status::Pass : Status::Fail;
       }

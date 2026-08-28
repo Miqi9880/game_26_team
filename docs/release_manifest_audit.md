@@ -19,7 +19,8 @@ JSON 证据路径。
     "worktree_clean": true
   },
   "sources": [
-    {"id":"release-smoke", "kind":"release_smoke", "path":"/abs/smoke-report.json"},
+    {"id":"release-smoke", "kind":"release_smoke", "path":"/abs/smoke-report.json",
+     "ctest_xml":"/abs/Testing/TAG/Test.xml"},
     {"id":"ros-e2e", "kind":"ros_e2e", "path":"/abs/e2e-report.json",
      "absence_status":"NOT_VERIFIED"}
   ]
@@ -28,7 +29,12 @@ JSON 证据路径。
 
 `path` 必须由调用方提供，工具不会按文件名猜测版本或寻找替代文件。可选的
 `sha256`（64 位十六进制）会与实际文件 hash 比较；缺失/空文件只有在显式
-`absence_status`（五种状态之一）时才会被记录为不可用，否则为 FAIL。
+`absence_status`（仅 `UNAVAILABLE`、`NOT_RUN` 或 `NOT_VERIFIED`）时才会被记录为不可用，
+否则为 FAIL；缺失或空的来源/产物绝不能声明为 `PASS`。
+
+任何带有 `counts`/`cases` 的 CTest-backed 报告都必须在来源声明中提供
+`ctest_xml`。审计会读取该 XML，并 fail-closed 地比较总案例数与
+`PASS`、`FAIL`、`NOT_RUN` 统计；缺失、损坏、无 `Test` 记录或统计不一致均为 FAIL。
 
 运行：
 
@@ -44,7 +50,7 @@ release_manifest_audit --config /abs/release-input.json \
 ## fail-closed 规则
 
 - candidate HEAD、main baseline 必须是 40 位 SHA，工作区必须声明干净；
-- 来源 JSON 必须是 schema v1、状态和 CTest counts/cases 自洽，Git SHA 与候选
+- 来源 JSON 必须是 schema v1、状态和 CTest XML 的总数/统计一致，Git SHA 与候选
   一致，声明的 hash 与实际 hash 一致；
 - `production_ready`、硬件验证、开火、命中率等任何生产性声明为 true 都失败；
 - 证据来源必须保持 `synthetic=true`、`test_only=true`、`production_ready=false`；

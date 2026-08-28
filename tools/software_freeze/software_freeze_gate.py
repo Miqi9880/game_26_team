@@ -2525,7 +2525,7 @@ def _manifest_source_record(
     if payload is None:
         # An explicit absence marker may cover a missing path, but it must not
         # bless a symlink or malformed declaration as an unavailable source.
-        if path.is_symlink() or invalid_identity or invalid_absence:
+        if path.is_symlink() or path.exists() or invalid_identity or invalid_absence:
             record["status"] = "FAIL"
             reasons.append(read_error or "source is not a regular non-link file")
         elif absence is not None:
@@ -2719,7 +2719,7 @@ def _manifest_artifact_record(
     if payload is None:
         # An explicit absence marker may cover a missing path, but it must not
         # bless a symlink or malformed declaration as an unavailable artifact.
-        if path.is_symlink() or (absence_raw is not None and absence is None):
+        if path.is_symlink() or path.exists() or (absence_raw is not None and absence is None):
             record["status"] = "FAIL"
             reasons.append(read_error or "artifact is not a regular non-link file")
         elif absence is not None:

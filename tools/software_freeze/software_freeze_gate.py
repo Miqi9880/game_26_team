@@ -2523,7 +2523,12 @@ def _manifest_source_record(
         absence = None
     payload, read_error = _read_regular_file(path)
     if payload is None:
-        if absence is not None:
+        # An explicit absence marker may cover a missing path, but it must not
+        # bless a symlink or malformed declaration as an unavailable source.
+        if path.is_symlink() or invalid_identity or invalid_absence:
+            record["status"] = "FAIL"
+            reasons.append(read_error or "source is not a regular non-link file")
+        elif absence is not None:
             record["status"] = absence
             reasons.append(f"source unavailable: explicit {absence}")
         else:
@@ -2533,6 +2538,15 @@ def _manifest_source_record(
     record["size_bytes"] = len(payload)
     digest = _sha256_bytes(payload)
     record["sha256"] = digest
+    if len(payload) == 0:
+        if absence is not None and not invalid_identity and not invalid_absence:
+            record["status"] = absence
+            reasons.append(f"source unavailable: explicit {absence}")
+        else:
+            record["status"] = "FAIL"
+            reasons.append("source is empty")
+        record["reason"] = reasons[0]
+        return record, None
     fatal = invalid_absence or invalid_identity
     unverified = False
     try:
@@ -2703,7 +2717,12 @@ def _manifest_artifact_record(
         absence = None
     payload, read_error = _read_regular_file(path)
     if payload is None:
-        if absence is not None:
+        # An explicit absence marker may cover a missing path, but it must not
+        # bless a symlink or malformed declaration as an unavailable artifact.
+        if path.is_symlink() or (absence_raw is not None and absence is None):
+            record["status"] = "FAIL"
+            reasons.append(read_error or "artifact is not a regular non-link file")
+        elif absence is not None:
             record["status"] = absence
             reasons.append(f"artifact unavailable: explicit {absence}")
         else:
@@ -2713,6 +2732,15 @@ def _manifest_artifact_record(
     record["size_bytes"] = len(payload)
     digest = _sha256_bytes(payload)
     record["sha256"] = digest
+    if len(payload) == 0:
+        if absence is not None:
+            record["status"] = absence
+            reasons.append(f"artifact unavailable: explicit {absence}")
+        else:
+            record["status"] = "FAIL"
+            reasons.append("artifact is empty")
+        record["reason"] = reasons[0]
+        return record
     try:
         expected = _manifest_sha(declaration.get("sha256"), context=f"artifact {role}")
     except ValueError as exc:

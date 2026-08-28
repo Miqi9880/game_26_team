@@ -236,7 +236,11 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       source.digest = sha256(source.path); if (const auto expected = optional_text(source_config, "sha256")) { if (!sha256_text(*expected) || source.digest != *expected) source.reasons.push_back("declared SHA-256 mismatch"); }
       const auto root = object(Parser(read_file(source.path)).parse(), "source JSON");
       const auto schema = find(root, "schema_version"); if (!schema || !std::holds_alternative<double>(*schema) || std::get<double>(*schema) != 1.0) source.reasons.push_back("unknown or missing schema_version");
-      const auto report_status = find(root, "status"); if (!report_status) source.reasons.push_back("missing report status"); else { try { if (status(text(*report_status, "status")) == Status::Fail) source.reasons.push_back("source reports FAIL"); } catch (...) { source.reasons.push_back("unknown report status"); } }
+      const auto report_status = find(root, "status"); if (!report_status) source.reasons.push_back("missing report status"); else {
+        const auto report_text = text(*report_status, "status");
+        if (report_text == "WARN") { source.result = Status::NotVerified; source.reasons.push_back("source reports WARN; cannot count as release PASS"); }
+        else { try { if (status(report_text) == Status::Fail) source.reasons.push_back("source reports FAIL"); } catch (...) { source.reasons.push_back("unknown report status"); } }
+      }
       if (unsafe_claim(Json(root))) source.reasons.push_back("production or hardware claim detected");
       std::string reason; if (!safe_fields(root, &reason)) source.reasons.push_back(reason);
       if (source.kind == "scenario_benchmark" || source.kind == "evidence" || source.kind == "calibration" || source.kind == "qualification") { if (!expected_synthetic(root, &reason)) source.reasons.push_back(reason); }
@@ -246,7 +250,7 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       if (const auto * source_base = find(root, "baseline_main"); source_base && text(*source_base, "baseline_main") != baseline) source.reasons.push_back("main baseline SHA mismatch");
       if (source.kind == "ros_e2e") { const auto * live = find(root, "node_liveness"); if (!live || !std::holds_alternative<Object>(*live)) { source.result = Status::NotVerified; source.reasons.push_back("node_liveness evidence missing; E2E cannot count as PASS"); } else { const auto & evidence = std::get<Object>(*live); const auto * alive = find(evidence, "alive_during_sampling"); const auto * expected_exit = find(evidence, "expected_exit_code"); const auto * observed_exit = find(evidence, "observed_exit_code"); if (!alive || !expected_exit || !observed_exit || !std::holds_alternative<bool>(*alive) || !std::get<bool>(*alive) || !std::holds_alternative<double>(*expected_exit) || !std::holds_alternative<double>(*observed_exit) || std::get<double>(*expected_exit) != std::get<double>(*observed_exit)) { source.result = Status::NotVerified; source.reasons.push_back("node_liveness evidence contradicts sampling or expected exit"); } } }
       if (source.result != Status::NotVerified) source.result = source.reasons.empty() ? Status::Pass : Status::Fail;
-      if (source.result == Status::NotVerified && std::any_of(source.reasons.begin(), source.reasons.end(), [](const std::string & item) { return item != "node_liveness evidence missing; E2E cannot count as PASS" && item != "node_liveness evidence contradicts sampling or expected exit"; })) source.result = Status::Fail;
+      if (source.result == Status::NotVerified && std::any_of(source.reasons.begin(), source.reasons.end(), [](const std::string & item) { return item != "node_liveness evidence missing; E2E cannot count as PASS" && item != "node_liveness evidence contradicts sampling or expected exit" && item != "source reports WARN; cannot count as release PASS"; })) source.result = Status::Fail;
     } catch (const std::exception & exception) { source.result = Status::Fail; source.reasons.push_back(std::string("unreadable or malformed source: ") + exception.what()); }
     sources.push_back(std::move(source));
   }

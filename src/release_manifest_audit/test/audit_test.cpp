@@ -99,6 +99,12 @@ TEST_F(AuditTest, MissingE2ELivenessIsNotVerified)
   EXPECT_EQ(execute(value), 2);
 }
 
+TEST_F(AuditTest, ExistingWarnStatusPropagatesAsNotVerified)
+{
+  write(root_ / "warn.json", safe_report("WARN"));
+  EXPECT_EQ(execute(config((root_ / "warn.json").string())), 2);
+}
+
 TEST_F(AuditTest, ArtifactHashMismatchAndAbsentArtifactPropagate)
 {
   write(root_ / "smoke.json", safe_report()); write(root_ / "model.xml", "fixture model");

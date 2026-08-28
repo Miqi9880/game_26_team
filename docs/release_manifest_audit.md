@@ -57,6 +57,9 @@ release_manifest_audit --config /abs/release-input.json \
 - 缺模型、标定、外参或硬件只能传播为 `UNAVAILABLE`、`NOT_RUN` 或
   `NOT_VERIFIED`，不能折算为 PASS。
 
+既有 Python evidence/qualification 工具的 `WARN` 会传播为
+`NOT_VERIFIED`，不被伪装成 PASS。
+
 退出码为 `0=PASS`、`1=FAIL`、`2=NOT_VERIFIED/其他不可验证状态`。
 
 审计通过不等于真实相机、Orin、正式模型/标定、CDC、机器人、云台、开火、真实

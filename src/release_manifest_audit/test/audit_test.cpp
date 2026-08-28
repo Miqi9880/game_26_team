@@ -174,4 +174,14 @@ TEST_F(AuditTest, StandardCTestTestListAndResultStatusesAreParsed)
   EXPECT_EQ(execute(config((root_ / "mixed.json").string()), "mixed_statuses"), 2);
 }
 
+TEST_F(AuditTest, DirectCTestResultWithoutStatusFailsClosed)
+{
+  write(root_ / "smoke.json", safe_report());
+  write(root_ / "ctest.xml",
+    "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./audit_test</Test></TestList>"
+    "<Test><Name>incomplete_result</Name></Test>"
+    "<Test Status=\"passed\"><Name>audit_test</Name></Test></Testing></Site>");
+  EXPECT_EQ(execute(config((root_ / "smoke.json").string()), "missing_result_status"), 1);
+}
+
 }  // namespace

@@ -241,7 +241,7 @@ bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why
   for (auto node = testing->children; node != nullptr; node = node->next) {
     if (node->type != XML_ELEMENT_NODE || xmlStrcmp(node->name, BAD_CAST "Test") != 0) continue;
     const auto attribute = std::unique_ptr<xmlChar, decltype(xmlFree)>(xmlGetProp(node, BAD_CAST "Status"), xmlFree);
-    if (!attribute) continue;
+    if (!attribute) { *why = "CTest result Test record has no Status attribute"; return false; }
     std::string value(reinterpret_cast<const char *>(attribute.get()));
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     ++result->total;

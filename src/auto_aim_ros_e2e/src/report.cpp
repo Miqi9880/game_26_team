@@ -33,7 +33,17 @@ bool any_failure(const std::vector<CaseResult> & results)
 bool report_passes(
   const ReportMetadata & metadata, const std::vector<CaseResult> & results) noexcept
 {
-  return !any_failure(results) && node_liveness_valid(metadata.node_liveness);
+  const bool case_liveness_valid = std::all_of(
+    results.begin(), results.end(), [](const CaseResult & result) {
+      // Lifecycle, expected-failure, and hardware-boundary records do not
+      // launch AutoAimNode and intentionally keep expected_exit_code unset.
+      // Any message case that does launch it must carry a complete,
+      // fail-closed liveness record of its own.
+      return result.node_liveness.expected_exit_code < 0 ||
+             node_liveness_valid(result.node_liveness);
+    });
+  return !any_failure(results) && case_liveness_valid &&
+         node_liveness_valid(metadata.node_liveness);
 }
 
 std::string markdown_cell(std::string value)

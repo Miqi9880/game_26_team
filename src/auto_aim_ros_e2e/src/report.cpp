@@ -30,6 +30,12 @@ bool any_failure(const std::vector<CaseResult> & results)
     });
 }
 
+bool report_passes(
+  const ReportMetadata & metadata, const std::vector<CaseResult> & results) noexcept
+{
+  return !any_failure(results) && node_liveness_valid(metadata.node_liveness);
+}
+
 std::string markdown_cell(std::string value)
 {
   std::replace(value.begin(), value.end(), '|', '/');
@@ -66,6 +72,14 @@ bool valid_git_sha(const std::string & value) noexcept
          std::all_of(value.begin(), value.end(), [](const unsigned char character) {
            return std::isxdigit(character) != 0;
          });
+}
+
+bool node_liveness_valid(const NodeLiveness & liveness) noexcept
+{
+  return liveness.alive_before_sampling && liveness.alive_during_sampling &&
+         liveness.alive_after_sampling && liveness.expected_exit_code >= 0 &&
+         liveness.observed_exit_code == liveness.expected_exit_code &&
+         liveness.exit_code_matches;
 }
 
 std::string json_escape(const std::string & value)
@@ -164,7 +178,7 @@ std::string render_json(
   stream << "{\n"
     << "  \"schema_version\": 1,\n"
     << "  \"suite\": \"auto_aim_ros_message_e2e\",\n"
-    << "  \"status\": \"" << (any_failure(results) ? "FAIL" : "PASS") << "\",\n"
+    << "  \"status\": \"" << (report_passes(metadata, results) ? "PASS" : "FAIL") << "\",\n"
     << "  \"baseline_main\": \"" << json_escape(metadata.baseline) << "\",\n"
     << "  \"candidate_commit\": \"" << json_escape(metadata.commit) << "\",\n"
     << "  \"run_id\": \"" << json_escape(metadata.suite_run_id) << "\",\n"
@@ -188,6 +202,18 @@ std::string render_json(
     << "  \"safety_assertions\": {\"serial_enabled\": false, \"dry_run\": true, "
        "\"allow_fire\": false, \"fire_command\": 0, \"yaw_vel\": 0, "
        "\"pitch_vel\": 0, \"yaw_acc\": 0, \"pitch_acc\": 0},\n"
+    << "  \"node_liveness\": {\n"
+    << "    \"alive_before_sampling\": "
+    << (metadata.node_liveness.alive_before_sampling ? "true" : "false") << ",\n"
+    << "    \"alive_during_sampling\": "
+    << (metadata.node_liveness.alive_during_sampling ? "true" : "false") << ",\n"
+    << "    \"alive_after_sampling\": "
+    << (metadata.node_liveness.alive_after_sampling ? "true" : "false") << ",\n"
+    << "    \"expected_exit_code\": " << metadata.node_liveness.expected_exit_code << ",\n"
+    << "    \"observed_exit_code\": " << metadata.node_liveness.observed_exit_code << ",\n"
+    << "    \"exit_code_matches\": "
+    << (metadata.node_liveness.exit_code_matches ? "true" : "false") << "\n"
+    << "  },\n"
     << "  \"counts\": {\"PASS\": " << totals[0] << ", \"FAIL\": " << totals[1]
     << ", \"UNAVAILABLE\": " << totals[2] << ", \"NOT_RUN\": " << totals[3]
     << ", \"NOT_VERIFIED\": " << totals[4] << "},\n"
@@ -202,6 +228,16 @@ std::string render_json(
       << "\", \"diagnostic\": \"" << json_escape(item.diagnostic)
       << "\", \"node_exit_code\": " << item.node_exit_code
       << ", \"preflight_exit_code\": " << item.preflight_exit_code
+      << ", \"node_liveness\": {\"alive_before_sampling\": "
+      << (item.node_liveness.alive_before_sampling ? "true" : "false")
+      << ", \"alive_during_sampling\": "
+      << (item.node_liveness.alive_during_sampling ? "true" : "false")
+      << ", \"alive_after_sampling\": "
+      << (item.node_liveness.alive_after_sampling ? "true" : "false")
+      << ", \"expected_exit_code\": " << item.node_liveness.expected_exit_code
+      << ", \"observed_exit_code\": " << item.node_liveness.observed_exit_code
+      << ", \"exit_code_matches\": "
+      << (item.node_liveness.exit_code_matches ? "true" : "false") << "}"
       << ", \"topics\": \"" << json_escape(item.topics) << "\", \"publishers\": \""
       << json_escape(item.publishers) << "\", \"control_messages\": "
       << item.control_messages << ", \"safety_fields_ok\": "
@@ -245,7 +281,7 @@ std::string render_markdown(
   const auto totals = counts(results);
   std::ostringstream stream;
   stream << "# ROS message-level dry-run E2E report\n\n"
-    << "- Status: `" << (any_failure(results) ? "FAIL" : "PASS") << "`\n"
+    << "- Status: `" << (report_passes(metadata, results) ? "PASS" : "FAIL") << "`\n"
     << "- Baseline main: `" << metadata.baseline << "`\n"
     << "- Candidate commit: `" << metadata.commit << "`\n"
     << "- Run ID: `" << metadata.suite_run_id << "`\n"
@@ -256,6 +292,20 @@ std::string render_markdown(
     << "- Counts: PASS=" << totals[0] << ", FAIL=" << totals[1]
     << ", UNAVAILABLE=" << totals[2] << ", NOT_RUN=" << totals[3]
     << ", NOT_VERIFIED=" << totals[4] << "\n\n"
+    << "## Node liveness\n\n"
+    << "| Check | Observed |\n|---|---|\n"
+    << "| Alive before sampling | `"
+    << (metadata.node_liveness.alive_before_sampling ? "true" : "false") << "` |\n"
+    << "| Alive during sampling | `"
+    << (metadata.node_liveness.alive_during_sampling ? "true" : "false") << "` |\n"
+    << "| Alive after sampling | `"
+    << (metadata.node_liveness.alive_after_sampling ? "true" : "false") << "` |\n"
+    << "| Expected controlled-stop exit | `" << metadata.node_liveness.expected_exit_code
+    << "` |\n"
+    << "| Observed controlled-stop exit | `" << metadata.node_liveness.observed_exit_code
+    << "` |\n"
+    << "| Exit code matches | `"
+    << (metadata.node_liveness.exit_code_matches ? "true" : "false") << "` |\n\n"
     << "## Cases\n\n"
     << "| Round | Case | Status | Node / Preflight exit | Controls | Cleanup | Summary |\n"
     << "|---:|---|---|---|---:|---|---|\n";

@@ -10,6 +10,18 @@
 namespace
 {
 
+auto_aim_ros_e2e::NodeLiveness normal_liveness()
+{
+  auto_aim_ros_e2e::NodeLiveness liveness;
+  liveness.alive_before_sampling = true;
+  liveness.alive_during_sampling = true;
+  liveness.alive_after_sampling = true;
+  liveness.expected_exit_code = 0;
+  liveness.observed_exit_code = 0;
+  liveness.exit_code_matches = true;
+  return liveness;
+}
+
 TEST(Report, StatusAndShaValidationAreStrict)
 {
   EXPECT_STREQ(auto_aim_ros_e2e::status_name(auto_aim_ros_e2e::Status::Pass), "PASS");
@@ -18,6 +30,36 @@ TEST(Report, StatusAndShaValidationAreStrict)
   EXPECT_TRUE(auto_aim_ros_e2e::valid_git_sha(std::string(40U, 'a')));
   EXPECT_FALSE(auto_aim_ros_e2e::valid_git_sha(std::string(39U, 'a')));
   EXPECT_FALSE(auto_aim_ros_e2e::valid_git_sha(std::string(40U, 'z')));
+}
+
+TEST(Report, NodeLivenessIsFailClosed)
+{
+  const auto missing = auto_aim_ros_e2e::NodeLiveness{};
+  EXPECT_FALSE(auto_aim_ros_e2e::node_liveness_valid(missing));
+
+  auto early_exit = normal_liveness();
+  early_exit.alive_during_sampling = false;
+  EXPECT_FALSE(auto_aim_ros_e2e::node_liveness_valid(early_exit));
+
+  auto mismatched_exit = normal_liveness();
+  mismatched_exit.observed_exit_code = 130;
+  mismatched_exit.exit_code_matches = false;
+  EXPECT_FALSE(auto_aim_ros_e2e::node_liveness_valid(mismatched_exit));
+
+  EXPECT_TRUE(auto_aim_ros_e2e::node_liveness_valid(normal_liveness()));
+}
+
+TEST(Report, MissingNodeLivenessCannotRenderPass)
+{
+  auto_aim_ros_e2e::CaseResult result;
+  result.status = auto_aim_ros_e2e::Status::Pass;
+  auto metadata = auto_aim_ros_e2e::ReportMetadata{
+    std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
+  const auto json = auto_aim_ros_e2e::render_json(metadata, {result}, {});
+  EXPECT_NE(json.find("\"status\": \"FAIL\""), std::string::npos);
+  EXPECT_NE(json.find("\"alive_during_sampling\": false"), std::string::npos);
+  EXPECT_NE(json.find("\"expected_exit_code\": -1"), std::string::npos);
+  EXPECT_NE(json.find("\"observed_exit_code\": -1"), std::string::npos);
 }
 
 TEST(Report, RenderersPreserveDetailedSafetyEvidence)
@@ -40,12 +82,20 @@ TEST(Report, RenderersPreserveDetailedSafetyEvidence)
   const auto metadata = auto_aim_ros_e2e::ReportMetadata{
     std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "Ubuntu; humble",
     "133", "260033", 5U};
-  const auto json = auto_aim_ros_e2e::render_json(metadata, {result}, {});
-  const auto markdown = auto_aim_ros_e2e::render_markdown(metadata, {result}, {});
+  auto report_metadata = metadata;
+  report_metadata.node_liveness = normal_liveness();
+  result.node_liveness = normal_liveness();
+  const auto json = auto_aim_ros_e2e::render_json(report_metadata, {result}, {});
+  const auto markdown = auto_aim_ros_e2e::render_markdown(report_metadata, {result}, {});
   EXPECT_NE(json.find("\"safety_fields_ok\": true"), std::string::npos);
   EXPECT_NE(json.find("\"NOT_VERIFIED\": 0"), std::string::npos);
+  EXPECT_NE(json.find("\"node_liveness\""), std::string::npos);
+  EXPECT_NE(json.find("\"expected_exit_code\": 0"), std::string::npos);
+  EXPECT_NE(json.find("\"observed_exit_code\": 0"), std::string::npos);
+  EXPECT_NE(json.find("\"status\": \"PASS\""), std::string::npos);
   EXPECT_NE(markdown.find("serial_enabled=false"), std::string::npos);
   EXPECT_NE(markdown.find("Message-level dry-run E2E PASS"), std::string::npos);
+  EXPECT_NE(markdown.find("Alive during sampling"), std::string::npos);
 }
 
 TEST(Report, NewFileRefusesOverwriteAndSha256IsStable)

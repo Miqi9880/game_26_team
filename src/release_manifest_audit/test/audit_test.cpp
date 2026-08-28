@@ -28,6 +28,10 @@ protected:
   {
     std::ofstream output(path); ASSERT_TRUE(output.good()); output << contents;
   }
+  std::string read(const fs::path & path)
+  {
+    std::ifstream input(path); std::ostringstream contents; contents << input.rdbuf(); return contents.str();
+  }
   int execute(const std::string & config, const std::string & output_name = "result")
   {
     write(root_ / "config.json", config); std::ostringstream out; std::ostringstream error;
@@ -112,8 +116,16 @@ TEST_F(AuditTest, ExistingWarnStatusPropagatesAsNotVerified)
 TEST_F(AuditTest, AllUnavailableReportStatusesRemainNonPass)
 {
   for (const auto & report_status : {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}) {
-    write(root_ / "status.json", safe_report(report_status));
-    EXPECT_EQ(execute(config((root_ / "status.json").string()), report_status), 2);
+    auto report = safe_report(report_status);
+    const auto counts = report.find(",\"counts\":");
+    ASSERT_NE(counts, std::string::npos);
+    report.erase(counts, report.rfind('}') - counts);
+    write(root_ / "status.json", report);
+    auto value = config((root_ / "status.json").string());
+    const auto ctest = value.find(",\"ctest_xml\":");
+    ASSERT_NE(ctest, std::string::npos);
+    value.erase(ctest, value.find('}', ctest) - ctest);
+    EXPECT_EQ(execute(value, report_status), 2);
   }
 }
 
@@ -159,7 +171,7 @@ TEST_F(AuditTest, CTestXmlMissingMalformedAndMismatchedFailClosed)
 
 TEST_F(AuditTest, StandardCTestTestListAndResultStatusesAreParsed)
 {
-  auto report = safe_report("NOT_VERIFIED");
+  auto report = safe_report("FAIL");
   const std::string old_counts = "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0";
   report.replace(report.find(old_counts), old_counts.size(),
     "\"PASS\":1,\"FAIL\":1,\"UNAVAILABLE\":0,\"NOT_RUN\":1");
@@ -171,7 +183,10 @@ TEST_F(AuditTest, StandardCTestTestListAndResultStatusesAreParsed)
     "<Test>./notrun</Test></TestList><Test Status=\"passed\"><Name>pass</Name></Test>"
     "<Test Status=\"failed\"><Name>fail</Name></Test>"
     "<Test Status=\"notrun\"><Name>notrun</Name></Test></Testing></Site>");
-  EXPECT_EQ(execute(config((root_ / "mixed.json").string()), "mixed_statuses"), 2);
+  EXPECT_EQ(execute(config((root_ / "mixed.json").string()), "mixed_statuses"), 1);
+  const auto manifest = read(root_ / "mixed_statuses" / "release-manifest.json");
+  EXPECT_NE(manifest.find("source reports FAIL"), std::string::npos);
+  EXPECT_EQ(manifest.find("disagree with CTest XML"), std::string::npos);
 }
 
 TEST_F(AuditTest, DirectCTestResultWithoutStatusFailsClosed)
@@ -182,6 +197,45 @@ TEST_F(AuditTest, DirectCTestResultWithoutStatusFailsClosed)
     "<Test><Name>incomplete_result</Name></Test>"
     "<Test Status=\"passed\"><Name>audit_test</Name></Test></Testing></Site>");
   EXPECT_EQ(execute(config((root_ / "smoke.json").string()), "missing_result_status"), 1);
+}
+
+TEST_F(AuditTest, TopLevelPassContradictingFailedCaseFailsClosed)
+{
+  auto report = safe_report("PASS");
+  const std::string old_counts = "\"PASS\":1,\"FAIL\":0";
+  report.replace(report.find(old_counts), old_counts.size(), "\"PASS\":0,\"FAIL\":1");
+  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19, "[{\"status\":\"FAIL\"}]");
+  write(root_ / "contradiction.json", report);
+  write(root_ / "ctest.xml",
+    "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./failed_test</Test></TestList>"
+    "<Test Status=\"failed\"><Name>failed_test</Name></Test></Testing></Site>");
+  EXPECT_EQ(execute(config((root_ / "contradiction.json").string()), "pass_with_failure"), 1);
+  const auto manifest = read(root_ / "pass_with_failure" / "release-manifest.json");
+  EXPECT_NE(manifest.find("top-level status PASS contradicts aggregated case status FAIL"),
+    std::string::npos);
+}
+
+TEST_F(AuditTest, TopLevelWarnCannotHideFailedCase)
+{
+  auto report = safe_report("WARN");
+  const std::string old_counts = "\"PASS\":1,\"FAIL\":0";
+  report.replace(report.find(old_counts), old_counts.size(), "\"PASS\":0,\"FAIL\":1");
+  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19, "[{\"status\":\"FAIL\"}]");
+  write(root_ / "warn-contradiction.json", report);
+  write(root_ / "ctest.xml",
+    "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./failed_test</Test></TestList>"
+    "<Test Status=\"failed\"><Name>failed_test</Name></Test></Testing></Site>");
+  EXPECT_EQ(execute(config((root_ / "warn-contradiction.json").string()), "warn_with_failure"), 1);
+}
+
+TEST_F(AuditTest, DeclaredCTestXmlRequiresCountsAndCases)
+{
+  auto report = safe_report();
+  const auto counts = report.find(",\"counts\":");
+  ASSERT_NE(counts, std::string::npos);
+  report.erase(counts, report.rfind('}') - counts);
+  write(root_ / "no-statistics.json", report);
+  EXPECT_EQ(execute(config((root_ / "no-statistics.json").string()), "ctest_without_statistics"), 1);
 }
 
 }  // namespace

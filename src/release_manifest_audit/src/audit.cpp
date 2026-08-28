@@ -221,6 +221,37 @@ bool counts_valid(const Object & root, std::string * why)
   for (const auto & item : cases) { const auto & entry = object(item, "case"); const auto value = text(required(entry, "status", "case"), "case.status"); if (!actual.count(value)) { *why = "case has unknown status"; return false; } ++actual[value]; }
   for (const auto & [key, total] : actual) { const auto * item = find(counts, key); if (!item || !std::holds_alternative<double>(*item) || std::get<double>(*item) != total) { *why = "counts disagree with cases for " + key; return false; } } return true;
 }
+bool status_matches_results(const Object & root, Status reported, std::string * why)
+{
+  const auto * counts_item = find(root, "counts"); const auto * cases_item = find(root, "cases");
+  if (!counts_item && !cases_item) return true;
+  if (!counts_item || !cases_item) { *why = "top-level status cannot be verified without both counts and cases"; return false; }
+  const auto & counts = object(*counts_item, "counts");
+  std::map<std::string, int> totals;
+  for (const auto & key : {"PASS", "FAIL", "UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}) {
+    const auto * item = find(counts, key);
+    if (!item || !std::holds_alternative<double>(*item)) { *why = "top-level status cannot be verified from counts"; return false; }
+    totals[key] = static_cast<int>(std::get<double>(*item));
+  }
+  Status aggregate = Status::Pass;
+  if (totals["FAIL"] > 0) aggregate = Status::Fail;
+  else if (totals["NOT_VERIFIED"] > 0) aggregate = Status::NotVerified;
+  else if (totals["NOT_RUN"] > 0) aggregate = Status::NotRun;
+  else if (totals["UNAVAILABLE"] > 0) aggregate = Status::Unavailable;
+  if (reported != aggregate) { *why = "top-level status " + std::string(name(reported)) + " contradicts aggregated case status " + name(aggregate); return false; }
+  return true;
+}
+bool warn_matches_results(const Object & root, std::string * why)
+{
+  const auto * counts_item = find(root, "counts"); const auto * cases_item = find(root, "cases");
+  if (!counts_item && !cases_item) return true;
+  if (!counts_item || !cases_item) { *why = "top-level WARN cannot be verified without both counts and cases"; return false; }
+  const auto & counts = object(*counts_item, "counts");
+  const auto * failures = find(counts, "FAIL");
+  if (!failures || !std::holds_alternative<double>(*failures)) { *why = "top-level WARN cannot be verified from counts"; return false; }
+  if (std::get<double>(*failures) != 0.0) { *why = "top-level WARN contradicts FAIL results"; return false; }
+  return true;
+}
 struct CTestCounts { int total{0}; int passed{0}; int failed{0}; int skipped{0}; };
 bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why)
 {
@@ -256,7 +287,6 @@ bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why
 bool ctest_matches_report(const Object & root, const fs::path & path, std::string * why)
 {
   const auto * counts_item = find(root, "counts"); const auto * cases_item = find(root, "cases");
-  if (!counts_item && !cases_item) return true;
   if (!counts_item || !cases_item) { *why = "CTest-backed report must provide both counts and cases"; return false; }
   const auto & counts = object(*counts_item, "counts");
   CTestCounts actual;
@@ -306,15 +336,18 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       source.digest = sha256(source.path); if (const auto expected = optional_text(source_config, "sha256")) { if (!sha256_text(*expected) || source.digest != *expected) source.reasons.push_back("declared SHA-256 mismatch"); }
       const auto root = object(Parser(read_file(source.path)).parse(), "source JSON");
       const auto schema = find(root, "schema_version"); if (!schema || !std::holds_alternative<double>(*schema) || std::get<double>(*schema) != 1.0) source.reasons.push_back("unknown or missing schema_version");
+      std::optional<Status> reported_status; bool reported_warn = false;
       const auto report_status = find(root, "status"); if (!report_status) source.reasons.push_back("missing report status"); else {
         const auto report_text = text(*report_status, "status");
-        if (report_text == "WARN") { source.result = Status::NotVerified; source.reasons.push_back("source reports WARN; cannot count as release PASS"); }
-        else { try { const auto reported = status(report_text); if (reported == Status::Fail) source.reasons.push_back("source reports FAIL"); else if (reported != Status::Pass) { source.result = reported; source.reasons.push_back("source reports " + report_text + "; cannot count as release PASS"); } } catch (...) { source.reasons.push_back("unknown report status"); } }
+        if (report_text == "WARN") { reported_warn = true; source.result = Status::NotVerified; source.reasons.push_back("source reports WARN; cannot count as release PASS"); }
+        else { try { reported_status = status(report_text); if (*reported_status == Status::Fail) source.reasons.push_back("source reports FAIL"); else if (*reported_status != Status::Pass) { source.result = *reported_status; source.reasons.push_back("source reports " + report_text + "; cannot count as release PASS"); } } catch (...) { source.reasons.push_back("unknown report status"); } }
       }
       if (unsafe_claim(Json(root))) source.reasons.push_back("production or hardware claim detected");
       std::string reason; if (!safe_fields(root, &reason)) source.reasons.push_back(reason);
       if (source.kind == "scenario_benchmark" || source.kind == "evidence" || source.kind == "calibration" || source.kind == "qualification") { if (!expected_synthetic(root, &reason)) source.reasons.push_back(reason); }
       if (!counts_valid(root, &reason)) source.reasons.push_back(reason);
+      if (reported_status && !status_matches_results(root, *reported_status, &reason)) source.reasons.push_back(reason);
+      if (reported_warn && !warn_matches_results(root, &reason)) source.reasons.push_back(reason);
       if (const auto ctest_path = optional_text(source_config, "ctest_xml")) {
         if (!ctest_matches_report(root, *ctest_path, &reason)) source.reasons.push_back(reason);
       } else if (find(root, "counts") || find(root, "cases")) {

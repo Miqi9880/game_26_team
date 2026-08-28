@@ -35,6 +35,8 @@ JSON 证据路径。
 任何带有 `counts`/`cases` 的 CTest-backed 报告都必须在来源声明中提供
 `ctest_xml`。审计会读取该 XML，并 fail-closed 地比较总案例数与
 `PASS`、`FAIL`、`NOT_RUN` 统计；缺失、损坏、无 `Test` 记录或统计不一致均为 FAIL。
+顶层五态还必须与 `counts` 和每个 `case.status` 的保守聚合结果一致（优先级为
+`FAIL`、`NOT_VERIFIED`、`NOT_RUN`、`UNAVAILABLE`、`PASS`）；任何矛盾都会 FAIL。
 
 运行：
 

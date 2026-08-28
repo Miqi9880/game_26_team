@@ -19,7 +19,9 @@ protected:
     root_ = fs::temp_directory_path() / ("release_manifest_audit_" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root_);
-    write(root_ / "ctest.xml", "<Site><Testing><Test Status=\"passed\"></Test></Testing></Site>");
+    write(root_ / "ctest.xml",
+      "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./audit_test</Test></TestList>"
+      "<Test Status=\"passed\"><Name>audit_test</Name></Test></Testing></Site>");
   }
   void TearDown() override { fs::remove_all(root_); }
   void write(const fs::path & path, const std::string & contents)
@@ -153,6 +155,23 @@ TEST_F(AuditTest, CTestXmlMissingMalformedAndMismatchedFailClosed)
   auto mismatch = config((root_ / "smoke.json").string());
   mismatch.replace(mismatch.find(ctest), ctest.size(), (root_ / "mismatch.xml").string());
   EXPECT_EQ(execute(mismatch, "mismatch_xml"), 1);
+}
+
+TEST_F(AuditTest, StandardCTestTestListAndResultStatusesAreParsed)
+{
+  auto report = safe_report("NOT_VERIFIED");
+  const std::string old_counts = "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0";
+  report.replace(report.find(old_counts), old_counts.size(),
+    "\"PASS\":1,\"FAIL\":1,\"UNAVAILABLE\":0,\"NOT_RUN\":1");
+  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19,
+    "[{\"status\":\"PASS\"},{\"status\":\"FAIL\"},{\"status\":\"NOT_RUN\"}]");
+  write(root_ / "mixed.json", report);
+  write(root_ / "ctest.xml",
+    "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./pass</Test><Test>./fail</Test>"
+    "<Test>./notrun</Test></TestList><Test Status=\"passed\"><Name>pass</Name></Test>"
+    "<Test Status=\"failed\"><Name>fail</Name></Test>"
+    "<Test Status=\"notrun\"><Name>notrun</Name></Test></Testing></Site>");
+  EXPECT_EQ(execute(config((root_ / "mixed.json").string()), "mixed_statuses"), 2);
 }
 
 }  // namespace

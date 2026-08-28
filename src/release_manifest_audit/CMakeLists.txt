@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake REQUIRED)
+find_package(LibXml2 REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_library(${PROJECT_NAME}_core src/audit.cpp)
@@ -13,7 +14,7 @@ target_compile_options(${PROJECT_NAME}_core PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(${PROJECT_NAME}_core OpenSSL::Crypto)
+target_link_libraries(${PROJECT_NAME}_core LibXml2::LibXml2 OpenSSL::Crypto)
 
 add_executable(${PROJECT_NAME} src/main.cpp)
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)

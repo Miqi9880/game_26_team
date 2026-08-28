@@ -9,8 +9,8 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -19,6 +19,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <libxml/parser.h>
+#include <libxml/tree.h>
 #include <openssl/evp.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -222,22 +224,25 @@ bool counts_valid(const Object & root, std::string * why)
 struct CTestCounts { int total{0}; int passed{0}; int failed{0}; int skipped{0}; };
 bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why)
 {
-  std::string xml;
-  try { xml = read_file(path); } catch (const std::exception & exception) { *why = std::string("CTest XML cannot be read: ") + exception.what(); return false; }
-  if (xml.empty()) { *why = "CTest XML is empty"; return false; }
-  const std::regex test_open(R"(<\s*Test\b([^>]*)>)", std::regex::icase);
-  const std::regex test_close(R"(<\s*/\s*Test\s*>)", std::regex::icase);
-  const std::regex status_attribute(R"(\bStatus\s*=\s*([\"'])([^\"']*)\1)", std::regex::icase);
-  const auto begin = std::sregex_iterator(xml.begin(), xml.end(), test_open);
-  const auto end = std::sregex_iterator();
-  const auto openings = static_cast<int>(std::distance(begin, end));
-  const auto closings = static_cast<int>(std::distance(std::sregex_iterator(xml.begin(), xml.end(), test_close), end));
-  if (openings == 0 || openings != closings) { *why = "CTest XML is malformed or contains no complete Test records"; return false; }
-  for (auto it = begin; it != end; ++it) {
-    std::smatch match;
-    const auto attributes = (*it)[1].str();
-    if (!std::regex_search(attributes, match, status_attribute)) { *why = "CTest Test record has no Status attribute"; return false; }
-    std::string value = match[2].str();
+  const auto document = std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)>(
+    xmlReadFile(path.c_str(), nullptr, XML_PARSE_NONET | XML_PARSE_NOBLANKS | XML_PARSE_NOERROR | XML_PARSE_NOWARNING),
+    &xmlFreeDoc);
+  if (!document) { *why = "CTest XML cannot be read or is malformed"; return false; }
+  const auto root = xmlDocGetRootElement(document.get());
+  if (!root || xmlStrcmp(root->name, BAD_CAST "Site") != 0) { *why = "CTest XML root must be Site"; return false; }
+  xmlNode * testing = nullptr;
+  for (auto node = root->children; node != nullptr; node = node->next) {
+    if (node->type == XML_ELEMENT_NODE && xmlStrcmp(node->name, BAD_CAST "Testing") == 0) {
+      if (testing != nullptr) { *why = "CTest XML contains multiple Testing elements"; return false; }
+      testing = node;
+    }
+  }
+  if (!testing) { *why = "CTest XML has no Testing element"; return false; }
+  for (auto node = testing->children; node != nullptr; node = node->next) {
+    if (node->type != XML_ELEMENT_NODE || xmlStrcmp(node->name, BAD_CAST "Test") != 0) continue;
+    const auto attribute = std::unique_ptr<xmlChar, decltype(xmlFree)>(xmlGetProp(node, BAD_CAST "Status"), xmlFree);
+    if (!attribute) continue;
+    std::string value(reinterpret_cast<const char *>(attribute.get()));
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     ++result->total;
     if (value == "passed") ++result->passed;
@@ -245,6 +250,7 @@ bool ctest_counts(const fs::path & path, CTestCounts * result, std::string * why
     else if (value == "notrun" || value == "not_run" || value == "skipped") ++result->skipped;
     else { *why = "CTest Test record has unsupported Status: " + value; return false; }
   }
+  if (result->total == 0) { *why = "CTest XML contains no Test result records with Status"; return false; }
   return true;
 }
 bool ctest_matches_report(const Object & root, const fs::path & path, std::string * why)

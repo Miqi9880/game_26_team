@@ -6,6 +6,7 @@
   <maintainer email="hj@todo.todo">hj</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>libxml2</depend>
   <depend>openssl</depend>
   <test_depend>ament_cmake_gtest</test_depend>
   <export><build_type>ament_cmake</build_type></export>

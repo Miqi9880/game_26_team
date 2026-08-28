@@ -36,11 +36,16 @@ bool report_passes(
   const bool case_liveness_valid = std::all_of(
     results.begin(), results.end(), [](const CaseResult & result) {
       // Lifecycle, expected-failure, and hardware-boundary records do not
-      // launch AutoAimNode and intentionally keep expected_exit_code unset.
-      // Any message case that does launch it must carry a complete,
-      // fail-closed liveness record of its own.
-      return result.node_liveness.expected_exit_code < 0 ||
-             node_liveness_valid(result.node_liveness);
+      // launch AutoAimNode and intentionally keep every liveness field at its
+      // default value. Any case that carries even partial liveness evidence
+      // must carry a complete, fail-closed record of its own; otherwise a
+      // malformed expected-exit field could silently bypass this check.
+      const auto & liveness = result.node_liveness;
+      const bool has_liveness_evidence =
+        liveness.alive_before_sampling || liveness.alive_during_sampling ||
+        liveness.alive_after_sampling || liveness.expected_exit_code != -1 ||
+        liveness.observed_exit_code != -1 || liveness.exit_code_matches;
+      return !has_liveness_evidence || node_liveness_valid(liveness);
     });
   return !any_failure(results) && case_liveness_valid &&
          node_liveness_valid(metadata.node_liveness);

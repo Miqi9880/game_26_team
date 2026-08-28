@@ -74,6 +74,18 @@ TEST(Report, MissingCaseNodeLivenessCannotRenderPass)
   EXPECT_NE(json.find("\"status\": \"FAIL\""), std::string::npos);
 }
 
+TEST(Report, PartialCaseNodeLivenessCannotRenderPass)
+{
+  auto_aim_ros_e2e::CaseResult result;
+  result.status = auto_aim_ros_e2e::Status::Pass;
+  result.node_liveness.observed_exit_code = 0;
+  auto metadata = auto_aim_ros_e2e::ReportMetadata{
+    std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
+  metadata.node_liveness = normal_liveness();
+  const auto json = auto_aim_ros_e2e::render_json(metadata, {result}, {});
+  EXPECT_NE(json.find("\"status\": \"FAIL\""), std::string::npos);
+}
+
 TEST(Report, RenderersPreserveDetailedSafetyEvidence)
 {
   auto_aim_ros_e2e::CaseResult result;

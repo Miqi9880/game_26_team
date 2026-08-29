@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -386,10 +387,18 @@ std::optional<Status> absence_status(const Object & value, std::vector<std::stri
   reasons->push_back(context + " absence_status must be UNAVAILABLE, NOT_RUN, or NOT_VERIFIED");
   return Status::Fail;
 }
-bool unsafe_claim(const Json & value)
+bool unsafe_claim(const Json & value, bool allow_negative_production_claim = false,
+                  bool top_level = true)
 {
   if (std::holds_alternative<Object>(value)) {
     for (const auto & [key, child] : std::get<Object>(value)) {
+      // A negative evidence fixture may intentionally contain exactly one
+      // top-level production_ready=true claim: that is the claim whose
+      // rejection is being demonstrated.  Every nested/aliased claim remains
+      // unsafe and therefore fatal.
+      const bool expected_negative_claim = allow_negative_production_claim &&
+        top_level && key == "production_ready" && std::holds_alternative<bool>(child) &&
+        std::get<bool>(child);
       const auto lower = canonical_claim_key(key);
       const auto bool_value = [&]() -> std::optional<bool> {
         if (std::holds_alternative<bool>(child)) return std::get<bool>(child);
@@ -411,21 +420,25 @@ bool unsafe_claim(const Json & value)
         (lower.find("firingvalidated") != std::string::npos) ||
         (lower.find("closedloopvalidated") != std::string::npos) ||
         (lower.find("controlapplied") != std::string::npos);
-      if (production_flag && bool_value && *bool_value) return true;
-      if ((lower == "testonly" || lower == "dryrun") && bool_value && !*bool_value) return true;
-      if (lower == "motionnonzero" && (!bool_value || *bool_value)) return true;
-      const auto motion_field = lower.find("fire") != std::string::npos ||
-        lower.find("velocity") != std::string::npos || lower.find("acceleration") != std::string::npos ||
-        lower == "yawvel" || lower == "pitchvel" || lower == "yawacc" || lower == "pitchacc";
-      if (motion_field) {
-        if (std::holds_alternative<double>(child) && std::get<double>(child) != 0.0) return true;
-        if (!std::holds_alternative<double>(child) && !bool_value) return true;
+      if (!expected_negative_claim) {
+        if (production_flag && bool_value && *bool_value) return true;
+        if ((lower == "testonly" || lower == "dryrun") && bool_value && !*bool_value) return true;
+        if (lower == "motionnonzero" && (!bool_value || *bool_value)) return true;
+        const auto motion_field = lower.find("fire") != std::string::npos ||
+          lower.find("velocity") != std::string::npos || lower.find("acceleration") != std::string::npos ||
+          lower == "yawvel" || lower == "pitchvel" || lower == "yawacc" || lower == "pitchacc";
+        if (motion_field) {
+          if (std::holds_alternative<double>(child) && std::get<double>(child) != 0.0) return true;
+          if (!std::holds_alternative<double>(child) && !bool_value) return true;
+        }
       }
-      if (unsafe_claim(child)) return true;
+      if (unsafe_claim(child, allow_negative_production_claim, false)) return true;
     }
   }
   if (std::holds_alternative<Array>(value)) {
-    for (const auto & child : std::get<Array>(value)) if (unsafe_claim(child)) return true;
+    for (const auto & child : std::get<Array>(value)) {
+      if (unsafe_claim(child, allow_negative_production_claim, false)) return true;
+    }
   }
   return false;
 }
@@ -448,9 +461,19 @@ bool safe_fields(const Object & root, std::string * why)
   }
   return true;
 }
-bool expected_synthetic(const Object & root, std::string * why)
+bool expected_synthetic(const Object & root, std::string * why,
+                        bool allow_negative_production_claim = false)
 {
-  for (const auto & [key, expected] : std::vector<std::pair<std::string, bool>>{{"synthetic", true}, {"test_only", true}, {"production_ready", false}}) { const auto * item = find(root, key); if (!item || !std::holds_alternative<bool>(*item) || std::get<bool>(*item) != expected) { *why = "missing or contradictory " + key; return false; } } return true;
+  for (const auto & [key, expected] : std::vector<std::pair<std::string, bool>>{{"synthetic", true}, {"test_only", true}, {"production_ready", false}}) {
+    const auto * item = find(root, key);
+    if (allow_negative_production_claim && key == "production_ready" && item &&
+      std::holds_alternative<bool>(*item) && std::get<bool>(*item)) continue;
+    if (!item || !std::holds_alternative<bool>(*item) || std::get<bool>(*item) != expected) {
+      *why = "missing or contradictory " + key;
+      return false;
+    }
+  }
+  return true;
 }
 bool counts_valid(const Object & root, std::string * why)
 {
@@ -635,7 +658,7 @@ bool ctest_matches_report(const Object & root, const fs::path & path, std::strin
 }
 
 bool negative_claim_rejection_valid(const Object & root, const Object & declaration,
-                                    const std::string & source_digest, std::string * why)
+                                    std::string * why)
 {
   bool negative_present = false;
   const bool negative = json_bool(declaration, "negative_test", &negative_present);
@@ -730,12 +753,63 @@ bool negative_claim_rejection_valid(const Object & root, const Object & declarat
     *why = "negative evidence expected/observed exit codes must match and be non-zero";
     return false;
   }
-  const auto fixture = optional_text(declaration, "fixture_sha256");
-  const auto root_fixture = optional_text(root, "fixture_sha256");
-  if (!fixture || !root_fixture || !sha256_text(*fixture) || !sha256_text(*root_fixture) ||
-    lower_token(*fixture) != lower_token(source_digest) || lower_token(*root_fixture) != lower_token(*fixture))
+  // ``fixture_sha256`` identifies the deliberately failing fixture payload,
+  // not the bytes of the enclosing report JSON.  Accept the historical
+  // aliases on each side, but require every supplied alias to be valid and
+  // mutually consistent before comparing declaration to report.
+  const auto collect_hash_aliases = [&](const Object & object_value,
+                                        const std::initializer_list<const char *> keys,
+                                        const std::string & context,
+                                        std::vector<std::string> * values) {
+    for (const auto * key : keys) {
+      const auto * item = find(object_value, key);
+      if (!item) continue;
+      if (!std::holds_alternative<std::string>(*item) ||
+        !sha256_text(std::get<std::string>(*item)))
+      {
+        *why = context + " " + key + " sha256 must be 64 hexadecimal characters";
+        return false;
+      }
+      values->push_back(lower_token(std::get<std::string>(*item)));
+    }
+    return true;
+  };
+  std::vector<std::string> expected_fixtures;
+  if (!collect_hash_aliases(declaration, {"fixture_sha256", "expected_fixture_sha256"},
+      "negative evidence declaration", &expected_fixtures)) return false;
+  if (expected_fixtures.empty()) {
+    *why = "negative evidence requires fixture_sha256";
+    return false;
+  }
+  if (std::any_of(expected_fixtures.begin() + 1U, expected_fixtures.end(),
+      [&](const std::string & value) { return value != expected_fixtures.front(); }))
   {
-    *why = "negative evidence fixture_sha256 is missing or does not match source bytes";
+    *why = "negative evidence fixture hash aliases disagree";
+    return false;
+  }
+
+  std::vector<std::string> actual_fixtures;
+  if (!collect_hash_aliases(root,
+      {"fixture_sha256", "fixture_hash", "expected_fixture_sha256"},
+      "negative evidence source", &actual_fixtures)) return false;
+  if (const auto * fixture_item = find(root, "fixture")) {
+    if (!std::holds_alternative<Object>(*fixture_item)) {
+      *why = "negative evidence fixture must be an object";
+      return false;
+    }
+    if (!collect_hash_aliases(std::get<Object>(*fixture_item), {"sha256", "sha"},
+        "negative evidence fixture", &actual_fixtures)) return false;
+  }
+  if (std::any_of(actual_fixtures.begin() + (actual_fixtures.empty() ? 0U : 1U),
+      actual_fixtures.end(), [&](const std::string & value) {
+        return value != actual_fixtures.front();
+      }))
+  {
+    *why = "negative evidence fixture hash aliases disagree";
+    return false;
+  }
+  if (actual_fixtures.empty() || actual_fixtures.front() != expected_fixtures.front()) {
+    *why = "negative evidence fixture SHA-256 does not match declaration";
     return false;
   }
   return true;
@@ -818,6 +892,10 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       else if (!sha256_text(*expected) || lower_token(source.digest) != lower_token(*expected)) source.reasons.push_back("declared SHA-256 mismatch");
       const auto root = object(Parser(read_file(source.path)).parse(), "source JSON");
       const auto schema = find(root, "schema_version"); if (!schema || !std::holds_alternative<double>(*schema) || std::get<double>(*schema) != 1.0) source.reasons.push_back("unknown or missing schema_version");
+      bool negative_declared = false;
+      (void)json_bool(source_config, "negative_test", &negative_declared);
+      bool expected_failure_declared = false;
+      (void)json_bool(source_config, "expected_failure", &expected_failure_declared);
       if (const auto * skip = find(root, "skip_ctest")) {
         if (!std::holds_alternative<bool>(*skip) || std::get<bool>(*skip)) {
           source.reasons.push_back("skip_ctest is not permitted in explicit admission mode");
@@ -833,13 +911,6 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       }
       if (unsafe_claim(Json(root))) source.reasons.push_back("production or hardware claim detected");
       std::string reason; if (!safe_fields(root, &reason)) source.reasons.push_back(reason);
-      if (source.kind == "scenario_benchmark" || source.kind == "scenario" ||
-        source.kind == "evidence" || source.kind == "evidence_report" ||
-        source.kind == "evidence_bundle" || source.kind == "bundle" ||
-        source.kind == "calibration" || source.kind == "qualification" ||
-        source.kind == "model_qualification") {
-        if (!expected_synthetic(root, &reason)) source.reasons.push_back(reason);
-      }
       if (is_hardware_kind(source.kind) && reported_status && *reported_status == Status::Pass) {
         source.reasons.push_back("hardware source cannot claim PASS");
       }
@@ -901,19 +972,33 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       } else if (declared_xml_digest || root_xml_digest) {
         source.reasons.push_back("ctest_xml_sha256 requires explicit ctest_xml");
       }
-      bool negative_declared = false;
-      (void)json_bool(source_config, "negative_test", &negative_declared);
-      bool expected_failure_declared = false;
-      (void)json_bool(source_config, "expected_failure", &expected_failure_declared);
       std::string negative_reason;
+      bool negative_unsafe_claim_only_expected = false;
       if (negative_declared || expected_failure_declared) {
-        if (!negative_claim_rejection_valid(root, source_config, source.digest, &negative_reason)) {
+        if (!negative_claim_rejection_valid(root, source_config, &negative_reason)) {
           source.reasons.push_back(negative_reason);
         } else {
           // The deliberately failing fixture is a PASS for this negative test
           // only after every rejection assertion above has matched exactly.
           negative_valid = true;
           source.result = Status::Pass;
+          // The initial recursive scan deliberately remains strict.  Only
+          // after the complete negative contract succeeds may the exact
+          // top-level production_ready=true claim be treated as expected.
+          negative_unsafe_claim_only_expected = !unsafe_claim(Json(root), true);
+          if (negative_unsafe_claim_only_expected) {
+            source.reasons.erase(std::remove(source.reasons.begin(), source.reasons.end(),
+              "production or hardware claim detected"), source.reasons.end());
+          }
+        }
+      }
+      if (source.kind == "scenario_benchmark" || source.kind == "scenario" ||
+        source.kind == "evidence" || source.kind == "evidence_report" ||
+        source.kind == "evidence_bundle" || source.kind == "bundle" ||
+        source.kind == "calibration" || source.kind == "qualification" ||
+        source.kind == "model_qualification") {
+        if (!expected_synthetic(root, &reason, negative_valid && negative_unsafe_claim_only_expected)) {
+          source.reasons.push_back(reason);
         }
       }
       if (source.kind == "ros_e2e" || source.kind == "ros_message_e2e") {
@@ -968,6 +1053,29 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
                   source.reasons.push_back("PASS node_liveness case is missing");
                   break;
                 }
+                const auto & case_evidence = std::get<Object>(*case_live);
+                const auto case_bool_false = [&](const char * key) {
+                  const auto * value = find(case_evidence, key);
+                  return value && std::holds_alternative<bool>(*value) && !std::get<bool>(*value);
+                };
+                const auto case_number = [&](const char * key, double expected) {
+                  const auto * value = find(case_evidence, key);
+                  return value && std::holds_alternative<double>(*value) &&
+                    std::isfinite(std::get<double>(*value)) && std::get<double>(*value) == expected;
+                };
+                const auto * case_matches = find(case_evidence, "exit_code_matches");
+                if (!case_bool_false("alive_before_sampling") ||
+                  !case_bool_false("alive_during_sampling") ||
+                  !case_bool_false("alive_after_sampling") ||
+                  !case_number("expected_exit_code", -1.0) ||
+                  !case_number("observed_exit_code", -1.0) ||
+                  !case_matches || !std::holds_alternative<bool>(*case_matches) ||
+                  std::get<bool>(*case_matches))
+                {
+                  source.result = Status::NotVerified;
+                  source.reasons.push_back("PASS node_liveness case sentinel is incomplete or invalid");
+                  break;
+                }
                 continue; // lifecycle/expected-failure/unavailable cases.
               }
               if (!case_live || !std::holds_alternative<Object>(*case_live)) { source.result = Status::NotVerified; source.reasons.push_back("PASS node_liveness case is missing"); break; }
@@ -995,8 +1103,9 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       if (negative_valid) {
         // All reasons related to the expected FAIL are intentionally
         // informational; any additional reason remains fatal below.
-        const auto expected_reason = [](const std::string & item) {
-          return item == "source reports FAIL";
+        const auto expected_reason = [&](const std::string & item) {
+          return item == "source reports FAIL" ||
+            (item == "production or hardware claim detected" && negative_unsafe_claim_only_expected);
         };
         if (std::any_of(source.reasons.begin(), source.reasons.end(),
           [&](const std::string & item) { return !expected_reason(item); })) source.result = Status::Fail;

@@ -37,11 +37,17 @@ bool report_passes(
     results.begin(), results.end(), [](const CaseResult & result) {
       // Lifecycle, expected-failure, and hardware-boundary records do not
       // launch AutoAimNode and intentionally keep every liveness field at its
-      // default value. An applicable case, however, must carry a complete,
-      // valid record; the all-default value is not an acceptable "no
-      // evidence" value because it would let a launched node bypass the
-      // liveness gate.
-      if (!result.node_liveness_applicable) return true;
+      // default sentinel.  A marker alone is not enough: accepting arbitrary
+      // values for an inapplicable case would let malformed evidence bypass
+      // the structured reporter contract.
+      if (!result.node_liveness_applicable) {
+        return !result.node_liveness.alive_before_sampling &&
+               !result.node_liveness.alive_during_sampling &&
+               !result.node_liveness.alive_after_sampling &&
+               result.node_liveness.expected_exit_code == -1 &&
+               result.node_liveness.observed_exit_code == -1 &&
+               !result.node_liveness.exit_code_matches;
+      }
       return node_liveness_valid(result.node_liveness);
     });
   return !any_failure(results) && case_liveness_valid &&

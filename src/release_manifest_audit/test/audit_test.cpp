@@ -426,6 +426,79 @@ TEST_F(AuditTest, NegativeEvidenceRequiresExactCalibrationPromotionDiagnostic)
   EXPECT_NE(missing_manifest.find("negative evidence requires expected_diagnostic_code"), std::string::npos);
 }
 
+TEST_F(AuditTest, NegativeEvidenceFixtureAliasesBindFixtureNotReportBytes)
+{
+  const auto fixture_sha = std::string(64, 'a');
+  const auto report = std::string(
+    "{\"schema_version\":1,\"status\":\"FAIL\",\"production_claim_rejected\":true,"
+    "\"production_ready\":true,\"exit_code\":1,"
+    "\"fixture_hash\":\"") + fixture_sha +
+    "\",\"commit\":\"" + kHead + "\",\"baseline_main\":\"" + kBase +
+    "\",\"safety_defaults\":{\"serial_enabled\":false,\"dry_run\":true,"
+    "\"allow_fire\":false,\"fire_command\":0,\"yaw_vel\":0,\"pitch_vel\":0,"
+    "\"yaw_acc\":0,\"pitch_acc\":0},\"diagnostics\":{\"errors\":[{"
+    "\"code\":\"calibration_promotion\"}],\"warnings\":[]}}";
+  write(root_ / "negative_aliases.json", report);
+  auto value = config((root_ / "negative_aliases.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end,
+    ",\"negative_test\":true,\"expected_failure\":true,"
+    "\"expected_diagnostic_code\":\"calibration_promotion\","
+    "\"expected_failure_exit_code\":1,\"expected_fixture_sha256\":\"" + fixture_sha + "\"");
+  EXPECT_EQ(execute(value, "negative_aliases"), 0);
+  const auto manifest = read(root_ / "negative_aliases" / "release-manifest.json");
+  EXPECT_NE(manifest.find("\"status\":\"PASS\""), std::string::npos);
+  EXPECT_EQ(manifest.find("production or hardware claim detected"), std::string::npos);
+
+  auto conflict = report;
+  const auto marker = conflict.find("\"fixture_hash\":\"");
+  ASSERT_NE(marker, std::string::npos);
+  conflict.insert(marker, "\"fixture_sha256\":\"" + std::string(64, 'b') + "\",");
+  write(root_ / "negative_aliases_conflict.json", conflict);
+  auto conflict_config = config((root_ / "negative_aliases_conflict.json").string());
+  const auto conflict_ctest = conflict_config.find(",\"ctest_xml\":");
+  ASSERT_NE(conflict_ctest, std::string::npos);
+  const auto conflict_source_close = conflict_config.find('}', conflict_ctest);
+  ASSERT_NE(conflict_source_close, std::string::npos);
+  conflict_config.erase(conflict_ctest, conflict_source_close - conflict_ctest);
+  const auto conflict_source_end = conflict_config.rfind("}]");
+  ASSERT_NE(conflict_source_end, std::string::npos);
+  conflict_config.insert(conflict_source_end,
+    ",\"negative_test\":true,\"expected_failure\":true,"
+    "\"expected_diagnostic_code\":\"calibration_promotion\","
+    "\"expected_exit_code\":1,\"fixture_sha256\":\"" + fixture_sha + "\"");
+  EXPECT_EQ(execute(conflict_config, "negative_aliases_conflict"), 1);
+  const auto conflict_manifest = read(root_ / "negative_aliases_conflict" / "release-manifest.json");
+  EXPECT_NE(conflict_manifest.find("negative evidence fixture hash aliases disagree"), std::string::npos);
+
+  auto nested_unsafe = report;
+  const auto safety_marker = nested_unsafe.find("\"safety_defaults\":{");
+  ASSERT_NE(safety_marker, std::string::npos);
+  nested_unsafe.insert(safety_marker, "\"claims\":{\"production_ready\":true},");
+  write(root_ / "negative_nested_unsafe.json", nested_unsafe);
+  auto nested_config = config((root_ / "negative_nested_unsafe.json").string());
+  const auto nested_ctest = nested_config.find(",\"ctest_xml\":");
+  ASSERT_NE(nested_ctest, std::string::npos);
+  const auto nested_source_close = nested_config.find('}', nested_ctest);
+  ASSERT_NE(nested_source_close, std::string::npos);
+  nested_config.erase(nested_ctest, nested_source_close - nested_ctest);
+  const auto nested_source_end = nested_config.rfind("}]");
+  ASSERT_NE(nested_source_end, std::string::npos);
+  nested_config.insert(nested_source_end,
+    ",\"negative_test\":true,\"expected_failure\":true,"
+    "\"expected_diagnostic_code\":\"calibration_promotion\","
+    "\"expected_exit_code\":1,\"fixture_sha256\":\"" + fixture_sha + "\"");
+  EXPECT_EQ(execute(nested_config, "negative_nested_unsafe"), 1);
+  const auto nested_manifest = read(root_ / "negative_nested_unsafe" / "release-manifest.json");
+  EXPECT_NE(nested_manifest.find("production or hardware claim detected"), std::string::npos);
+}
+
 TEST_F(AuditTest, RosE2EPassCasesRequireApplicableLivenessEvidence)
 {
   const std::string liveness = "\"node_liveness\":{\"alive_before_sampling\":true,\"alive_during_sampling\":true,\"alive_after_sampling\":true,\"expected_exit_code\":0,\"observed_exit_code\":0,\"exit_code_matches\":true}";
@@ -449,6 +522,34 @@ TEST_F(AuditTest, RosE2EPassCasesRequireApplicableLivenessEvidence)
   auto invalid_config = config((root_ / "e2e_liveness_invalid.json").string());
   invalid_config.replace(invalid_config.find("release_smoke"), std::string("release_smoke").size(), "ros_e2e");
   EXPECT_EQ(execute(invalid_config, "e2e_liveness_invalid"), 2);
+
+  const auto sentinel_case =
+    "[{\"name\":\"audit_test\",\"status\":\"PASS\","
+    "\"node_liveness_applicable\":false,\"node_liveness\":{"
+    "\"alive_before_sampling\":false,\"alive_during_sampling\":false,"
+    "\"alive_after_sampling\":false,\"expected_exit_code\":-1,"
+    "\"observed_exit_code\":-1,\"exit_code_matches\":false}}]";
+  auto valid_sentinel = valid;
+  const auto valid_case_start = valid_sentinel.find(new_case);
+  ASSERT_NE(valid_case_start, std::string::npos);
+  valid_sentinel.replace(valid_case_start, std::string(new_case).size(), sentinel_case);
+  write(root_ / "e2e_liveness_sentinel.json", valid_sentinel);
+  auto sentinel_config = config((root_ / "e2e_liveness_sentinel.json").string());
+  sentinel_config.replace(sentinel_config.find("release_smoke"), std::string("release_smoke").size(), "ros_e2e");
+  EXPECT_EQ(execute(sentinel_config, "e2e_liveness_sentinel"), 0);
+
+  auto invalid_sentinel = valid_sentinel;
+  const auto sentinel_object =
+    "\"node_liveness\":{\"alive_before_sampling\":false,\"alive_during_sampling\":false,"
+    "\"alive_after_sampling\":false,\"expected_exit_code\":-1,\"observed_exit_code\":-1,"
+    "\"exit_code_matches\":false}";
+  const auto sentinel_object_start = invalid_sentinel.find(sentinel_object);
+  ASSERT_NE(sentinel_object_start, std::string::npos);
+  invalid_sentinel.replace(sentinel_object_start, std::string(sentinel_object).size(), "\"node_liveness\":{}");
+  write(root_ / "e2e_liveness_invalid_sentinel.json", invalid_sentinel);
+  auto invalid_sentinel_config = config((root_ / "e2e_liveness_invalid_sentinel.json").string());
+  invalid_sentinel_config.replace(invalid_sentinel_config.find("release_smoke"), std::string("release_smoke").size(), "ros_e2e");
+  EXPECT_EQ(execute(invalid_sentinel_config, "e2e_liveness_invalid_sentinel"), 2);
 }
 
 }  // namespace

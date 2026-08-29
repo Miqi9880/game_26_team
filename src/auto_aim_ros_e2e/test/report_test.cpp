@@ -70,6 +70,22 @@ TEST(Report, MissingNodeLivenessCannotRenderPass)
   EXPECT_NE(json.find("\"observed_exit_code\": -1"), std::string::npos);
 }
 
+TEST(Report, InapplicableCaseRequiresDefaultLivenessSentinel)
+{
+  auto result = auto_aim_ros_e2e::CaseResult{};
+  result.status = auto_aim_ros_e2e::Status::Pass;
+  result.node_liveness_applicable = false;
+  auto metadata = auto_aim_ros_e2e::ReportMetadata{
+    std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
+  metadata.node_liveness = normal_liveness();
+  auto valid = auto_aim_ros_e2e::render_json(metadata, {result}, {});
+  EXPECT_NE(valid.find("\"status\": \"PASS\""), std::string::npos);
+
+  result.node_liveness.expected_exit_code = 0;
+  auto invalid = auto_aim_ros_e2e::render_json(metadata, {result}, {});
+  EXPECT_NE(invalid.find("\"status\": \"FAIL\""), std::string::npos);
+}
+
 TEST(Report, MissingCaseNodeLivenessCannotRenderPass)
 {
   auto_aim_ros_e2e::CaseResult result;

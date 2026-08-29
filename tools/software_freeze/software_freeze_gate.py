@@ -3074,6 +3074,10 @@ def _manifest_source_record(
             if ctest_failure:
                 reasons.append(ctest_failure)
                 fatal = True
+    elif ctest_not_applicable is True and not ("counts" in root or "cases" in root):
+        if kind not in {"release_smoke", "ros_e2e", "ros_message_e2e"}:
+            reasons.append("ctest_not_applicable requires a CTest-shaped reviewed wrapper report")
+            fatal = True
     elif ("counts" in root or "cases" in root) and ctest_not_applicable is not True:
         reasons.append("CTest-backed report requires explicit ctest_xml")
         fatal = True

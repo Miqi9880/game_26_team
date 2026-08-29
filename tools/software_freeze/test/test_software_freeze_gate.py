@@ -1002,6 +1002,66 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             assessed = build_input_manifest_report(manifest)
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
 
+    def test_manifest_negative_evidence_aliases_and_warnings_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            fixture = "fixture-data"
+            fixture_sha = hashlib.sha256(fixture.encode()).hexdigest()
+
+            def make_report(**extra):
+                report = self._safe_report(
+                    status="FAIL", report_status="FAIL", production_claim_rejected=True,
+                    fixture_sha256=fixture_sha, exit_code=1,
+                    diagnostics={"errors": [{"code": "calibration_promotion"}], "warnings": []},
+                    synthetic=True, test_only=True, production_ready=False,
+                )
+                report.update(extra)
+                return report
+
+            def make_manifest(report, **declaration):
+                return self._minimal_input_manifest(
+                    root, report, kind="evidence_bundle", negative_test=True,
+                    expected_failure=True, expected_diagnostic_code="calibration_promotion",
+                    expected_exit_code=1, fixture_sha256=fixture_sha, **declaration,
+                )
+
+            report = make_report()
+            report["diagnostics"].pop("warnings")
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "negative evidence diagnostics.warnings must be an empty array",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
+            report = make_report()
+            manifest = make_manifest(report, expected_failure_exit_code=2)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "negative evidence expected exit-code aliases disagree",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
+            report = make_report(observed_exit_code=2)
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "negative evidence observed exit-code aliases disagree",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
+            report = make_report(claims={"production_ready": True})
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertTrue(any(
+                "unexpected unsafe claim" in reason
+                for reason in assessed["inputs"][0]["failure_reasons"]
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

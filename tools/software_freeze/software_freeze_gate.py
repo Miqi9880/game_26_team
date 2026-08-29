@@ -2786,38 +2786,77 @@ def _manifest_negative_evidence(
         expected_code = ""
     expected_code = expected_code.strip().lower()
 
-    expected_exit = declaration.get("expected_exit_code", declaration.get("expected_failure_exit_code"))
-    expected_exit_number = _manifest_number(expected_exit)
-    if expected_exit_number is None or expected_exit_number == 0:
+    expected_exit_values: list[int] = []
+    for key in ("expected_exit_code", "expected_failure_exit_code"):
+        if key not in declaration:
+            continue
+        number = _manifest_number(declaration.get(key))
+        if number is None or number == 0:
+            failures.append(f"negative evidence {key} must be a non-zero integer")
+            continue
+        expected_exit_values.append(number)
+    if len(set(expected_exit_values)) > 1:
+        failures.append("negative evidence expected exit-code aliases disagree")
+    expected_exit_number = expected_exit_values[0] if expected_exit_values else None
+    if expected_exit_number is None and not expected_exit_values:
         failures.append("negative evidence requires a non-zero expected_exit_code")
 
-    expected_fixture = declaration.get("fixture_sha256", declaration.get("expected_fixture_sha256"))
-    try:
-        expected_fixture = _manifest_sha(expected_fixture, context="negative fixture")
-    except ValueError as exc:
-        failures.append(str(exc))
-        expected_fixture = None
+    expected_fixture_values: list[str] = []
+    for key in ("fixture_sha256", "expected_fixture_sha256"):
+        if key not in declaration:
+            continue
+        try:
+            value = _manifest_sha(declaration.get(key), context=f"negative fixture {key}")
+        except ValueError as exc:
+            failures.append(str(exc))
+            continue
+        if value is not None:
+            expected_fixture_values.append(value)
+    if len(set(expected_fixture_values)) > 1:
+        failures.append("negative evidence fixture hash aliases disagree")
+    expected_fixture = expected_fixture_values[0] if expected_fixture_values else None
     if expected_fixture is None:
         failures.append("negative evidence requires fixture_sha256")
 
-    actual_exit = None
+    actual_exit_values: list[int] = []
     for key in ("exit_code", "observed_exit_code", "returncode", "process_exit_code"):
-        if key in root:
-            actual_exit = _manifest_number(root.get(key))
-            break
+        if key not in root:
+            continue
+        number = _manifest_number(root.get(key))
+        if number is None:
+            failures.append(f"negative evidence {key} must be an integer")
+            continue
+        actual_exit_values.append(number)
+    if len(set(actual_exit_values)) > 1:
+        failures.append("negative evidence observed exit-code aliases disagree")
+    actual_exit = actual_exit_values[0] if actual_exit_values else None
     if expected_exit_number is not None and actual_exit != expected_exit_number:
         failures.append("negative evidence exit code does not match expected_exit_code")
 
-    actual_fixture = None
+    actual_fixture_values: list[str] = []
     for key in ("fixture_sha256", "fixture_hash", "expected_fixture_sha256"):
         value = root.get(key)
         if isinstance(value, str):
-            actual_fixture = value.lower()
-            break
-    if actual_fixture is None and isinstance(root.get("fixture"), Mapping):
+            try:
+                normalized = _manifest_sha(value, context=f"negative fixture {key}")
+            except ValueError as exc:
+                failures.append(str(exc))
+                continue
+            if normalized is not None:
+                actual_fixture_values.append(normalized)
+    if isinstance(root.get("fixture"), Mapping):
         value = root["fixture"].get("sha256", root["fixture"].get("sha"))
         if isinstance(value, str):
-            actual_fixture = value.lower()
+            try:
+                normalized = _manifest_sha(value, context="negative fixture.fixture")
+            except ValueError as exc:
+                failures.append(str(exc))
+                normalized = None
+            if normalized is not None:
+                actual_fixture_values.append(normalized)
+    if len(set(actual_fixture_values)) > 1:
+        failures.append("negative evidence fixture hash aliases disagree")
+    actual_fixture = actual_fixture_values[0] if actual_fixture_values else None
     if expected_fixture is not None and actual_fixture != expected_fixture:
         failures.append("negative evidence fixture SHA-256 does not match declaration")
 
@@ -2833,8 +2872,8 @@ def _manifest_negative_evidence(
         else:
             errors = errors_value
         warnings = diagnostics.get("warnings")
-        if warnings not in (None, [], ()):  # warnings indicate an extra outcome
-            failures.append("negative evidence diagnostics contain unexpected warnings")
+        if not isinstance(warnings, list) or warnings:
+            failures.append("negative evidence diagnostics.warnings must be an empty array")
     diagnostic_codes: list[str] = []
     for item in errors:
         if not isinstance(item, Mapping) or not isinstance(item.get("code"), str):
@@ -2852,7 +2891,10 @@ def _manifest_negative_evidence(
             continue
         path = str(item.get("path", "")).lower()
         value = item.get("value")
-        if path.rsplit(".", 1)[-1] == "production_ready" and value is True:
+        # Only the top-level production claim is the expected negative-test
+        # fixture.  Nested claims remain unsafe even if a diagnostic string
+        # happens to mention production_ready=true.
+        if path == "$.production_ready" and value is True:
             continue
         if "production_ready=true" in str(value).lower() and path.startswith("$.diagnostics"):
             continue

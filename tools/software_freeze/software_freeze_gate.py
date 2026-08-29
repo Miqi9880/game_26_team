@@ -3060,7 +3060,11 @@ def _manifest_source_record(
                 fatal = True
             else:
                 record["ctest_xml_sha256"] = _sha256_bytes(payload)
-                expected_xml_sha = declaration.get("ctest_xml_sha256", root.get("ctest_xml_sha256"))
+                # The caller's input manifest is the authority for the XML
+                # bytes. A digest copied into the producer report must not
+                # satisfy this binding: a compromised/stale producer can
+                # otherwise self-attest its own XML.
+                expected_xml_sha = declaration.get("ctest_xml_sha256")
                 try:
                     expected_xml_sha = _manifest_sha(expected_xml_sha, context=f"CTest XML for {source_id}")
                 except ValueError as exc:
@@ -3146,7 +3150,15 @@ def _manifest_source_record(
                     and _manifest_number(case_liveness.get("expected_exit_code")) is not None
                     and _manifest_number(case_liveness.get("expected_exit_code")) >= 0
                 )
-                if applicable and not _valid_liveness(case_liveness):
+                if not applicable and not isinstance(case_liveness, Mapping):
+                    # Non-node PASS cases (lifecycle, expected-failure, and
+                    # unavailable boundaries) still need the structured
+                    # sentinel emitted by the reporter. A bare false marker
+                    # or an omitted object would make malformed evidence look
+                    # like an intentional opt-out.
+                    reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
+                    unverified = True
+                elif applicable and not _valid_liveness(case_liveness):
                     reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
                     unverified = True
 

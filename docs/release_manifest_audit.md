@@ -64,7 +64,8 @@ release_manifest_audit --config /abs/release-input.json \
   `node_liveness.alive_before_sampling=true`、`alive_during_sampling=true`、
   `alive_after_sampling=true`、`exit_code_matches=true`，且
   `expected_exit_code=observed_exit_code=0`；每个适用 node case 也必须提供同样
-  的完整记录。缺失或矛盾会是 `NOT_VERIFIED`，不会计入发布 PASS；
+  的完整记录；标记为不适用的 PASS case 仍必须携带报告器生成的结构化
+  sentinel 对象，不能用省略字段伪造豁免。缺失或矛盾会是 `NOT_VERIFIED`，不会计入发布 PASS；
 - 缺模型、标定、外参或硬件只能传播为 `UNAVAILABLE`、`NOT_RUN` 或
   `NOT_VERIFIED`，不能折算为 PASS。
 

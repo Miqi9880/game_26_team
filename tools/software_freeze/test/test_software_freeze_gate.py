@@ -920,6 +920,26 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("report case names disagree with CTest XML", assessed["inputs"][0]["failure_reasons"])
 
+    def test_manifest_ctest_xml_digest_cannot_be_self_attested_by_report(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            ctest = root / "Test.xml"
+            ctest.write_text(
+                "<Site><Testing><Test Status=\"passed\"><Name>one</Name></Test></Testing></Site>",
+                encoding="utf-8",
+            )
+            report = self._safe_report(
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "one", "status": "PASS"}],
+                ctest_xml_sha256=hashlib.sha256(ctest.read_bytes()).hexdigest(),
+            )
+            manifest = self._minimal_input_manifest(
+                root, report, kind="ctest", ctest_xml=str(ctest)
+            )
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("CTest XML sha256 is required", assessed["inputs"][0]["failure_reasons"])
+
     def test_manifest_rejects_liveness_exit_aliases_and_hardware_pass(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)

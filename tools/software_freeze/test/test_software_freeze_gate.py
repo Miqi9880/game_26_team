@@ -342,6 +342,25 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             report = build_report(observations)
             self.assertIn("EVIDENCE_BOUNDARY_FAILED", report["blockers"], nested)
 
+    def test_evidence_claim_aliases_cannot_hide_in_camel_case(self) -> None:
+        for claim in (
+            {"productionReady": True},
+            {"hardwareValidation": True},
+            {"serialEnabled": True},
+            {"testOnly": False},
+            {"dryRun": False},
+            {"pitchAcc": 1},
+            {"motionNonzero": True},
+            {"diagnostic": "productionReady=true"},
+            {"diagnostic": "serialEnabled=true"},
+            {"diagnostic": "dryRun=false"},
+        ):
+            self.assertEqual(scan_evidence_claims(claim)["status"], "FAIL", claim)
+            observations = passing_observations()
+            observations["evidence"] = {"status": "PASS", "production_claim_rejected": True, "claims": claim}
+            report = build_report(observations)
+            self.assertEqual(report["software_candidate_status"], "BLOCKED", claim)
+
     def test_ros_safety_transcript_explicit_unsafe_values_are_parsed(self) -> None:
         parsed = _parse_ros_safety_output(
             "ros_safety_integration_test: fire=2 yaw_vel_rad_s=0.5 "
@@ -950,6 +969,21 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("declared input path traverses a symlink", assessed["inputs"][0]["failure_reasons"])
 
+    def test_manifest_path_symlink_is_rejected(self) -> None:
+        """API callers must not use a linked manifest to change path base."""
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink unavailable")
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            target = root / "real"
+            target.mkdir()
+            linked = root / "linked"
+            os.symlink(target, linked, target_is_directory=True)
+            manifest = self._minimal_input_manifest(root, self._safe_report())
+            with self.assertRaises(ValueError):
+                build_input_manifest_report(manifest, manifest_path=linked / "inputs.json")
+
     def test_manifest_requires_source_and_artifact_sha(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)
@@ -985,6 +1019,20 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertIn(
                 "absence_status contradicts present artifact",
                 assessed["artifacts"][0]["failure_reasons"],
+            )
+
+    def test_manifest_rejects_absence_status_on_present_source(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report()
+            manifest = self._minimal_input_manifest(
+                root, report, absence_status="NOT_VERIFIED",
+            )
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "absence_status contradicts present source",
+                assessed["inputs"][0]["failure_reasons"],
             )
 
     def test_manifest_rejects_ctest_skip_and_bad_case_consistency(self) -> None:
@@ -1030,6 +1078,32 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             assessed = build_input_manifest_report(manifest)
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("CTest XML sha256 is required", assessed["inputs"][0]["failure_reasons"])
+
+    def test_manifest_rejects_source_ctest_digest_mismatch(self) -> None:
+        """A producer-side XML digest must agree with the actual XML bytes."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            ctest = root / "Test.xml"
+            ctest.write_text(
+                "<Site><Testing><Test Status=\"passed\"><Name>one</Name></Test></Testing></Site>",
+                encoding="utf-8",
+            )
+            report = self._safe_report(
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "one", "status": "PASS"}],
+                ctest_xml_sha256="0" * 64,
+            )
+            manifest = self._minimal_input_manifest(
+                root, report, kind="ctest", ctest_xml=str(ctest),
+                ctest_xml_sha256=hashlib.sha256(ctest.read_bytes()).hexdigest(),
+            )
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "source ctest_xml_sha256 does not match CTest XML bytes",
+                assessed["inputs"][0]["failure_reasons"],
+            )
 
     def test_manifest_rejects_liveness_exit_aliases_and_hardware_pass(self) -> None:
         with tempfile.TemporaryDirectory() as parent:

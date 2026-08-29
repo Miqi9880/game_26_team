@@ -190,6 +190,31 @@ TEST_F(AuditTest, ArtifactHashMismatchAndAbsentArtifactPropagate)
   EXPECT_EQ(execute(invalid_absence, "invalid_absence"), 1);
 }
 
+TEST_F(AuditTest, PresentSourcesAndArtifactsCannotCarryAbsenceStatus)
+{
+  write(root_ / "present.json", safe_report());
+  auto source_config = config((root_ / "present.json").string());
+  const auto source_marker = source_config.rfind("\"ctest_xml_sha256\"");
+  ASSERT_NE(source_marker, std::string::npos);
+  // Insert the declaration next to the source's explicit path/hash fields.
+  const auto source_end = source_config.find("}]", source_marker);
+  ASSERT_NE(source_end, std::string::npos);
+  source_config.insert(source_end, ",\"absence_status\":\"NOT_VERIFIED\"");
+  EXPECT_EQ(execute(source_config, "present_source_absence"), 1);
+  const auto source_manifest = read(root_ / "present_source_absence" / "release-manifest.json");
+  EXPECT_NE(source_manifest.find("absence_status contradicts present source"), std::string::npos);
+
+  write(root_ / "artifact.xml", "model artifact");
+  auto artifact_config = config((root_ / "present.json").string());
+  const auto artifact_hash = sha256_file(root_ / "artifact.xml");
+  artifact_config.insert(artifact_config.rfind('}'), ",\"artifacts\":[{\"role\":\"model_xml\",\"path\":\"" +
+    (root_ / "artifact.xml").string() + "\",\"sha256\":\"" + artifact_hash +
+    "\",\"absence_status\":\"NOT_VERIFIED\"}]");
+  EXPECT_EQ(execute(artifact_config, "present_artifact_absence"), 1);
+  const auto artifact_manifest = read(root_ / "present_artifact_absence" / "release-manifest.json");
+  EXPECT_NE(artifact_manifest.find("absence_status contradicts present artifact"), std::string::npos);
+}
+
 TEST_F(AuditTest, CTestXmlMissingMalformedAndMismatchedFailClosed)
 {
   write(root_ / "smoke.json", safe_report());
@@ -362,6 +387,22 @@ TEST_F(AuditTest, BranchWhitespaceIsNotAValidCandidateIdentity)
   ASSERT_NE(marker, std::string::npos);
   value.replace(marker, std::string("\"branch\":\"fixture\"").size(), "\"branch\":\" \\t\\n \"");
   EXPECT_THROW(execute(value, "blank_branch"), std::runtime_error);
+}
+
+TEST_F(AuditTest, CandidateSHAAliasConflictsAreRejected)
+{
+  write(root_ / "candidate_alias.json", safe_report());
+  auto head_conflict = config((root_ / "candidate_alias.json").string());
+  const auto head_marker = head_conflict.find("\",\"main_baseline\":\"");
+  ASSERT_NE(head_marker, std::string::npos);
+  head_conflict.insert(head_marker, ",\"candidate_commit\":\"3333333333333333333333333333333333333333\"");
+  EXPECT_THROW(execute(head_conflict, "candidate_head_alias_conflict"), std::runtime_error);
+
+  auto base_conflict = config((root_ / "candidate_alias.json").string());
+  const auto base_marker = base_conflict.find("\",\"branch\":\"");
+  ASSERT_NE(base_marker, std::string::npos);
+  base_conflict.insert(base_marker, ",\"origin_main_sha\":\"4444444444444444444444444444444444444444\"");
+  EXPECT_THROW(execute(base_conflict, "candidate_base_alias_conflict"), std::runtime_error);
 }
 
 TEST_F(AuditTest, UnsafeClaimKeysAreCanonicalizedAcrossSeparatorsAndCase)

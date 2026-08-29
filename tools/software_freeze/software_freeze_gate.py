@@ -852,6 +852,18 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
         "fire",
     }
 
+    # Producers occasionally serialize the same contract in camelCase or
+    # with punctuation (for example ``hardwareValidation`` or
+    # ``serial-enabled``).  Compare claim names in a separator-insensitive
+    # namespace so a spelling change cannot hide an unsafe assertion.  Keep
+    # the original path/value in diagnostics for auditability.
+    def _claim_token(key: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", key.lower())
+
+    unsafe_true_tokens = {_claim_token(key) for key in unsafe_true_keys}
+    unsafe_false_tokens = {_claim_token(key) for key in unsafe_false_keys}
+    motion_tokens = {_claim_token(key) for key in motion_keys}
+
     def _boolish(node: Any) -> bool | None:
         if isinstance(node, bool):
             return node
@@ -867,49 +879,51 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
 
     def _unsafe_boolean_key(lowered: str, child: Any) -> bool:
         truth = _boolish(child)
-        recognized = lowered in unsafe_true_keys or lowered in unsafe_false_keys
-        recognized = recognized or lowered.endswith((
-            "_production_ready", "_hardware_validation", "_closed_loop_validated",
-            "_firing_validated", "_test_only", "_control_applied",
+        compact = _claim_token(lowered)
+        recognized = compact in unsafe_true_tokens or compact in unsafe_false_tokens
+        recognized = recognized or compact.endswith((
+            "productionready", "hardwarevalidation", "closedloopvalidated",
+            "firingvalidated", "testonly", "controlapplied",
         ))
         recognized = recognized or (
-            "robotctrl" in lowered and ("angle" in lowered or "relative" in lowered)
+            "robotctrl" in compact and ("angle" in compact or "relative" in compact)
         )
-        recognized = recognized or ("relative" in lowered and "absolute" in lowered)
+        recognized = recognized or ("relative" in compact and "absolute" in compact)
         recognized = recognized or (
-            "gimbal" in lowered and "muzzle" in lowered
-            and ("origin" in lowered or "assumption" in lowered)
+            "gimbal" in compact and "muzzle" in compact
+            and ("origin" in compact or "assumption" in compact)
         )
         if truth is None:
             # An explicitly present safety/production flag with an unknown
             # type is unverifiable and therefore unsafe.  Missing keys are
             # not visited and remain outside this rule.
             return recognized
-        if lowered in unsafe_true_keys:
+        if compact in unsafe_true_tokens:
             return truth
-        if lowered in unsafe_false_keys:
+        if compact in unsafe_false_tokens:
             return not truth
         # Existing evidence uses component-specific names such as
         # ballistic_production_ready and prediction_test_only.  Enforce the
         # same boundary for those suffix forms without rejecting the normal
         # false/true values respectively.
-        if lowered.endswith(("_production_ready", "_hardware_validation", "_closed_loop_validated", "_firing_validated")):
+        if compact.endswith(("productionready", "hardwarevalidation", "closedloopvalidated", "firingvalidated")):
             return truth
-        if lowered.endswith("_test_only"):
+        if compact.endswith("testonly"):
             return not truth
-        if lowered.endswith("_control_applied"):
+        if compact.endswith("controlapplied"):
             return truth
-        if "robotctrl" in lowered and ("angle" in lowered or "relative" in lowered):
+        if "robotctrl" in compact and ("angle" in compact or "relative" in compact):
             return truth
-        if "relative" in lowered and "absolute" in lowered:
+        if "relative" in compact and "absolute" in compact:
             return truth
-        if "gimbal" in lowered and "muzzle" in lowered and ("origin" in lowered or "assumption" in lowered):
+        if "gimbal" in compact and "muzzle" in compact and ("origin" in compact or "assumption" in compact):
             return truth
         return False
 
     def _motionish_key(lowered: str) -> bool:
-        return any(token in lowered for token in (
-            "fire", "velocity", "vel", "acceleration", "angular_acc", "yaw_acc", "pitch_acc",
+        compact = _claim_token(lowered)
+        return any(token in compact for token in (
+            "fire", "velocity", "vel", "acceleration", "angularacc", "yawacc", "pitchacc",
         ))
 
     def visit(node: Any, path: str = "$") -> None:
@@ -917,10 +931,11 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
             for key, child in node.items():
                 key_text = str(key)
                 lowered = key_text.lower()
+                compact = _claim_token(lowered)
                 child_path = f"{path}.{key_text}"
                 if _unsafe_boolean_key(lowered, child):
                     unsafe.append({"path": child_path, "value": child})
-                if lowered in motion_keys:
+                if lowered in motion_keys or compact in motion_tokens:
                     try:
                         if isinstance(child, bool):
                             raise ValueError("boolean is not a numeric motion value")
@@ -928,7 +943,7 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
                             unsafe.append({"path": child_path, "value": child})
                     except (TypeError, ValueError):
                         unsafe.append({"path": child_path, "value": child})
-                elif _motionish_key(lowered) and lowered not in unsafe_true_keys and lowered not in unsafe_false_keys:
+                elif _motionish_key(lowered) and compact not in unsafe_true_tokens and compact not in unsafe_false_tokens:
                     try:
                         if isinstance(child, bool):
                             if child:
@@ -937,7 +952,7 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
                             unsafe.append({"path": child_path, "value": child})
                     except (TypeError, ValueError):
                         unsafe.append({"path": child_path, "value": child})
-                if lowered == "motion_nonzero":
+                if compact == "motionnonzero":
                     truth = _boolish(child)
                     if truth is None or truth:
                         unsafe.append({"path": child_path, "value": child})
@@ -951,6 +966,11 @@ def scan_evidence_claims(value: Any) -> dict[str, Any]:
                 r"(?:test_only|dry_run)\s*[:=]\s*(?:false|no|0)\b",
                 r"(?:[A-Za-z0-9_]+_(?:production_ready|hardware_validation|closed_loop_validated|firing_validated|control_applied))\s*[:=]\s*(?:true|yes|1)\b",
                 r"[A-Za-z0-9_]*_test_only\s*[:=]\s*(?:false|no|0)\b",
+                # Also recognize compact/camelCase spellings used by some
+                # JSON-to-text diagnostics (for example ``productionReady``
+                # and ``serialEnabled``).
+                r"(?:productionready|hardwarevalidation|gimbalclosedloopvalidated|firingvalidated|realhitratecomputed|ballisticcontrolapplied|predictioncontrolapplied|serialenabled|allowfire|absolutecommandvalid|relativeangleasrobotctrl|relativeangleusedasrobotctrl|robotctrlabsoluteangle|gimbaloriginismuzzle|gimbaloriginasmuzzle|muzzleoriginfromgimbal)\s*[:=]\s*(?:true|yes|1)\b",
+                r"(?:testonly|dryrun)\s*[:=]\s*(?:false|no|0)\b",
             )
             for pattern in claim_patterns:
                 match = re.search(pattern, node, re.IGNORECASE)
@@ -2972,6 +2992,13 @@ def _manifest_source_record(
         return record, None
     fatal = invalid_absence or invalid_identity
     unverified = False
+    # ``absence_status`` is an assertion about the declared source, not a
+    # soft annotation.  A present, non-empty source contradicts it and must
+    # fail closed; otherwise a stale absence marker could silently downgrade
+    # a real report while hiding the metadata inconsistency.
+    if absence is not None:
+        reasons.append("absence_status contradicts present source")
+        fatal = True
     try:
         expected_digest = _manifest_sha(declaration.get("sha256"), context=f"source {source_id}")
     except ValueError as exc:
@@ -3119,6 +3146,24 @@ def _manifest_source_record(
                 if expected_xml_sha is not None and expected_xml_sha != record["ctest_xml_sha256"]:
                     reasons.append("declared CTest XML SHA-256 mismatch")
                     fatal = True
+                # A producer may also persist the XML digest in its report.
+                # The explicit input declaration remains authoritative, but a
+                # conflicting or malformed producer-side digest is evidence
+                # of stale/tampered metadata and must fail closed rather than
+                # being silently ignored.
+                if "ctest_xml_sha256" in root:
+                    try:
+                        source_xml_sha = _manifest_sha(
+                            root.get("ctest_xml_sha256"),
+                            context=f"source CTest XML for {source_id}",
+                        )
+                    except ValueError as exc:
+                        reasons.append(str(exc))
+                        source_xml_sha = None
+                        fatal = True
+                    if source_xml_sha is not None and source_xml_sha != record["ctest_xml_sha256"]:
+                        reasons.append("source ctest_xml_sha256 does not match CTest XML bytes")
+                        fatal = True
             ctest_failure = _manifest_compare_ctest(root, ctest_path)
             if ctest_failure:
                 reasons.append(ctest_failure)
@@ -3403,7 +3448,13 @@ def build_input_manifest_report(
         raise ValueError(f"input manifest schema must be {INPUT_MANIFEST_SCHEMA}")
     if _manifest_number(manifest.get("schema_version")) != INPUT_MANIFEST_VERSION:
         raise ValueError("input manifest requires schema_version 1")
-    base_dir = Path(os.path.abspath(str(manifest_path))).parent if manifest_path is not None else Path.cwd()
+    if manifest_path is not None:
+        manifest_path_value = Path(os.path.abspath(str(manifest_path)))
+        if _path_has_symlink_component(manifest_path_value):
+            raise ValueError("input manifest path traverses a symlink")
+        base_dir = manifest_path_value.parent
+    else:
+        base_dir = Path.cwd()
     candidate_value = manifest.get("candidate")
     if not isinstance(candidate_value, Mapping):
         raise ValueError("input manifest requires candidate object")

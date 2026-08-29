@@ -831,14 +831,14 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
   const auto & candidate = object(required(config, "candidate", "audit configuration"), "candidate");
   const auto head = text(required(candidate, "head", "candidate"), "candidate.head"); const auto baseline = text(required(candidate, "main_baseline", "candidate"), "candidate.main_baseline");
   if (!git_sha(head) || !git_sha(baseline)) throw std::runtime_error("candidate Git SHA must be 40 hexadecimal characters");
-  for (const auto * key : {"head_sha", "candidate_sha", "observed_head", "observed_head_sha"}) {
+  for (const auto * key : {"head_sha", "candidate_sha", "candidate_commit", "observed_head", "observed_head_sha"}) {
     if (const auto * value = find(candidate, key)) {
       if (!std::holds_alternative<std::string>(*value) || !git_sha(std::get<std::string>(*value)) || lower_token(std::get<std::string>(*value)) != lower_token(head)) {
         throw std::runtime_error(std::string("candidate SHA alias disagrees: ") + key);
       }
     }
   }
-  for (const auto * key : {"main_baseline_sha", "baseline_main", "baseline_sha", "observed_main_baseline"}) {
+  for (const auto * key : {"main_baseline_sha", "origin_main_sha", "baseline_main", "baseline_sha", "observed_main_baseline", "observed_origin_main"}) {
     if (const auto * value = find(candidate, key)) {
       if (!std::holds_alternative<std::string>(*value) || !git_sha(std::get<std::string>(*value)) || lower_token(std::get<std::string>(*value)) != lower_token(baseline)) {
         throw std::runtime_error(std::string("candidate baseline SHA alias disagrees: ") + key);
@@ -890,6 +890,9 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       const auto expected = optional_text(source_config, "sha256");
       if (!expected) source.reasons.push_back("source.sha256 is required for present input");
       else if (!sha256_text(*expected) || lower_token(source.digest) != lower_token(*expected)) source.reasons.push_back("declared SHA-256 mismatch");
+      if (absence) {
+        source.reasons.push_back("absence_status contradicts present source");
+      }
       const auto root = object(Parser(read_file(source.path)).parse(), "source JSON");
       const auto schema = find(root, "schema_version"); if (!schema || !std::holds_alternative<double>(*schema) || std::get<double>(*schema) != 1.0) source.reasons.push_back("unknown or missing schema_version");
       bool negative_declared = false;
@@ -1144,6 +1147,7 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
         artifact.digest = sha256(artifact.path); const auto expected = optional_text(item, "sha256");
         if (!expected) artifact.reasons.push_back("artifact.sha256 is required for present input");
         else if (!sha256_text(*expected) || lower_token(artifact.digest) != lower_token(*expected)) artifact.reasons.push_back("declared SHA-256 mismatch");
+        if (absence) artifact.reasons.push_back("absence_status contradicts present artifact");
         artifact.result = artifact.reasons.empty() ? Status::Pass : Status::Fail;
       }
       artifacts.push_back(std::move(artifact));

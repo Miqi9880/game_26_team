@@ -3280,6 +3280,12 @@ def _manifest_artifact_record(
             reasons.append("artifact is empty")
         record["reason"] = reasons[0]
         return record
+    # ``absence_status`` is an explicit assertion that the declared artifact
+    # is unavailable/not run/not verified.  A present, non-empty artifact
+    # contradicts that assertion and must not be admitted as PASS (or silently
+    # downgraded to a non-blocking absence).
+    if absence is not None:
+        reasons.append("absence_status contradicts present artifact")
     try:
         expected = _manifest_sha(declaration.get("sha256"), context=f"artifact {role}")
     except ValueError as exc:
@@ -3334,10 +3340,12 @@ def _validate_candidate_git_binding(
         observations = _git_observations(repo_root, runner, [])
         actual_head = observations.get("head_sha")
         actual_origin = observations.get("origin_main_sha")
+        actual_branch = observations.get("branch")
         binding.update({
             "repo_root": str(repo_root),
             "observed_head": actual_head,
             "observed_origin_main": actual_origin,
+            "observed_branch": actual_branch,
             "worktree_clean": observations.get("worktree_clean"),
             "ancestry_verified": observations.get("candidate_base_matches_origin_main") is True,
         })
@@ -3345,6 +3353,15 @@ def _validate_candidate_git_binding(
             failures.append("candidate HEAD does not match actual Git HEAD")
         if baseline is None or actual_origin is None or str(actual_origin).lower() != baseline.lower():
             failures.append("candidate main_baseline does not match origin/main")
+        declared_branch = candidate.get("branch")
+        if (
+            not isinstance(declared_branch, str)
+            or not declared_branch.strip()
+            or not isinstance(actual_branch, str)
+            or not actual_branch.strip()
+            or declared_branch != actual_branch
+        ):
+            failures.append("candidate branch does not match actual Git branch")
         if observations.get("worktree_clean") is not True:
             failures.append("candidate Git worktree is not clean")
         if observations.get("candidate_base_matches_origin_main") is not True:

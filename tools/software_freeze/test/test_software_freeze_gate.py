@@ -745,6 +745,41 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertTrue(any("ARTIFACT" not in item for item in assessed["blockers"]))
 
+    def test_explicit_input_manifest_binds_declared_branch_to_repository(self) -> None:
+        """A repository-backed audit must not trust an arbitrary branch label."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report()
+            manifest = self._minimal_input_manifest(root, report)
+            # The helper uses a deliberately generic branch for API-only
+            # manifests.  Once a repository is supplied, the declaration must
+            # agree with the branch observed by the read-only Git probes.
+            manifest["candidate"]["branch"] = "declared-branch"
+
+            def fake_runner(argv, **_kwargs):
+                command = tuple(str(item) for item in argv)
+                if command[:3] == ("git", "rev-parse", "HEAD"):
+                    return CommandResult(0, "a" * 40 + "\n")
+                if command[:3] == ("git", "branch", "--show-current"):
+                    return CommandResult(0, "observed-branch\n")
+                if command[:3] == ("git", "status", "--porcelain"):
+                    return CommandResult(0, "")
+                if command == ("git", "diff", "--check"):
+                    return CommandResult(0, "")
+                if command == ("git", "ls-remote", "origin", "refs/heads/main"):
+                    return CommandResult(0, "" + "b" * 40 + "\trefs/heads/main\n")
+                if command == ("git", "merge-base", "--is-ancestor", "b" * 40, "HEAD"):
+                    return CommandResult(0, "")
+                return CommandResult(127, "", "unexpected command")
+
+            assessed = build_input_manifest_report(
+                manifest, manifest_path=root / "inputs.json", repo_root=root, runner=fake_runner,
+            )
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("candidate branch does not match actual Git branch", assessed["blockers"])
+            self.assertEqual(assessed["git_binding"]["observed_branch"], "observed-branch")
+
     def test_explicit_input_manifest_rejects_contradictory_optional_liveness(self) -> None:
         """Optional E2E phase/equality fields remain fail-closed when present."""
 
@@ -931,6 +966,26 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             assessed = build_input_manifest_report(manifest)
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("artifact sha256 is required for a present artifact", assessed["artifacts"][0]["failure_reasons"])
+
+    def test_manifest_rejects_absence_status_on_present_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            artifact = root / "model.xml"
+            artifact.write_text("model", encoding="utf-8")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            manifest = self._minimal_input_manifest(root, self._safe_report())
+            manifest["artifacts"] = [{
+                "role": "model_xml",
+                "path": str(artifact),
+                "sha256": digest,
+                "absence_status": "NOT_VERIFIED",
+            }]
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "absence_status contradicts present artifact",
+                assessed["artifacts"][0]["failure_reasons"],
+            )
 
     def test_manifest_rejects_ctest_skip_and_bad_case_consistency(self) -> None:
         with tempfile.TemporaryDirectory() as parent:

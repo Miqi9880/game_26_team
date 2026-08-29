@@ -814,6 +814,9 @@ def _evidence_status(evidence: Mapping[str, Any]) -> tuple[str, list[str]]:
         item = errors[0]
         if not isinstance(item, Mapping) or str(item.get("code", "")).strip().lower() != EXPECTED_NEGATIVE_DIAGNOSTIC_CODE:
             return False
+        message = item.get("message")
+        if not isinstance(message, str) or "production_ready=true" not in message.lower():
+            return False
 
         # Warnings are optional in the live report because missing optional
         # hardware/model metadata is expected in a software-only run.  If a

@@ -792,6 +792,42 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["inputs"][0]["status"], "NOT_VERIFIED")
             self.assertIn("node_liveness evidence missing or contradictory", assessed["inputs"][0]["failure_reasons"])
 
+    def test_explicit_input_manifest_rejects_empty_inapplicable_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            ctest = root / "Test.xml"
+            ctest.write_text(
+                "<Site><Testing><Test Status=\"passed\"><Name>non_node_pass</Name></Test></Testing></Site>",
+                encoding="utf-8",
+            )
+            report = self._safe_report(
+                node_liveness={
+                    "alive_before_sampling": True,
+                    "alive_during_sampling": True,
+                    "alive_after_sampling": True,
+                    "expected_exit_code": 0,
+                    "observed_exit_code": 0,
+                    "exit_code_matches": True,
+                },
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{
+                    "name": "non_node_pass",
+                    "status": "PASS",
+                    "node_liveness_applicable": False,
+                    "node_liveness": {},
+                }],
+            )
+            manifest = self._minimal_input_manifest(
+                root, report, kind="ros_e2e", ctest_xml=str(ctest),
+            )
+            manifest["inputs"][0]["ctest_xml_sha256"] = hashlib.sha256(ctest.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
+            self.assertIn(
+                "node_liveness evidence missing or contradictory for case non_node_pass",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
     def _minimal_input_manifest(self, root: Path, report: dict, *, kind: str = "build", **declaration):
         report_path = root / f"{kind}.json"
         report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")

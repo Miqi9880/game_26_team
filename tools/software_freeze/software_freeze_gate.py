@@ -3192,15 +3192,27 @@ def _manifest_source_record(
                     and _manifest_number(case_liveness.get("expected_exit_code")) is not None
                     and _manifest_number(case_liveness.get("expected_exit_code")) >= 0
                 )
-                if not applicable and not isinstance(case_liveness, Mapping):
+                if not applicable:
                     # Non-node PASS cases (lifecycle, expected-failure, and
-                    # unavailable boundaries) still need the structured
-                    # sentinel emitted by the reporter. A bare false marker
-                    # or an omitted object would make malformed evidence look
-                    # like an intentional opt-out.
-                    reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
-                    unverified = True
-                elif applicable and not _valid_liveness(case_liveness):
+                    # unavailable boundaries) still need the complete
+                    # all-default sentinel emitted by the reporter. Merely
+                    # supplying an empty object would make malformed evidence
+                    # look like an intentional opt-out.
+                    sentinel_valid = (
+                        isinstance(case_liveness, Mapping)
+                        and case_liveness.get("alive_before_sampling") is False
+                        and case_liveness.get("alive_during_sampling") is False
+                        and case_liveness.get("alive_after_sampling") is False
+                        and _manifest_number(case_liveness.get("expected_exit_code")) == -1
+                        and _manifest_number(case_liveness.get("observed_exit_code")) == -1
+                        and case_liveness.get("exit_code_matches") is False
+                    )
+                    if not sentinel_valid:
+                        reasons.append(
+                            f"node_liveness evidence missing or contradictory for case {case_id}"
+                        )
+                        unverified = True
+                elif not _valid_liveness(case_liveness):
                     reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
                     unverified = True
 

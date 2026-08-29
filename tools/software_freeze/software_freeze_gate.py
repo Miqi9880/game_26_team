@@ -2736,7 +2736,9 @@ def _manifest_report_counts_and_cases(root: Mapping[str, Any]) -> tuple[dict[str
     return counts, normalized_cases, None
 
 
-def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | None:
+def _manifest_compare_ctest(
+    root: Mapping[str, Any], xml_path: Path, *, wrapper_kind: bool = False
+) -> str | None:
     counts, cases, report_error = _manifest_report_counts_and_cases(root)
     if counts is None or cases is None:
         return report_error
@@ -2764,8 +2766,15 @@ def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | No
     # admission and may accompany an otherwise PASS-shaped case matrix; it
     # must never be upgraded to PASS, but the XML/case bytes can still be
     # checked for structural consistency.
-    if str(raw_status).strip().upper() != "WARN" and aggregate != report_status:
-        return "report top-level status disagrees with counts/cases"
+    if str(raw_status).strip().upper() != "WARN":
+        if wrapper_kind and report_status == "PASS":
+            # Wrapper reports summarize the software runner.  Expected
+            # unavailable/not-run/not-verified sub-checks are allowed while
+            # PASS still requires that no case actually failed.
+            if any(item["status"] == "FAIL" for item in cases):
+                return "report top-level PASS hides failed wrapper case"
+        elif aggregate != report_status:
+            return "report top-level status disagrees with counts/cases"
     return None
 
 
@@ -3163,7 +3172,15 @@ def _manifest_source_record(
             elif normalized_cases is not None:
                 report_status, _ = _manifest_status_hint(root)
                 aggregate = _manifest_aggregate_status(item["status"] for item in normalized_cases)
-                if report_status is None or aggregate != report_status:
+                if report_status is None:
+                    reasons.append("report top-level status disagrees with counts/cases")
+                    fatal = True
+                elif report_status == "PASS" and any(
+                    item["status"] == "FAIL" for item in normalized_cases
+                ):
+                    reasons.append("report top-level PASS hides failed wrapper case")
+                    fatal = True
+                elif kind not in {"release_smoke", "ros_e2e", "ros_message_e2e"} and aggregate != report_status:
                     reasons.append("report top-level status disagrees with counts/cases")
                     fatal = True
         elif kind in {"ros_e2e", "ros_message_e2e"}:
@@ -3218,7 +3235,11 @@ def _manifest_source_record(
                     if source_xml_sha is not None and source_xml_sha != record["ctest_xml_sha256"]:
                         reasons.append("source ctest_xml_sha256 does not match CTest XML bytes")
                         fatal = True
-            ctest_failure = _manifest_compare_ctest(root, ctest_path)
+            ctest_failure = _manifest_compare_ctest(
+                root,
+                ctest_path,
+                wrapper_kind=kind in {"release_smoke", "ros_e2e", "ros_message_e2e"},
+            )
             if ctest_failure:
                 reasons.append(ctest_failure)
                 fatal = True

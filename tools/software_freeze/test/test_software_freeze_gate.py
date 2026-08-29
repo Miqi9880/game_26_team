@@ -1110,6 +1110,38 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("report case names disagree with CTest XML", assessed["inputs"][0]["failure_reasons"])
 
+    def test_wrapper_ctest_not_applicable_allows_unavailable_subchecks(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report(
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 1, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "smoke", "status": "PASS"}, {"name": "camera", "status": "UNAVAILABLE"}],
+            )
+            report_path = root / "wrapper.json"
+            report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+            manifest = self._minimal_input_manifest(root, report, kind="release_smoke")
+            manifest["inputs"][0]["ctest_not_applicable"] = True
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertNotEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertEqual(assessed["inputs"][0]["status"], "PASS")
+
+    def test_wrapper_ctest_not_applicable_rejects_failed_case_hidden_by_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report(
+                counts={"PASS": 1, "FAIL": 1, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "smoke", "status": "PASS"}, {"name": "bad", "status": "FAIL"}],
+            )
+            report_path = root / "wrapper.json"
+            report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+            manifest = self._minimal_input_manifest(root, report, kind="release_smoke")
+            manifest["inputs"][0]["ctest_not_applicable"] = True
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("report top-level PASS hides failed wrapper case", assessed["inputs"][0]["failure_reasons"])
+
     def test_manifest_ctest_xml_digest_cannot_be_self_attested_by_report(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)

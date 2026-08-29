@@ -2684,11 +2684,15 @@ def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | No
     xml_names = [str(item["name"]) for item in xml_records]
     if sorted(report_names) != sorted(xml_names):
         return "report case names disagree with CTest XML"
-    report_status, _ = _manifest_status_hint(root)
+    report_status, raw_status = _manifest_status_hint(root)
     aggregate = _manifest_aggregate_status(item["status"] for item in cases)
     if report_status is None:
         return "report status is missing or aliases conflict"
-    if aggregate != report_status:
+    # WARN is an explicit producer warning. It maps to NOT_VERIFIED for gate
+    # admission and may accompany an otherwise PASS-shaped case matrix; it
+    # must never be upgraded to PASS, but the XML/case bytes can still be
+    # checked for structural consistency.
+    if str(raw_status).strip().upper() != "WARN" and aggregate != report_status:
         return "report top-level status disagrees with counts/cases"
     return None
 
@@ -3115,7 +3119,27 @@ def _manifest_source_record(
         else:
             for index, case in enumerate(cases):
                 case_id = case.get("name", case.get("id", index)) if isinstance(case, Mapping) else index
-                if not isinstance(case, Mapping) or not _valid_liveness(case.get("node_liveness")):
+                if not isinstance(case, Mapping):
+                    reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
+                    unverified = True
+                    continue
+                marker = case.get("node_liveness_applicable")
+                if marker is not None and not isinstance(marker, bool):
+                    reasons.append(f"node_liveness_applicable is not boolean for case {case_id}")
+                    unverified = True
+                    continue
+                case_liveness = case.get("node_liveness")
+                # Lifecycle, expected-failure, and unavailable-boundary cases
+                # do not launch AutoAimNode.  Their reporter emits the
+                # default sentinel liveness object and explicitly marks the
+                # contract as inapplicable.  A node case is applicable when
+                # marked true, or when it carries a non-sentinel exit code.
+                applicable = marker if marker is not None else (
+                    isinstance(case_liveness, Mapping)
+                    and _manifest_number(case_liveness.get("expected_exit_code")) is not None
+                    and _manifest_number(case_liveness.get("expected_exit_code")) >= 0
+                )
+                if applicable and not _valid_liveness(case_liveness):
                     reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
                     unverified = True
 

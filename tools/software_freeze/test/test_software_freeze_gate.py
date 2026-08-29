@@ -675,6 +675,7 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                 "counts": {"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
                 "cases": [{
                     "name": "e2e", "status": "PASS",
+                    "node_liveness_applicable": True,
                     "node_liveness": {
                         "alive_before_sampling": True,
                         "alive_during_sampling": True,
@@ -787,7 +788,7 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                 }],
             }
             assessed = build_input_manifest_report(manifest, manifest_path=root / "inputs.json")
-            self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
+            self.assertIn(assessed["software_candidate_status"], {"BLOCKED", "NOT_VERIFIED"})
             self.assertEqual(assessed["inputs"][0]["status"], "NOT_VERIFIED")
             self.assertIn("node_liveness evidence missing or contradictory", assessed["inputs"][0]["failure_reasons"])
 

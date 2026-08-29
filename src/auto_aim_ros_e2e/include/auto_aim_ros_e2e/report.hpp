@@ -24,6 +24,20 @@ struct Artifact
   std::string sha256;
 };
 
+// Liveness evidence for the AutoAimNode process that is sampled by the
+// message-level runner.  All fields are intentionally fail-closed: a report
+// that does not establish each phase and an equal controlled-stop exit code
+// cannot be treated as a PASS by downstream release audits.
+struct NodeLiveness
+{
+  bool alive_before_sampling{false};
+  bool alive_during_sampling{false};
+  bool alive_after_sampling{false};
+  int expected_exit_code{-1};
+  int observed_exit_code{-1};
+  bool exit_code_matches{false};
+};
+
 struct CaseResult
 {
   std::size_t round{0U};
@@ -36,6 +50,11 @@ struct CaseResult
   std::string diagnostic;
   int node_exit_code{-1};
   int preflight_exit_code{-1};
+  // True only for cases that actually launch and sample AutoAimNode. Other
+  // lifecycle, expected-failure, and unavailable-boundary cases intentionally
+  // have no node liveness contract.
+  bool node_liveness_applicable{false};
+  NodeLiveness node_liveness{};
   std::string topics;
   std::string publishers;
   std::size_t control_messages{0U};
@@ -57,10 +76,12 @@ struct ReportMetadata
   std::string ros_domain_id;
   std::string seed;
   std::size_t rounds{0U};
+  NodeLiveness node_liveness{};
 };
 
 const char * status_name(Status status) noexcept;
 bool valid_git_sha(const std::string & value) noexcept;
+bool node_liveness_valid(const NodeLiveness & liveness) noexcept;
 std::string json_escape(const std::string & value);
 std::string sha256_file(const std::filesystem::path & path);
 std::string render_json(

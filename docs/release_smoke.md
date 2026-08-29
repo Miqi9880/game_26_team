@@ -47,10 +47,10 @@ Run from a clean feature worktree based on the actual current main SHA. The
 output root must not exist; reuse is rejected before any mutation.
 
 ```bash
-cd /home/ubuntu22/vision-study/game_26_issue_31
+cd /home/ubuntu22/vision-study/game_26_software_freeze
 source /opt/ros/humble/setup.bash
 
-BASELINE=9de02ae662dfecec02ad4701beb626996554935d
+BASELINE="$(git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')"
 OUTPUT=/tmp/game26-release-smoke-$(git rev-parse --short HEAD)
 
 bash src/auto_aim_release_smoke/scripts/run_release_smoke.sh \

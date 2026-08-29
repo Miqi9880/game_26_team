@@ -64,6 +64,25 @@ The full matrix repeats every runnable software case five times with seed
 Each case records its input summary, expected and actual state, diagnostic,
 node and preflight exit codes, topic/publisher observation, control count,
 safety fields, target-lock summary, cleanup result, and input/output SHA-256.
+The report also contains a suite-level `node_liveness` object (and the same
+evidence on each AutoAimNode case):
+
+| Field | Meaning |
+|---|---|
+| `alive_before_sampling` | AutoAimNode was observed alive after graph setup and before fixture sampling began |
+| `alive_during_sampling` | Every sampling heartbeat observed AutoAimNode alive; an early exit makes this false |
+| `alive_after_sampling` | AutoAimNode was still alive after the final sample/preflight observation, before controlled stop |
+| `expected_exit_code` | Expected normal exit from the generated rclcpp executable after SIGINT (`0`) |
+| `observed_exit_code` | Exit status recorded after the runner stopped and reaped AutoAimNode |
+| `exit_code_matches` | Explicit equality check for expected and observed exit status |
+
+Liveness is fail-closed: a missing phase observation, an AutoAimNode exit
+during sampling, an escalation exit (for example 130/137), or any expected /
+observed exit-code mismatch makes that case `FAIL` and prevents the suite
+report from claiming `PASS`. `release_manifest_audit` additionally requires
+the top-level `node_liveness.alive_during_sampling`, `expected_exit_code`, and
+`observed_exit_code` fields and rejects missing or contradictory evidence as
+`NOT_VERIFIED`.
 `PASS`, `FAIL`, `UNAVAILABLE`, `NOT_RUN`, and `NOT_VERIFIED` are distinct.
 
 ## Reproducible build and run
@@ -73,10 +92,10 @@ colcon, OpenCV, OpenSSL, yaml-cpp, and the dependencies declared by the ROS
 packages. The output root must not exist.
 
 ```bash
-cd /home/ubuntu22/vision-study/game_26_issue_33
+cd /home/ubuntu22/vision-study/game_26_software_freeze
 source /opt/ros/humble/setup.bash
 
-BASELINE=28dc6e0021f16fa6675235eaed5042c43d7b011f
+BASELINE="$(git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')"
 OUTPUT=/tmp/game26-issue33-$(git rev-parse --short HEAD)-$(date +%s)
 
 bash src/auto_aim_ros_e2e/scripts/run_ros_message_e2e.sh \

@@ -43,10 +43,15 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using auto_aim_ros_e2e::Artifact;
 using auto_aim_ros_e2e::CaseResult;
+using auto_aim_ros_e2e::NodeLiveness;
 using auto_aim_ros_e2e::Status;
 
 constexpr std::int8_t kTargetLocked = 49;
 constexpr std::int8_t kTargetUnlocked = 50;
+// rclcpp's generated component executable handles SIGINT by shutting down the
+// context and returning normally.  A signal/escalation exit is evidence that
+// the controlled stop contract was not met and is therefore fail-closed.
+constexpr int kExpectedNodeExitCode = 0;
 volatile std::sig_atomic_t caught_signal = 0;
 std::array<volatile std::sig_atomic_t, 8> active_process_groups{};
 
@@ -440,11 +445,14 @@ private:
 
 bool spin_until(
   const std::shared_ptr<FixtureProbe> & probe, const std::function<bool()> & predicate,
-  std::chrono::milliseconds timeout)
+  std::chrono::milliseconds timeout, const std::function<void()> & heartbeat = {})
 {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     rclcpp::spin_some(probe);
+    if (heartbeat) {
+      heartbeat();
+    }
     if (predicate()) {
       return true;
     }
@@ -452,6 +460,9 @@ bool spin_until(
       return false;
     }
     std::this_thread::sleep_for(10ms);
+  }
+  if (heartbeat) {
+    heartbeat();
   }
   return predicate();
 }
@@ -730,6 +741,20 @@ CaseResult run_message_case(
       preflight_executable, topics, preflight_name, case_dir / "preflight.json"),
     case_dir / "preflight.log");
 
+  NodeLiveness node_liveness;
+  node_liveness.expected_exit_code = kExpectedNodeExitCode;
+  // Establish the pre-sampling observation after both children have been
+  // launched and the ROS graph has had a chance to settle.  poll_process()
+  // reaps an early exit, so a dead AutoAimNode cannot be mistaken for a
+  // publisher/graph failure that still yields PASS.
+  const auto node_alive = [&]() {
+      return !poll_process(&node);
+    };
+  const auto sample_heartbeat = [&]() {
+      node_liveness.alive_during_sampling =
+        node_liveness.alive_during_sampling && node_alive();
+    };
+
   bool graph_ready = false;
   bool serial_fd = false;
   std::string serial_detail;
@@ -737,21 +762,26 @@ CaseResult run_message_case(
   bool phase_unlocked = false;
   try {
     graph_ready = spin_until(probe, [&]() {return probe->graph_ready(wrong_topic);}, 3500ms);
+    node_liveness.alive_before_sampling = node_alive();
+    node_liveness.alive_during_sampling = true;
     serial_fd = group_has_serial_fd(node.pid, &serial_detail);
     const auto publish_once = [&](std::int32_t sec, std::uint32_t nanosec) {
+        sample_heartbeat();
         auto image = valid_image(sec, nanosec, options.seed);
         std::optional<sensor_msgs::msg::CameraInfo> camera = valid_camera_info(sec, nanosec);
         mutate_fixture(spec.scenario, &image, &camera);
         probe->publish(image, camera, valid_vision(sec, nanosec));
         rclcpp::spin_some(probe);
+        sample_heartbeat();
       };
 
     if (spec.scenario == Scenario::NoInput || wrong_topic) {
-      spin_until(probe, []() {return false;}, 500ms);
+      spin_until(probe, []() {return false;}, 500ms, sample_heartbeat);
     } else if (spec.scenario == Scenario::TemporaryOcclusion) {
       for (int index = 0; index < 6; ++index) {
         publish_once(100 + index, 1U);
         std::this_thread::sleep_for(25ms);
+        sample_heartbeat();
       }
       spin_until(probe, [&]() {
         phase_locked = std::any_of(
@@ -761,15 +791,17 @@ CaseResult run_message_case(
         phase_unlocked = !probe->controls().empty() &&
           probe->controls().back().target_lock == kTargetUnlocked;
         return phase_locked && phase_unlocked;
-      }, 350ms);
+      }, 350ms, sample_heartbeat);
       for (int index = 0; index < 6; ++index) {
         publish_once(200 + index, 1U);
         std::this_thread::sleep_for(25ms);
+        sample_heartbeat();
       }
     } else if (spec.scenario == Scenario::ContinuousInterruption) {
       for (int index = 0; index < 6; ++index) {
         publish_once(100 + index, 1U);
         std::this_thread::sleep_for(25ms);
+        sample_heartbeat();
       }
       spin_until(probe, [&]() {
         phase_locked = std::any_of(
@@ -779,9 +811,10 @@ CaseResult run_message_case(
         phase_unlocked = !probe->controls().empty() &&
           probe->controls().back().target_lock == kTargetUnlocked;
         return phase_locked && phase_unlocked;
-      }, 400ms);
+      }, 400ms, sample_heartbeat);
     } else if (spec.scenario == Scenario::ReorderedValid) {
       for (int index = 0; index < 12; ++index) {
+        sample_heartbeat();
         const auto sec = 100 + index;
         const auto camera = valid_camera_info(sec, 1U);
         probe->publish_camera_info(camera);
@@ -789,6 +822,7 @@ CaseResult run_message_case(
         probe->publish_vision(valid_vision(sec, 1U));
         probe->publish_image(valid_image(sec, 1U, options.seed));
         rclcpp::spin_some(probe);
+        sample_heartbeat();
         std::this_thread::sleep_for(30ms);
       }
     } else {
@@ -801,12 +835,18 @@ CaseResult run_message_case(
         }
         publish_once(sec, 1U);
         std::this_thread::sleep_for(30ms);
+        sample_heartbeat();
       }
     }
-    spin_until(probe, [&]() {return !probe->controls().empty();}, 800ms);
+    spin_until(probe, [&]() {return !probe->controls().empty();}, 800ms, sample_heartbeat);
     if (!wait_process(&preflight, 2500ms)) {
       stop_process(&preflight);
     }
+    sample_heartbeat();
+    // This is the post-sampling observation.  It deliberately happens before
+    // the controlled stop below, so an AutoAimNode that exits during the
+    // final report/preflight window is still reported as a liveness failure.
+    node_liveness.alive_after_sampling = node_alive();
   } catch (...) {
     stop_process(&preflight);
     stop_process(&node);
@@ -828,6 +868,9 @@ CaseResult run_message_case(
   const bool preflight_cleanup = stop_process(&preflight);
   const bool node_cleanup = stop_process(&node);
   const bool cleanup_ok = preflight_cleanup && node_cleanup;
+  node_liveness.observed_exit_code = node.exit_code.value_or(-1);
+  node_liveness.exit_code_matches =
+    node_liveness.observed_exit_code == node_liveness.expected_exit_code;
   probe.reset();
 
   const auto preflight_report = read_text(case_dir / "preflight.json");
@@ -851,7 +894,8 @@ CaseResult run_message_case(
     publishers.find("preflight_control_publisher=false") != std::string::npos &&
     publishers.find("unremapped_control_publishers=0") != std::string::npos;
   const bool passed = graph_ready && !serial_fd && fields_safe && lock_ok &&
-    preflight_status_ok && publisher_ok && cleanup_ok;
+    preflight_status_ok && publisher_ok && cleanup_ok &&
+    auto_aim_ros_e2e::node_liveness_valid(node_liveness);
 
   CaseResult result;
   result.round = round;
@@ -867,8 +911,17 @@ CaseResult run_message_case(
   result.diagnostic = std::string("serial_fd=") + (serial_fd ? serial_detail : "none") +
     "; preflight_expectation=" + (preflight_status_ok ? "matched" : "mismatch") +
     "; publisher_contract=" + (publisher_ok ? "matched" : "mismatch");
+  result.diagnostic += std::string("; node_liveness=") +
+    (auto_aim_ros_e2e::node_liveness_valid(node_liveness) ? "valid" : "invalid") +
+    "; alive_before=" + (node_liveness.alive_before_sampling ? "true" : "false") +
+    "; alive_during=" + (node_liveness.alive_during_sampling ? "true" : "false") +
+    "; alive_after=" + (node_liveness.alive_after_sampling ? "true" : "false") +
+    "; expected_exit=" + std::to_string(node_liveness.expected_exit_code) +
+    "; observed_exit=" + std::to_string(node_liveness.observed_exit_code);
   result.node_exit_code = node.exit_code.value_or(-1);
   result.preflight_exit_code = preflight.exit_code.value_or(-1);
+  result.node_liveness_applicable = true;
+  result.node_liveness = node_liveness;
   result.topics = "image=" + topics.image + "; camera_info=" + topics.camera_info +
     "; vision=" + topics.vision + "; control=" + topics.control;
   result.publishers = publishers;
@@ -931,6 +984,7 @@ CaseResult run_expected_failure_case(
     "expected diagnostic missing";
   result.node_exit_code = process.exit_code.value_or(-1);
   result.preflight_exit_code = -1;
+  result.node_liveness_applicable = false;
   result.publishers = "startup failed before any approved control path was connected";
   result.control_messages = 0U;
   result.safety_fields_ok = true;
@@ -1016,6 +1070,7 @@ CaseResult run_lifecycle_case(
   result.diagnostic = cleanup_ok ? "process group fully reaped" : "residual process group";
   result.node_exit_code = -1;
   result.preflight_exit_code = exit_code;
+  result.node_liveness_applicable = false;
   result.publishers = "read-only preflight; no RobotCtrl publisher";
   result.control_messages = 0U;
   result.safety_fields_ok = true;
@@ -1040,6 +1095,7 @@ CaseResult unavailable_offline_case(
   result.id = "offline_reference_valid_artifacts";
   result.run_id = suite_run_id + "-r" + std::to_string(round) + "-offline-unavailable";
   result.status = Status::Unavailable;
+  result.node_liveness_applicable = false;
   result.input_summary = "Valid formal XML/BIN, model profile, and calibration were requested";
   result.expected = "Run only when reviewed artifacts are available";
   result.actual = "Repository intentionally contains no formal model/calibration bundle";
@@ -1377,14 +1433,16 @@ int run_suite(const Options & options)
     throw;
   }
 
-  std::map<std::string, std::tuple<Status, bool, bool>> signatures;
+  std::map<std::string, std::tuple<Status, bool, bool, bool, int, int>> signatures;
   std::map<std::string, bool> deterministic;
   for (const auto & result : results) {
     if (result.rerun) {
       continue;
     }
     const auto signature = std::make_tuple(
-      result.status, result.safety_fields_ok, result.cleanup_ok);
+      result.status, result.safety_fields_ok, result.cleanup_ok,
+      auto_aim_ros_e2e::node_liveness_valid(result.node_liveness),
+      result.node_liveness.expected_exit_code, result.node_liveness.observed_exit_code);
     const auto inserted = signatures.emplace(result.id, signature);
     if (!inserted.second && inserted.first->second != signature) {
       deterministic[result.id] = false;
@@ -1440,6 +1498,44 @@ int run_suite(const Options & options)
     results.push_back(std::move(result));
   }
 
+  // Fold every message-case observation into one suite-level evidence object.
+  // Cases that do not launch AutoAimNode (lifecycle, expected startup failures,
+  // and explicit hardware boundaries) intentionally carry an unset expected
+  // exit code and are not part of this aggregate.  A single early exit,
+  // missing phase observation, or exit-code mismatch therefore remains visible
+  // and prevents the report from being rendered as PASS.
+  NodeLiveness suite_node_liveness;
+  bool suite_liveness_seen = false;
+  bool exit_mismatch_seen = false;
+  for (const auto & result : results) {
+    if (result.node_liveness.expected_exit_code < 0) {
+      continue;
+    }
+    if (!suite_liveness_seen) {
+      suite_node_liveness = result.node_liveness;
+      suite_liveness_seen = true;
+      exit_mismatch_seen = !result.node_liveness.exit_code_matches;
+      continue;
+    }
+    suite_node_liveness.alive_before_sampling =
+      suite_node_liveness.alive_before_sampling && result.node_liveness.alive_before_sampling;
+    suite_node_liveness.alive_during_sampling =
+      suite_node_liveness.alive_during_sampling && result.node_liveness.alive_during_sampling;
+    suite_node_liveness.alive_after_sampling =
+      suite_node_liveness.alive_after_sampling && result.node_liveness.alive_after_sampling;
+    const bool same_exit =
+      suite_node_liveness.expected_exit_code == result.node_liveness.expected_exit_code &&
+      suite_node_liveness.observed_exit_code == result.node_liveness.observed_exit_code;
+    if (!same_exit && !exit_mismatch_seen) {
+      // Preserve the first contradictory observation as the report's actual
+      // value while the boolean below records that the aggregate is invalid.
+      suite_node_liveness.observed_exit_code = result.node_liveness.observed_exit_code;
+      exit_mismatch_seen = true;
+    }
+    suite_node_liveness.exit_code_matches =
+      suite_node_liveness.exit_code_matches && result.node_liveness.exit_code_matches && same_exit;
+  }
+
   std::vector<Artifact> artifacts;
   std::error_code error;
   for (const auto & entry : fs::recursive_directory_iterator(options.output_dir, error)) {
@@ -1452,7 +1548,7 @@ int run_suite(const Options & options)
     });
   const auto metadata = auto_aim_ros_e2e::ReportMetadata{
     options.baseline, options.commit, suite_run_id, environment_description(),
-    domain, std::to_string(options.seed), options.rounds};
+    domain, std::to_string(options.seed), options.rounds, suite_node_liveness};
   const auto json_path = options.output_dir / "ros-message-e2e-report.json";
   const auto markdown_path = options.output_dir / "ros-message-e2e-report.md";
   auto_aim_ros_e2e::write_new_file(

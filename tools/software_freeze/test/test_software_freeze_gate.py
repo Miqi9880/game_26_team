@@ -115,7 +115,27 @@ def passing_observations() -> dict:
             "openvino_python": {"status": "UNAVAILABLE", "reason": "test fixture has no runtime"},
         },
         "camera_preflight": {"status": "NOT_VERIFIED", "reason": "fixture has no camera"},
-        "evidence": {"status": "PASS", "production_claim_rejected": True, "claims": {"production_ready": False}},
+        # The live evidence contract deliberately includes a normal PASS
+        # report and a separately persisted evidence-only bundle that FAILs
+        # for the injected production claim.  A bare boolean is not enough to
+        # satisfy the freeze gate.
+        "evidence": {
+            "status": "PASS",
+            "report_status": "PASS",
+            "bundle_status": "FAIL",
+            "bundle_report_status": "FAIL",
+            "bundle_exit_code": 1,
+            "bundle_claim_rejection_signal": True,
+            "production_claim_rejected": True,
+            "bundle_diagnostics": {
+                "errors": [{
+                    "code": "calibration_promotion",
+                    "message": "evidence_only calibration claims production_ready=true",
+                }],
+                "warnings": [{"code": "missing_optional_artifact"}],
+            },
+            "claims": {"production_ready": True},
+        },
         "ros_safety": {
             "rounds": [
                 {"status": "PASS", "motion_nonzero": False, **SAFE_DEFAULTS.copy()}
@@ -614,6 +634,33 @@ class SoftwareFreezeGateTests(unittest.TestCase):
         observations["evidence"] = {"status": "PASS", "production_claim_rejected": True, "claims": {"fire_command": 2}}
         report = build_report(observations)
         self.assertIn("EVIDENCE_BOUNDARY_FAILED", report["blockers"])
+
+    def test_live_evidence_bare_claim_rejection_is_not_admissible(self) -> None:
+        observations = passing_observations()
+        observations["evidence"] = {
+            "status": "PASS",
+            "production_claim_rejected": True,
+        }
+        report = build_report(observations)
+        self.assertEqual(report["software_candidate_status"], "BLOCKED")
+        self.assertIn("EVIDENCE_BOUNDARY_FAILED", report["blockers"])
+        self.assertTrue(any(
+            "complete negative bundle contract" in failure
+            for failure in report["observations"]["evidence"]["failures"]
+        ))
+
+    def test_live_evidence_rejection_requires_exact_bundle_diagnostic(self) -> None:
+        for mutate in (
+            lambda evidence: evidence["bundle_diagnostics"]["errors"].append({"code": "other_failure"}),
+            lambda evidence: evidence["bundle_diagnostics"].update({"diagnostic": "other_failure"}),
+            lambda evidence: evidence.update({"diagnostics": {"errors": [{"code": "other_failure"}]}}),
+            lambda evidence: evidence.update({"bundle_report_status": "PASS"}),
+        ):
+            observations = passing_observations()
+            mutate(observations["evidence"])
+            report = build_report(observations)
+            self.assertEqual(report["software_candidate_status"], "BLOCKED")
+            self.assertIn("EVIDENCE_BOUNDARY_FAILED", report["blockers"])
 
     def test_malformed_claim_rejection_diagnostics_cannot_exempt_claim(self) -> None:
         observations = passing_observations()
@@ -1355,6 +1402,73 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertTrue(any(
                 "must be a positive integer exit code" in reason
+                for reason in assessed["inputs"][0]["failure_reasons"]
+            ))
+
+            report = make_report()
+            manifest = make_manifest(report)
+            manifest["inputs"][0]["expected_diagnostic_code"] = "other_failure"
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertTrue(any(
+                "expected_diagnostic_code must be calibration_promotion" in reason
+                for reason in assessed["inputs"][0]["failure_reasons"]
+            ))
+
+            report = make_report(fixture="fixture-data")
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "negative evidence fixture must be an object",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
+            report = make_report()
+            report["bundle_diagnostics"] = {
+                "errors": [{"code": "calibration_promotion"}],
+                "warnings": [],
+            }
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "negative evidence diagnostics aliases disagree",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
+    def test_manifest_required_hardware_status_is_not_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            for status in ("NOT_VERIFIED", "UNAVAILABLE", "NOT_RUN"):
+                report = self._safe_report(status=status)
+                manifest = self._minimal_input_manifest(root, report, kind="camera")
+                assessed = build_input_manifest_report(manifest)
+                self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
+                self.assertIn("camera", assessed["not_verified"])
+
+    def test_manifest_missing_required_software_kind_is_not_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            manifest = self._minimal_input_manifest(root, self._safe_report(), kind="build")
+            manifest["required_kinds"] = ["build", "release_smoke"]
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
+            self.assertIn("missing:release_smoke", assessed["not_verified"])
+
+    def test_manifest_rejects_invalid_utf8_source(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report()
+            manifest = self._minimal_input_manifest(root, report, kind="build")
+            source_path = Path(manifest["inputs"][0]["path"])
+            payload = source_path.read_bytes() + b"\xff"
+            source_path.write_bytes(payload)
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(payload).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertTrue(any(
+                "codec" in reason.lower() or "utf" in reason.lower()
                 for reason in assessed["inputs"][0]["failure_reasons"]
             ))
 

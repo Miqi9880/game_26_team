@@ -2680,10 +2680,13 @@ def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | No
         xml_counts[item["status"]] += 1
     if counts != xml_counts:
         return "report counts disagree with CTest XML"
-    report_names = [str(item["name"]) for item in cases]
-    xml_names = [str(item["name"]) for item in xml_records]
-    if sorted(report_names) != sorted(xml_names):
+    report_by_name = {str(item["name"]): str(item["status"]) for item in cases}
+    xml_by_name = {str(item["name"]): str(item["status"]) for item in xml_records}
+    if set(report_by_name) != set(xml_by_name):
         return "report case names disagree with CTest XML"
+    for name in sorted(report_by_name):
+        if report_by_name[name] != xml_by_name[name]:
+            return f"report case status disagrees with CTest XML for {name}"
     report_status, raw_status = _manifest_status_hint(root)
     aggregate = _manifest_aggregate_status(item["status"] for item in cases)
     if report_status is None:

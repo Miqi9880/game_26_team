@@ -54,10 +54,13 @@ For a final freeze, prefer the explicit-input mode. Create a JSON file (schema
   },
   "required_kinds": ["release_smoke", "ros_e2e", "scenario_benchmark"],
   "inputs": [
-    {"id": "release-smoke", "kind": "release_smoke", "path": "/abs/smoke-report.json"},
-    {"id": "ros-e2e", "kind": "ros_e2e", "path": "/abs/ros-message-e2e-report.json"},
+    {"id": "release-smoke", "kind": "release_smoke", "path": "/abs/smoke-report.json",
+     "sha256": "<64-hex-sha256>"},
+    {"id": "ros-e2e", "kind": "ros_e2e", "path": "/abs/ros-message-e2e-report.json",
+     "sha256": "<64-hex-sha256>"},
     {"id": "scenario", "kind": "scenario_benchmark", "path": "/abs/summary.json",
-     "ctest_xml": "/abs/Testing/TAG/Test.xml"}
+     "sha256": "<64-hex-sha256>", "ctest_xml": "/abs/Testing/TAG/Test.xml",
+     "ctest_xml_sha256": "<64-hex-sha256>"}
   ],
   "artifacts": [
     {"role": "model_xml", "path": "/abs/model.xml", "absence_status": "NOT_VERIFIED"},
@@ -79,12 +82,26 @@ python3 tools/software_freeze/software_freeze_gate.py \
 ```
 
 Every declared input and artifact is recorded with its resolved path, byte
-size, SHA-256, schema, status, and failure reason. Missing paths are accepted
+size, SHA-256, schema, status, and failure reason. Every present input and
+artifact must declare the expected SHA-256; a missing declaration is a
+validation failure. Missing paths are accepted
 only with an explicit `absence_status` of `UNAVAILABLE`, `NOT_RUN`, or
 `NOT_VERIFIED`; the tool never searches a directory or substitutes a file
-whose name happens to match. CTest XML totals/cases, candidate and baseline
+whose name happens to match. CTest XML totals, per-case names/statuses,
+candidate and baseline
 SHA references, model XML/BIN/profile, PnP, calibration-manifest hashes,
 ROS-E2E `node_liveness`, and safe control fields are compared fail-closed.
+`skip_ctest` is not an accepted bypass. If a producer has CTest-shaped
+`counts`/`cases`, the corresponding XML (and its byte SHA-256) must be named
+explicitly and agree case-by-case.
+
+负向 evidence 只能通过显式、可复核的拒绝契约计入软件准入：输入声明必须同时
+给出 `negative_test=true`、`expected_failure=true`、固定的
+`expected_diagnostic_code="calibration_promotion"`、非零
+`expected_exit_code` 和 `fixture_sha256`。来源 JSON 必须声明同一个 fixture hash、
+实际非零退出码、`production_claim_rejected=true`、所有状态别名均为 `FAIL`，并且
+diagnostics 只能包含一个同码错误且没有额外 warning；任何缺字段、额外错误或
+真实软件失败仍为 `BLOCKED`。
 
 ## Safety and evidence boundary
 
@@ -115,4 +132,6 @@ python3 -m unittest discover \
 python3 -m py_compile tools/software_freeze/software_freeze_gate.py
 ```
 
-Only the four files in this task are in scope. Revert the submitted feature commit with `git revert <commit-sha>`; do not use reset, checkout, or clean.
+本次受限 diff 只覆盖冻结门禁、ROS E2E liveness、发布审计及对应文档/测试；未改动
+核心算法、协议、真实串口或硬件路径。回退提交使用 `git revert <commit-sha>`；不要使用
+reset、checkout 或 clean。

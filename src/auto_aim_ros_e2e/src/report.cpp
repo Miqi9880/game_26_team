@@ -37,15 +37,12 @@ bool report_passes(
     results.begin(), results.end(), [](const CaseResult & result) {
       // Lifecycle, expected-failure, and hardware-boundary records do not
       // launch AutoAimNode and intentionally keep every liveness field at its
-      // default value. Any case that carries even partial liveness evidence
-      // must carry a complete, fail-closed record of its own; otherwise a
-      // malformed expected-exit field could silently bypass this check.
-      const auto & liveness = result.node_liveness;
-      const bool has_liveness_evidence =
-        liveness.alive_before_sampling || liveness.alive_during_sampling ||
-        liveness.alive_after_sampling || liveness.expected_exit_code != -1 ||
-        liveness.observed_exit_code != -1 || liveness.exit_code_matches;
-      return !has_liveness_evidence || node_liveness_valid(liveness);
+      // default value. An applicable case, however, must carry a complete,
+      // valid record; the all-default value is not an acceptable "no
+      // evidence" value because it would let a launched node bypass the
+      // liveness gate.
+      if (!result.node_liveness_applicable) return true;
+      return node_liveness_valid(result.node_liveness);
     });
   return !any_failure(results) && case_liveness_valid &&
          node_liveness_valid(metadata.node_liveness);
@@ -92,7 +89,8 @@ bool valid_git_sha(const std::string & value) noexcept
 bool node_liveness_valid(const NodeLiveness & liveness) noexcept
 {
   return liveness.alive_before_sampling && liveness.alive_during_sampling &&
-         liveness.alive_after_sampling && liveness.expected_exit_code >= 0 &&
+         liveness.alive_after_sampling && liveness.expected_exit_code == 0 &&
+         liveness.observed_exit_code == 0 &&
          liveness.observed_exit_code == liveness.expected_exit_code &&
          liveness.exit_code_matches;
 }
@@ -253,6 +251,8 @@ std::string render_json(
       << ", \"observed_exit_code\": " << item.node_liveness.observed_exit_code
       << ", \"exit_code_matches\": "
       << (item.node_liveness.exit_code_matches ? "true" : "false") << "}"
+      << ", \"node_liveness_applicable\": "
+      << (item.node_liveness_applicable ? "true" : "false")
       << ", \"topics\": \"" << json_escape(item.topics) << "\", \"publishers\": \""
       << json_escape(item.publishers) << "\", \"control_messages\": "
       << item.control_messages << ", \"safety_fields_ok\": "

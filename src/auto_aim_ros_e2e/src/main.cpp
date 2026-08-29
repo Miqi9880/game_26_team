@@ -920,6 +920,7 @@ CaseResult run_message_case(
     "; observed_exit=" + std::to_string(node_liveness.observed_exit_code);
   result.node_exit_code = node.exit_code.value_or(-1);
   result.preflight_exit_code = preflight.exit_code.value_or(-1);
+  result.node_liveness_applicable = true;
   result.node_liveness = node_liveness;
   result.topics = "image=" + topics.image + "; camera_info=" + topics.camera_info +
     "; vision=" + topics.vision + "; control=" + topics.control;
@@ -983,6 +984,7 @@ CaseResult run_expected_failure_case(
     "expected diagnostic missing";
   result.node_exit_code = process.exit_code.value_or(-1);
   result.preflight_exit_code = -1;
+  result.node_liveness_applicable = false;
   result.publishers = "startup failed before any approved control path was connected";
   result.control_messages = 0U;
   result.safety_fields_ok = true;
@@ -1068,6 +1070,7 @@ CaseResult run_lifecycle_case(
   result.diagnostic = cleanup_ok ? "process group fully reaped" : "residual process group";
   result.node_exit_code = -1;
   result.preflight_exit_code = exit_code;
+  result.node_liveness_applicable = false;
   result.publishers = "read-only preflight; no RobotCtrl publisher";
   result.control_messages = 0U;
   result.safety_fields_ok = true;
@@ -1092,6 +1095,7 @@ CaseResult unavailable_offline_case(
   result.id = "offline_reference_valid_artifacts";
   result.run_id = suite_run_id + "-r" + std::to_string(round) + "-offline-unavailable";
   result.status = Status::Unavailable;
+  result.node_liveness_applicable = false;
   result.input_summary = "Valid formal XML/BIN, model profile, and calibration were requested";
   result.expected = "Run only when reviewed artifacts are available";
   result.actual = "Repository intentionally contains no formal model/calibration bundle";

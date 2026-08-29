@@ -50,6 +50,10 @@ struct CaseResult
   std::string diagnostic;
   int node_exit_code{-1};
   int preflight_exit_code{-1};
+  // True only for cases that actually launch and sample AutoAimNode. Other
+  // lifecycle, expected-failure, and unavailable-boundary cases intentionally
+  // have no node liveness contract.
+  bool node_liveness_applicable{false};
   NodeLiveness node_liveness{};
   std::string topics;
   std::string publishers;

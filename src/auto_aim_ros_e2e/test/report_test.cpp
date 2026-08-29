@@ -46,6 +46,14 @@ TEST(Report, NodeLivenessIsFailClosed)
   mismatched_exit.exit_code_matches = false;
   EXPECT_FALSE(auto_aim_ros_e2e::node_liveness_valid(mismatched_exit));
 
+  for (const auto exit_code : {-1, 130, 137}) {
+    auto escalated = normal_liveness();
+    escalated.expected_exit_code = exit_code;
+    escalated.observed_exit_code = exit_code;
+    escalated.exit_code_matches = true;
+    EXPECT_FALSE(auto_aim_ros_e2e::node_liveness_valid(escalated));
+  }
+
   EXPECT_TRUE(auto_aim_ros_e2e::node_liveness_valid(normal_liveness()));
 }
 
@@ -66,7 +74,22 @@ TEST(Report, MissingCaseNodeLivenessCannotRenderPass)
 {
   auto_aim_ros_e2e::CaseResult result;
   result.status = auto_aim_ros_e2e::Status::Pass;
+  result.node_liveness_applicable = true;
   result.node_liveness.expected_exit_code = 0;
+  auto metadata = auto_aim_ros_e2e::ReportMetadata{
+    std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
+  metadata.node_liveness = normal_liveness();
+  const auto json = auto_aim_ros_e2e::render_json(metadata, {result}, {});
+  EXPECT_NE(json.find("\"status\": \"FAIL\""), std::string::npos);
+}
+
+TEST(Report, AllDefaultApplicableCaseLivenessCannotRenderPass)
+{
+  auto result = auto_aim_ros_e2e::CaseResult{};
+  result.status = auto_aim_ros_e2e::Status::Pass;
+  result.node_liveness_applicable = true;
+  // Leave every liveness field at its fail-closed default.  An applicable
+  // case must not pass merely because it has no evidence fields.
   auto metadata = auto_aim_ros_e2e::ReportMetadata{
     std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
   metadata.node_liveness = normal_liveness();
@@ -78,6 +101,7 @@ TEST(Report, PartialCaseNodeLivenessCannotRenderPass)
 {
   auto_aim_ros_e2e::CaseResult result;
   result.status = auto_aim_ros_e2e::Status::Pass;
+  result.node_liveness_applicable = true;
   result.node_liveness.observed_exit_code = 0;
   auto metadata = auto_aim_ros_e2e::ReportMetadata{
     std::string(40U, 'a'), std::string(40U, 'b'), "suite-run", "test", "133", "260033", 1U};
@@ -99,6 +123,7 @@ TEST(Report, RenderersPreserveDetailedSafetyEvidence)
   result.diagnostic = "adapter rejected input";
   result.node_exit_code = 130;
   result.preflight_exit_code = 2;
+  result.node_liveness_applicable = true;
   result.control_messages = 4U;
   result.safety_fields_ok = true;
   result.target_lock = "locked=0; unlocked=4";

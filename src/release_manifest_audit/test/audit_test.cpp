@@ -5,7 +5,10 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
+
+#include <openssl/evp.h>
 
 namespace
 {
@@ -43,19 +46,53 @@ protected:
 constexpr const char * kHead = "1111111111111111111111111111111111111111";
 constexpr const char * kBase = "2222222222222222222222222222222222222222";
 
+std::string sha256_file(const fs::path & path)
+{
+  std::ifstream input(path, std::ios::binary);
+  if (!input.good()) return {};
+  EVP_MD_CTX * context = EVP_MD_CTX_new();
+  EXPECT_NE(context, nullptr);
+  if (context == nullptr || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1) {
+    if (context != nullptr) EVP_MD_CTX_free(context);
+    return {};
+  }
+  char buffer[4096];
+  while (input) {
+    input.read(buffer, sizeof(buffer));
+    const auto count = input.gcount();
+    if (count > 0) EXPECT_EQ(EVP_DigestUpdate(context, buffer, static_cast<std::size_t>(count)), 1);
+  }
+  unsigned char digest[EVP_MAX_MD_SIZE]{};
+  unsigned size = 0U;
+  if (EVP_DigestFinal_ex(context, digest, &size) != 1) {
+    EVP_MD_CTX_free(context);
+    return {};
+  }
+  EVP_MD_CTX_free(context);
+  std::ostringstream output;
+  output << std::hex << std::setfill('0');
+  for (unsigned i = 0; i < size; ++i) output << std::setw(2) << static_cast<unsigned>(digest[i]);
+  return output.str();
+}
+
 std::string config(const std::string & source)
 {
+  const auto digest = sha256_file(source);
+  const auto ctest = fs::path(source).parent_path() / "ctest.xml";
+  const auto digest_field = digest.empty() ? std::string{} : std::string("\",\"sha256\":\"") + digest;
+  const auto ctest_digest_field = sha256_file(ctest);
+  const auto ctest_field = ctest_digest_field.empty() ? std::string{} : std::string("\",\"ctest_xml_sha256\":\"") + ctest_digest_field;
   return std::string("{\"schema_version\":1,\"candidate\":{\"head\":\"") + kHead +
     "\",\"main_baseline\":\"" + kBase +
-    "\",\"branch\":\"fixture\",\"worktree_clean\":true},\"sources\":[{\"id\":\"smoke\",\"kind\":\"release_smoke\",\"path\":\"" + source + "\",\"ctest_xml\":\"" +
-    (fs::path(source).parent_path() / "ctest.xml").string() + "\"}]}";
+    "\",\"branch\":\"fixture\",\"worktree_clean\":true},\"sources\":[{\"id\":\"smoke\",\"kind\":\"release_smoke\",\"path\":\"" + source + digest_field + "\",\"ctest_xml\":\"" +
+    (fs::path(source).parent_path() / "ctest.xml").string() + ctest_field + "\"}]}";
 }
 
 std::string safe_report(const std::string & status = "PASS")
 {
   return std::string("{\"schema_version\":1,\"status\":\"") + status +
     "\",\"commit\":\"" + kHead + "\",\"baseline_main\":\"" + kBase +
-    "\",\"safety_defaults\":{\"serial_enabled\":false,\"dry_run\":true,\"allow_fire\":false,\"fire_command\":0,\"yaw_vel\":0,\"pitch_vel\":0,\"yaw_acc\":0,\"pitch_acc\":0},\"counts\":{\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0,\"NOT_VERIFIED\":0},\"cases\":[{\"status\":\"PASS\"}]}";
+    "\",\"safety_defaults\":{\"serial_enabled\":false,\"dry_run\":true,\"allow_fire\":false,\"fire_command\":0,\"yaw_vel\":0,\"pitch_vel\":0,\"yaw_acc\":0,\"pitch_acc\":0},\"counts\":{\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0,\"NOT_VERIFIED\":0},\"cases\":[{\"name\":\"audit_test\",\"status\":\"PASS\"}]}";
 }
 
 TEST_F(AuditTest, ValidSourceProducesDeterministicPassManifest)
@@ -92,9 +129,10 @@ TEST_F(AuditTest, HashAndStatisticsMismatchFailClosed)
 {
   write(root_ / "smoke.json", safe_report());
   auto invalid_hash = config((root_ / "smoke.json").string());
-  const auto source_end = invalid_hash.rfind("}]}");
-  ASSERT_NE(source_end, std::string::npos);
-  invalid_hash.insert(source_end, ",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"");
+  const auto source_hash = invalid_hash.find("\"sha256\":\"");
+  ASSERT_NE(source_hash, std::string::npos);
+  invalid_hash.replace(source_hash + std::string("\"sha256\":\"").size(), 64,
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   EXPECT_EQ(execute(invalid_hash), 1);
   auto mismatch = safe_report(); mismatch.replace(mismatch.find("\"PASS\":1"), 8, "\"PASS\":2"); write(root_ / "counts.json", mismatch);
   EXPECT_EQ(execute(config((root_ / "counts.json").string()), "counts"), 1);
@@ -175,8 +213,9 @@ TEST_F(AuditTest, StandardCTestTestListAndResultStatusesAreParsed)
   const std::string old_counts = "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0";
   report.replace(report.find(old_counts), old_counts.size(),
     "\"PASS\":1,\"FAIL\":1,\"UNAVAILABLE\":0,\"NOT_RUN\":1");
-  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19,
-    "[{\"status\":\"PASS\"},{\"status\":\"FAIL\"},{\"status\":\"NOT_RUN\"}]");
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  report.replace(report.find(old_case), old_case.size(),
+    "[{\"name\":\"pass\",\"status\":\"PASS\"},{\"name\":\"fail\",\"status\":\"FAIL\"},{\"name\":\"notrun\",\"status\":\"NOT_RUN\"}]");
   write(root_ / "mixed.json", report);
   write(root_ / "ctest.xml",
     "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./pass</Test><Test>./fail</Test>"
@@ -204,7 +243,8 @@ TEST_F(AuditTest, TopLevelPassContradictingFailedCaseFailsClosed)
   auto report = safe_report("PASS");
   const std::string old_counts = "\"PASS\":1,\"FAIL\":0";
   report.replace(report.find(old_counts), old_counts.size(), "\"PASS\":0,\"FAIL\":1");
-  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19, "[{\"status\":\"FAIL\"}]");
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  report.replace(report.find(old_case), old_case.size(), "[{\"name\":\"failed_test\",\"status\":\"FAIL\"}]");
   write(root_ / "contradiction.json", report);
   write(root_ / "ctest.xml",
     "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./failed_test</Test></TestList>"
@@ -220,7 +260,8 @@ TEST_F(AuditTest, TopLevelWarnCannotHideFailedCase)
   auto report = safe_report("WARN");
   const std::string old_counts = "\"PASS\":1,\"FAIL\":0";
   report.replace(report.find(old_counts), old_counts.size(), "\"PASS\":0,\"FAIL\":1");
-  report.replace(report.find("[{\"status\":\"PASS\"}]"), 19, "[{\"status\":\"FAIL\"}]");
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  report.replace(report.find(old_case), old_case.size(), "[{\"name\":\"failed_test\",\"status\":\"FAIL\"}]");
   write(root_ / "warn-contradiction.json", report);
   write(root_ / "ctest.xml",
     "<?xml version=\"1.0\"?><Site><Testing><TestList><Test>./failed_test</Test></TestList>"
@@ -236,6 +277,178 @@ TEST_F(AuditTest, DeclaredCTestXmlRequiresCountsAndCases)
   report.erase(counts, report.rfind('}') - counts);
   write(root_ / "no-statistics.json", report);
   EXPECT_EQ(execute(config((root_ / "no-statistics.json").string()), "ctest_without_statistics"), 1);
+}
+
+TEST_F(AuditTest, UnknownKindAndHardwarePassAreRejected)
+{
+  write(root_ / "smoke.json", safe_report());
+  auto unknown = config((root_ / "smoke.json").string());
+  unknown.replace(unknown.find("release_smoke"), 13, "unknown_kind");
+  EXPECT_EQ(execute(unknown, "unknown_kind"), 1);
+  auto hardware = config((root_ / "smoke.json").string());
+  hardware.replace(hardware.find("release_smoke"), 13, "hardware");
+  EXPECT_EQ(execute(hardware, "hardware_pass"), 1);
+}
+
+TEST_F(AuditTest, DuplicateStatusAliasAndCTestCaseFailClosed)
+{
+  auto report = safe_report();
+  report.insert(report.find("{\"schema_version\":1") + 1, "\"overall_status\":\"FAIL\",");
+  write(root_ / "aliases.json", report);
+  EXPECT_EQ(execute(config((root_ / "aliases.json").string()), "aliases"), 1);
+  auto mismatch = config((root_ / "aliases.json").string());
+  write(root_ / "valid.json", safe_report());
+  mismatch.replace(mismatch.find("aliases.json"), std::string("aliases.json").size(), "valid.json");
+  write(root_ / "ctest.xml", "<Site><Testing><Test Status=\"passed\"><Name>one</Name></Test><Test Status=\"failed\"><Name>one</Name></Test></Testing></Site>");
+  EXPECT_EQ(execute(mismatch, "duplicate_ctest"), 1);
+}
+
+TEST_F(AuditTest, EveryStatusAliasMustAgree)
+{
+  auto report = safe_report();
+  report.insert(report.find("{\"schema_version\":1") + 1, "\"report_status\":\"FAIL\",");
+  write(root_ / "status_alias.json", report);
+  EXPECT_EQ(execute(config((root_ / "status_alias.json").string()), "status_alias"), 1);
+  const auto manifest = read(root_ / "status_alias" / "release-manifest.json");
+  EXPECT_NE(manifest.find("status aliases disagree"), std::string::npos);
+}
+
+TEST_F(AuditTest, CTestXmlDigestMustBeDeclaredByConfiguration)
+{
+  auto report = safe_report();
+  const auto xml_digest = sha256_file(root_ / "ctest.xml");
+  report.insert(report.rfind('}'), ",\"ctest_xml_sha256\":\"" + xml_digest + "\"");
+  write(root_ / "root_digest_only.json", report);
+  auto value = config((root_ / "root_digest_only.json").string());
+  const auto marker = value.find(",\"ctest_xml_sha256\":\"");
+  ASSERT_NE(marker, std::string::npos);
+  const auto end_quote = value.find('"', marker + std::string(",\"ctest_xml_sha256\":\"").size());
+  ASSERT_NE(end_quote, std::string::npos);
+  value.erase(marker, end_quote - marker + 1U);
+  EXPECT_EQ(execute(value, "missing_ctest_digest"), 1);
+  const auto manifest = read(root_ / "missing_ctest_digest" / "release-manifest.json");
+  EXPECT_NE(manifest.find("ctest_xml_sha256 is required when ctest_xml is declared"), std::string::npos);
+}
+
+TEST_F(AuditTest, SkipCTestIsNeverAnAdmissionBypass)
+{
+  write(root_ / "skip_config.json", safe_report());
+  auto value = config((root_ / "skip_config.json").string());
+  value.insert(value.rfind("}]"), ",\"skip_ctest\":true");
+  EXPECT_EQ(execute(value, "skip_config"), 1);
+
+  auto report = safe_report();
+  report.insert(report.rfind('}'), ",\"skip_ctest\":true");
+  write(root_ / "skip_report.json", report);
+  EXPECT_EQ(execute(config((root_ / "skip_report.json").string()), "skip_report"), 1);
+}
+
+TEST_F(AuditTest, CountsRejectUnknownStatusKeys)
+{
+  auto report = safe_report();
+  report.replace(report.find("\"counts\":{") + std::string("\"counts\":{").size(), 0,
+    "\"MYSTERY\":0,");
+  write(root_ / "unknown_count.json", report);
+  EXPECT_EQ(execute(config((root_ / "unknown_count.json").string()), "unknown_count"), 1);
+  const auto manifest = read(root_ / "unknown_count" / "release-manifest.json");
+  EXPECT_NE(manifest.find("counts contains unknown status key"), std::string::npos);
+}
+
+TEST_F(AuditTest, BranchWhitespaceIsNotAValidCandidateIdentity)
+{
+  write(root_ / "branch.json", safe_report());
+  auto value = config((root_ / "branch.json").string());
+  const auto marker = value.find("\"branch\":\"fixture\"");
+  ASSERT_NE(marker, std::string::npos);
+  value.replace(marker, std::string("\"branch\":\"fixture\"").size(), "\"branch\":\" \\t\\n \"");
+  EXPECT_THROW(execute(value, "blank_branch"), std::runtime_error);
+}
+
+TEST_F(AuditTest, UnsafeClaimKeysAreCanonicalizedAcrossSeparatorsAndCase)
+{
+  auto report = safe_report();
+  report.insert(report.rfind('}'), ",\"PRODUCTIONREADY\":true");
+  write(root_ / "canonical_claim.json", report);
+  EXPECT_EQ(execute(config((root_ / "canonical_claim.json").string()), "canonical_claim"), 1);
+}
+
+TEST_F(AuditTest, NegativeEvidenceRequiresExactCalibrationPromotionDiagnostic)
+{
+  const auto make_negative = [&](const std::string & warnings, const std::string & errors) {
+    return std::string("{\"schema_version\":1,\"status\":\"FAIL\",\"production_claim_rejected\":true,") +
+      "\"observed_exit_code\":1,\"fixture_sha256\":\"" + std::string(64, '0') +
+      "\",\"commit\":\"" + kHead + "\",\"baseline_main\":\"" + kBase +
+      "\",\"safety_defaults\":{\"serial_enabled\":false,\"dry_run\":true,\"allow_fire\":false,\"fire_command\":0,\"yaw_vel\":0,\"pitch_vel\":0,\"yaw_acc\":0,\"pitch_acc\":0},\"diagnostics\":{\"errors\":" + errors + ",\"warnings\":" + warnings + "}}";
+  };
+  const auto declaration = [&](const fs::path & path, const std::string & output_name) {
+    auto value = config(path.string());
+    const auto ctest = value.find(",\"ctest_xml\":");
+    if (ctest == std::string::npos) {
+      ADD_FAILURE() << "CTest declaration missing";
+      return std::string{};
+    }
+    const auto source_close = value.find('}', ctest);
+    if (source_close == std::string::npos) {
+      ADD_FAILURE() << "source object terminator missing";
+      return std::string{};
+    }
+    value.erase(ctest, source_close - ctest);
+    const auto source_end = value.rfind("}]");
+    if (source_end == std::string::npos) {
+      ADD_FAILURE() << "source declaration terminator missing";
+      return std::string{};
+    }
+    value.insert(source_end, ",\"negative_test\":true,\"expected_failure\":true,\"expected_diagnostic_code\":\"calibration_promotion\",\"expected_exit_code\":1,\"fixture_sha256\":\"" + std::string(64, '0') + "\"");
+    EXPECT_EQ(execute(value, output_name), 1);
+    return read(root_ / output_name / "release-manifest.json");
+  };
+
+  write(root_ / "negative_warning.json", make_negative("[{\"code\":\"extra\"}]", "[{\"code\":\"calibration_promotion\"}]"));
+  const auto warning_manifest = declaration(root_ / "negative_warning.json", "negative_warning");
+  EXPECT_NE(warning_manifest.find("diagnostics.warnings must be an empty array"), std::string::npos);
+
+  write(root_ / "negative_extra_error.json", make_negative("[]", "[{\"code\":\"calibration_promotion\"},{\"code\":\"other\"}]"));
+  const auto error_manifest = declaration(root_ / "negative_extra_error.json", "negative_extra_error");
+  EXPECT_NE(error_manifest.find("exactly one diagnostic error"), std::string::npos);
+
+  auto missing_code = config((root_ / "negative_extra_error.json").string());
+  const auto missing_ctest = missing_code.find(",\"ctest_xml\":");
+  ASSERT_NE(missing_ctest, std::string::npos);
+  const auto missing_source_close = missing_code.find('}', missing_ctest);
+  ASSERT_NE(missing_source_close, std::string::npos);
+  missing_code.erase(missing_ctest, missing_source_close - missing_ctest);
+  const auto missing_source_end = missing_code.rfind("}]");
+  ASSERT_NE(missing_source_end, std::string::npos);
+  missing_code.insert(missing_source_end,
+    ",\"negative_test\":true,\"expected_failure\":true,\"expected_exit_code\":1,\"fixture_sha256\":\"" + std::string(64, '0') + "\"");
+  EXPECT_EQ(execute(missing_code, "negative_missing_declaration"), 1);
+  const auto missing_manifest = read(root_ / "negative_missing_declaration" / "release-manifest.json");
+  EXPECT_NE(missing_manifest.find("negative evidence requires expected_diagnostic_code"), std::string::npos);
+}
+
+TEST_F(AuditTest, RosE2EPassCasesRequireApplicableLivenessEvidence)
+{
+  const std::string liveness = "\"node_liveness\":{\"alive_before_sampling\":true,\"alive_during_sampling\":true,\"alive_after_sampling\":true,\"expected_exit_code\":0,\"observed_exit_code\":0,\"exit_code_matches\":true}";
+  auto valid = safe_report();
+  valid.insert(valid.rfind('}'), "," + liveness);
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  const auto new_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\",\"node_liveness_applicable\":true,\"node_liveness\":{\"alive_before_sampling\":true,\"alive_during_sampling\":true,\"alive_after_sampling\":true,\"expected_exit_code\":0,\"observed_exit_code\":0,\"exit_code_matches\":true}}]";
+  ASSERT_NE(valid.find(old_case), std::string::npos);
+  valid.replace(valid.find(old_case), old_case.size(), new_case);
+  write(root_ / "e2e_liveness.json", valid);
+  auto valid_config = config((root_ / "e2e_liveness.json").string());
+  valid_config.replace(valid_config.find("release_smoke"), std::string("release_smoke").size(), "ros_e2e");
+  EXPECT_EQ(execute(valid_config, "e2e_liveness"), 0);
+
+  auto invalid = valid;
+  const auto invalid_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\",\"node_liveness_applicable\":true}]";
+  const auto valid_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\",\"node_liveness_applicable\":true,\"node_liveness\":{\"alive_before_sampling\":true,\"alive_during_sampling\":true,\"alive_after_sampling\":true,\"expected_exit_code\":0,\"observed_exit_code\":0,\"exit_code_matches\":true}}]";
+  ASSERT_NE(invalid.find(valid_case), std::string::npos);
+  invalid.replace(invalid.find(valid_case), std::string(valid_case).size(), invalid_case);
+  write(root_ / "e2e_liveness_invalid.json", invalid);
+  auto invalid_config = config((root_ / "e2e_liveness_invalid.json").string());
+  invalid_config.replace(invalid_config.find("release_smoke"), std::string("release_smoke").size(), "ros_e2e");
+  EXPECT_EQ(execute(invalid_config, "e2e_liveness_invalid"), 2);
 }
 
 }  // namespace

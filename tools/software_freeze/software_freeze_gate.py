@@ -83,6 +83,7 @@ REQUIRED_PYTHON_GROUPS = (
     "offline_evidence_bundle",
     "orin_unavailable",
 )
+EXPECTED_NEGATIVE_DIAGNOSTIC_CODE = "calibration_promotion"
 REQUIRED_SCENARIO_FILES = ("benchmark.csv", "summary.json", "summary.md")
 SCENARIO_HELP_NAME = "auto_aim_scenario_benchmark_help"
 OFFLINE_HELP_NAME = "auto_aim_offline_help"
@@ -752,32 +753,91 @@ def _evidence_status(evidence: Mapping[str, Any]) -> tuple[str, list[str]]:
         if report_status not in ALLOWED_STATUSES or report_status != "PASS":
             failures.append(f"report_status={report_status}")
     bundle_status = evidence.get("bundle_status")
-    def _has_valid_claim_rejection() -> bool:
-        """Return whether the checked fixture proves a calibration rejection.
 
-        A caller-provided boolean or free-form diagnostic is not sufficient to
-        exempt an unsafe ``production_ready`` claim.  The bundle must have
-        failed, its persisted report must be FAIL, and its structured
-        diagnostics must contain the documented calibration-promotion code.
+    def _has_valid_claim_rejection() -> bool:
+        """Return whether evidence proves the *expected* claim rejection.
+
+        ``production_claim_rejected`` is only an assertion made by the
+        producer; it is not evidence on its own.  The persisted bundle must
+        report the expected failure and contain exactly the one diagnostic
+        that this gate is designed to exercise.  Requiring an exact error
+        list also prevents an unrelated diagnostic from being hidden beside
+        the expected calibration-promotion rejection.
         """
 
         if evidence.get("production_claim_rejected") is not True:
             return False
+        claims = evidence.get("claims")
+        if not isinstance(claims, Mapping) or claims.get("production_ready") is not True:
+            return False
+        if evidence.get("status") != "PASS" or evidence.get("report_status") != "PASS":
+            return False
         if evidence.get("bundle_status") != "FAIL" or evidence.get("bundle_report_status") != "FAIL":
             return False
-        diagnostics = evidence.get("bundle_diagnostics")
-        if not isinstance(diagnostics, Mapping):
+
+        # The live runner emits this signal after checking both the process
+        # exit status and the persisted manifest.  If present, it must agree;
+        # a false signal can never be used to launder an otherwise failing
+        # bundle.  Older API fixtures may omit it, so absence is handled below
+        # by the status/diagnostics contract rather than being guessed true.
+        if "bundle_claim_rejection_signal" in evidence and evidence.get("bundle_claim_rejection_signal") is not True:
+            return False
+        if "bundle_exit_code" in evidence:
+            exit_code = _manifest_number(evidence.get("bundle_exit_code"))
+            if exit_code is None or exit_code <= 0:
+                return False
+
+        diagnostic_aliases = [
+            (key, evidence.get(key))
+            for key in ("bundle_diagnostics", "diagnostics")
+            if key in evidence
+        ]
+        if not diagnostic_aliases:
+            return False
+        if any(not isinstance(value, Mapping) for _, value in diagnostic_aliases):
+            return False
+        # If both spellings are supplied they must be byte-for-byte equivalent
+        # structured diagnostics; selecting whichever happens to be first is
+        # unsafe because a conflicting alias could hide a failure.
+        if len(diagnostic_aliases) > 1:
+            # There is one canonical live spelling.  Supplying both aliases
+            # is ambiguous even when their current values happen to match;
+            # rejecting duplicates avoids a future producer update silently
+            # changing which object the gate trusts.
+            return False
+        diagnostics = diagnostic_aliases[0][1]
+        if set(diagnostics) - {"errors", "warnings"}:
             return False
         errors = diagnostics.get("errors")
-        if not isinstance(errors, list):
+        if not isinstance(errors, list) or len(errors) != 1:
             return False
-        return any(
-            isinstance(item, Mapping)
-            and str(item.get("code", "")).lower() == "calibration_promotion"
-            for item in errors
-        )
+        item = errors[0]
+        if not isinstance(item, Mapping) or str(item.get("code", "")).strip().lower() != EXPECTED_NEGATIVE_DIAGNOSTIC_CODE:
+            return False
+
+        # Warnings are optional in the live report because missing optional
+        # hardware/model metadata is expected in a software-only run.  If a
+        # producer emits warnings, keep their shape and reject unknown or
+        # unsafe diagnostics rather than silently ignoring them.
+        if "warnings" in diagnostics:
+            warnings = diagnostics.get("warnings")
+            if not isinstance(warnings, list):
+                return False
+            allowed_warning_codes = {"metadata", "missing_metadata", "missing_optional_artifact"}
+            for warning in warnings:
+                if not isinstance(warning, Mapping):
+                    return False
+                code = str(warning.get("code", "")).strip().lower()
+                if code not in allowed_warning_codes:
+                    return False
+        return True
 
     valid_claim_rejection = _has_valid_claim_rejection()
+    # A normal freeze run deliberately includes one evidence-only bundle
+    # negative test.  Do not let a bare boolean (or status=PASS with no
+    # persisted bundle proof) turn that assertion into a passing boundary.
+    if evidence.get("production_claim_rejected") is True and not valid_claim_rejection:
+        failures.append("production claim rejection requires complete negative bundle contract")
     if bundle_status is not None:
         # The evidence-only bundle is expected to return FAIL for the
         # deliberately injected production-claim fixture.  Every other
@@ -815,22 +875,28 @@ def _evidence_status(evidence: Mapping[str, Any]) -> tuple[str, list[str]]:
     claim_scan = scan_evidence_claims(evidence)
     unsafe_claims = claim_scan.get("unsafe_claims", [])
     # A production_ready=true fixture is intentionally used to prove the
-    # rejection path.  It is acceptable only when the caller explicitly
-    # records that it was rejected; unsafe control values remain fatal.
+    # rejection path.  It is acceptable only when the caller supplies the
+    # complete, independently checkable contract above; unsafe control values
+    # and extra diagnostics remain fatal.
     expected_rejection = valid_claim_rejection
-    residual = [
-        item for item in unsafe_claims
-        if not (
+    residual = []
+    for item in unsafe_claims:
+        path = str(item.get("path", "")).lower()
+        value = item.get("value")
+        expected_bundle_claim = (
             expected_rejection
-            and str(item.get("path", "")).lower().rsplit(".", 1)[-1] == "production_ready"
-            and item.get("value") is True
+            and path == "$.claims.production_ready"
+            and value is True
         )
-        and not (
+        expected_diagnostic_message = (
             expected_rejection
-            and str(item.get("path", "")).lower().startswith("$.bundle_diagnostics")
-            and "production_ready=true" in str(item.get("value", "")).lower()
+            and path.startswith("$.bundle_diagnostics")
+            and path.endswith(".message")
+            and isinstance(value, str)
+            and "production_ready=true" in value.lower()
         )
-    ]
+        if not expected_bundle_claim and not expected_diagnostic_message:
+            residual.append(item)
     if residual:
         failures.append("evidence contains unsafe production/control claims")
     return ("FAIL" if failures else "PASS"), failures
@@ -2029,7 +2095,11 @@ def _evidence_observations(
         "bundle_exit_code": bundle_result.returncode,
         "production_claim_rejected": claim_rejected,
         "bundle_claim_rejection_signal": bool(manifest_claim_rejection or explicit_claim_signal),
-        "claims": {"production_ready": False},
+        # Record the deliberately injected claim explicitly.  The live gate
+        # only exempts this nested claim when the persisted bundle proves it
+        # was rejected; it must not be represented as a normal top-level
+        # production-ready assertion.
+        "claims": {"production_ready": True},
     }
     if isinstance(manifest_value, Mapping):
         result["bundle_report_status"] = manifest_value.get("status")
@@ -2869,8 +2939,18 @@ def _manifest_negative_evidence(
     expected_code = declaration.get("expected_diagnostic_code")
     if not isinstance(expected_code, str) or not expected_code.strip():
         failures.append("negative evidence requires expected_diagnostic_code")
-        expected_code = ""
-    expected_code = expected_code.strip().lower()
+    else:
+        expected_code = expected_code.strip().lower()
+        if expected_code != EXPECTED_NEGATIVE_DIAGNOSTIC_CODE:
+            failures.append(
+                "negative evidence expected_diagnostic_code must be "
+                f"{EXPECTED_NEGATIVE_DIAGNOSTIC_CODE}"
+            )
+    # Never allow a producer/declaration alias to select a different
+    # diagnostic namespace.  The freeze gate has one intentionally tested
+    # rejection reason; accepting arbitrary codes would turn any unrelated
+    # failure into a passing negative fixture.
+    expected_code = EXPECTED_NEGATIVE_DIAGNOSTIC_CODE
 
     expected_exit_values: list[int] = []
     for key in ("expected_exit_code", "expected_failure_exit_code"):
@@ -2932,6 +3012,8 @@ def _manifest_negative_evidence(
                 continue
             if normalized is not None:
                 actual_fixture_values.append(normalized)
+    if "fixture" in root and not isinstance(root.get("fixture"), Mapping):
+        failures.append("negative evidence fixture must be an object")
     if isinstance(root.get("fixture"), Mapping):
         value = root["fixture"].get("sha256", root["fixture"].get("sha"))
         if isinstance(value, str):
@@ -2948,11 +3030,30 @@ def _manifest_negative_evidence(
     if expected_fixture is not None and actual_fixture != expected_fixture:
         failures.append("negative evidence fixture SHA-256 does not match declaration")
 
-    diagnostics = root.get("diagnostics", root.get("bundle_diagnostics"))
+    diagnostic_aliases = [
+        (key, root.get(key))
+        for key in ("diagnostics", "bundle_diagnostics")
+        if key in root
+    ]
+    for key in root:
+        compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        if compact in {"diagnostic", "diagnosticerrors", "bundlediagnostic", "bundlediagnostics"} and key not in {
+            "diagnostics", "bundle_diagnostics"
+        }:
+            failures.append(f"negative evidence contains unsupported diagnostics alias: {key}")
+    # There is one canonical diagnostics object per source.  Supplying both
+    # spellings is ambiguous even if they currently happen to match; a stale
+    # alias must never be hidden by whichever key is selected first.
+    if len(diagnostic_aliases) > 1:
+        failures.append("negative evidence diagnostics aliases disagree")
+    diagnostics = diagnostic_aliases[0][1] if diagnostic_aliases else None
     if not isinstance(diagnostics, Mapping):
         failures.append("negative evidence diagnostics must be an object")
         errors: list[Any] = []
     else:
+        unsupported_diagnostics = set(diagnostics) - {"errors", "warnings"}
+        if unsupported_diagnostics:
+            failures.append("negative evidence diagnostics contain unsupported fields")
         errors_value = diagnostics.get("errors")
         if not isinstance(errors_value, list):
             failures.append("negative evidence diagnostics.errors must be an array")
@@ -2971,8 +3072,9 @@ def _manifest_negative_evidence(
     if expected_code and diagnostic_codes != [expected_code]:
         failures.append("negative evidence diagnostics do not exactly match expected_diagnostic_code")
 
-    # A rejected production claim may contain the one expected unsafe claim,
-    # but no residual motion, serial, firing, or additional production claim.
+    # A rejected production claim may contain the one expected top-level
+    # ``production_ready=true`` fixture (plus its diagnostic message), but no
+    # residual motion, serial, firing, or additional production claim.
     for item in scan_evidence_claims(root).get("unsafe_claims", []):
         if not isinstance(item, Mapping):
             failures.append("negative evidence contains malformed unsafe claim")
@@ -2984,7 +3086,12 @@ def _manifest_negative_evidence(
         # happens to mention production_ready=true.
         if path == "$.production_ready" and value is True:
             continue
-        if "production_ready=true" in str(value).lower() and path.startswith("$.diagnostics"):
+        if (
+            path.startswith("$.diagnostics")
+            and path.endswith(".message")
+            and isinstance(value, str)
+            and "production_ready=true" in value.lower()
+        ):
             continue
         failures.append(f"negative evidence contains unexpected unsafe claim: {path}")
     return True, failures
@@ -3080,8 +3187,13 @@ def _manifest_source_record(
         reasons.append("declared SHA-256 mismatch")
         fatal = True
     try:
-        parsed = _parse_json_strict(payload.decode("utf-8", errors="replace"), context=f"source {source_id}")
-    except ValueError as exc:
+        # Invalid UTF-8 is not a harmless presentation issue for a hashed
+        # release input: replacement characters could turn malformed bytes
+        # into a different, apparently valid JSON report.  Decode strictly so
+        # the declared source bytes and parsed evidence are the same object.
+        decoded = payload.decode("utf-8")
+        parsed = _parse_json_strict(decoded, context=f"source {source_id}")
+    except (UnicodeDecodeError, ValueError) as exc:
         reasons.append(str(exc))
         record["reason"] = reasons[0]
         return record, None
@@ -3645,8 +3757,22 @@ def build_input_manifest_report(
         normalized_required.append(normalized)
     seen_kinds = {_manifest_kind(item.get("kind")) for item in source_records}
     for normalized in normalized_required:
+        matching_records = [
+            item for item in source_records
+            if _manifest_kind(item.get("kind")) == normalized
+        ]
         if normalized not in seen_kinds:
             not_verified.append(f"missing:{normalized}")
+        elif any(item.get("status") != "PASS" for item in matching_records):
+            # A required kind is an admission prerequisite even when it is a
+            # hardware observation.  Hardware gaps that are merely optional
+            # remain non-blocking, but a required camera/Orin/CDC/etc. input
+            # may never be silently discarded and upgraded to READY_CANDIDATE.
+            not_verified.extend(
+                str(item.get("id") or f"required:{normalized}")
+                for item in matching_records
+                if item.get("status") != "PASS"
+            )
 
     # A duplicate role or a producer's declared role hash disagreement is a
     # safety contradiction, not an optional hardware gap.

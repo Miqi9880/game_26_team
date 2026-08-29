@@ -1142,6 +1142,23 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("report top-level PASS hides failed wrapper case", assessed["inputs"][0]["failure_reasons"])
 
+    def test_wrapper_ctest_not_applicable_nonpass_status_matches_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report(
+                status="NOT_VERIFIED",
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "smoke", "status": "PASS"}],
+            )
+            report_path = root / "wrapper.json"
+            report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+            manifest = self._minimal_input_manifest(root, report, kind="release_smoke")
+            manifest["inputs"][0]["ctest_not_applicable"] = True
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("report top-level status disagrees with counts/cases", assessed["inputs"][0]["failure_reasons"])
+
     def test_manifest_ctest_xml_digest_cannot_be_self_attested_by_report(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)

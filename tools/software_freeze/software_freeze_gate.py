@@ -2767,12 +2767,17 @@ def _manifest_compare_ctest(
     # must never be upgraded to PASS, but the XML/case bytes can still be
     # checked for structural consistency.
     if str(raw_status).strip().upper() != "WARN":
-        if wrapper_kind and report_status == "PASS":
-            # Wrapper reports summarize the software runner.  Expected
-            # unavailable/not-run/not-verified sub-checks are allowed while
-            # PASS still requires that no case actually failed.
-            if any(item["status"] == "FAIL" for item in cases):
-                return "report top-level PASS hides failed wrapper case"
+        if wrapper_kind:
+            # Wrapper reports summarize a larger software/hardware matrix.
+            # PASS may coexist with unavailable/not-run/not-verified
+            # sub-checks, but must never hide a failed case.  Any non-PASS
+            # wrapper status still has to agree with the conservative case
+            # aggregate so a stale status cannot launder a failure or gap.
+            if report_status == "PASS":
+                if any(item["status"] == "FAIL" for item in cases):
+                    return "report top-level PASS hides failed wrapper case"
+            elif aggregate != report_status:
+                return "report top-level status disagrees with counts/cases"
         elif aggregate != report_status:
             return "report top-level status disagrees with counts/cases"
     return None
@@ -3175,12 +3180,16 @@ def _manifest_source_record(
                 if report_status is None:
                     reasons.append("report top-level status disagrees with counts/cases")
                     fatal = True
-                elif report_status == "PASS" and any(
-                    item["status"] == "FAIL" for item in normalized_cases
-                ):
-                    reasons.append("report top-level PASS hides failed wrapper case")
-                    fatal = True
-                elif kind not in {"release_smoke", "ros_e2e", "ros_message_e2e"} and aggregate != report_status:
+                elif kind in {"release_smoke", "ros_e2e", "ros_message_e2e"}:
+                    if report_status == "PASS" and any(
+                        item["status"] == "FAIL" for item in normalized_cases
+                    ):
+                        reasons.append("report top-level PASS hides failed wrapper case")
+                        fatal = True
+                    elif report_status != "PASS" and aggregate != report_status:
+                        reasons.append("report top-level status disagrees with counts/cases")
+                        fatal = True
+                elif aggregate != report_status:
                     reasons.append("report top-level status disagrees with counts/cases")
                     fatal = True
         elif kind in {"ros_e2e", "ros_message_e2e"}:

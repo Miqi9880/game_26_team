@@ -276,7 +276,7 @@ TEST_F(AuditTest, TopLevelPassContradictingFailedCaseFailsClosed)
     "<Test Status=\"failed\"><Name>failed_test</Name></Test></Testing></Site>");
   EXPECT_EQ(execute(config((root_ / "contradiction.json").string()), "pass_with_failure"), 1);
   const auto manifest = read(root_ / "pass_with_failure" / "release-manifest.json");
-  EXPECT_NE(manifest.find("top-level status PASS contradicts aggregated case status FAIL"),
+  EXPECT_NE(manifest.find("report top-level PASS hides failed wrapper case"),
     std::string::npos);
 }
 
@@ -302,6 +302,93 @@ TEST_F(AuditTest, DeclaredCTestXmlRequiresCountsAndCases)
   report.erase(counts, report.rfind('}') - counts);
   write(root_ / "no-statistics.json", report);
   EXPECT_EQ(execute(config((root_ / "no-statistics.json").string()), "ctest_without_statistics"), 1);
+}
+
+TEST_F(AuditTest, ReviewedWrapperCanExplicitlyMarkCTestNotApplicable)
+{
+  auto report = safe_report();
+  const std::string old_counts = "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0,\"NOT_VERIFIED\":0";
+  report.replace(report.find(old_counts), old_counts.size(),
+    "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":1,\"NOT_RUN\":0,\"NOT_VERIFIED\":0");
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  report.replace(report.find(old_case), old_case.size(),
+    "[{\"name\":\"audit_test\",\"status\":\"PASS\"},{\"name\":\"camera\",\"status\":\"UNAVAILABLE\"}]");
+  write(root_ / "wrapper_not_applicable.json", report);
+
+  auto value = config((root_ / "wrapper_not_applicable.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end, ",\"ctest_not_applicable\":true");
+  EXPECT_EQ(execute(value, "wrapper_not_applicable"), 0);
+}
+
+TEST_F(AuditTest, WrapperPassCannotHideFailedCaseWhenCTestIsNotApplicable)
+{
+  auto report = safe_report();
+  const std::string old_counts = "\"PASS\":1,\"FAIL\":0,\"UNAVAILABLE\":0,\"NOT_RUN\":0,\"NOT_VERIFIED\":0";
+  report.replace(report.find(old_counts), old_counts.size(),
+    "\"PASS\":1,\"FAIL\":1,\"UNAVAILABLE\":0,\"NOT_RUN\":0,\"NOT_VERIFIED\":0");
+  const std::string old_case = "[{\"name\":\"audit_test\",\"status\":\"PASS\"}]";
+  report.replace(report.find(old_case), old_case.size(),
+    "[{\"name\":\"audit_test\",\"status\":\"PASS\"},{\"name\":\"failed\",\"status\":\"FAIL\"}]");
+  write(root_ / "wrapper_hidden_failure.json", report);
+
+  auto value = config((root_ / "wrapper_hidden_failure.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end, ",\"ctest_not_applicable\":true");
+  EXPECT_EQ(execute(value, "wrapper_hidden_failure"), 1);
+  const auto manifest = read(root_ / "wrapper_hidden_failure" / "release-manifest.json");
+  EXPECT_NE(manifest.find("report top-level PASS hides failed wrapper case"), std::string::npos);
+}
+
+TEST_F(AuditTest, WrapperNonPassMustMatchCaseAggregateWhenCTestIsNotApplicable)
+{
+  auto report = safe_report("NOT_VERIFIED");
+  write(root_ / "wrapper_stale_status.json", report);
+
+  auto value = config((root_ / "wrapper_stale_status.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end, ",\"ctest_not_applicable\":true");
+  EXPECT_EQ(execute(value, "wrapper_stale_status"), 1);
+  const auto manifest = read(root_ / "wrapper_stale_status" / "release-manifest.json");
+  EXPECT_NE(manifest.find("top-level status NOT_VERIFIED contradicts aggregated case status PASS"), std::string::npos);
+}
+
+TEST_F(AuditTest, CTestNotApplicableIsRestrictedToReviewedWrappers)
+{
+  write(root_ / "non_wrapper.json", safe_report());
+  auto value = config((root_ / "non_wrapper.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto kind = value.find("release_smoke");
+  ASSERT_NE(kind, std::string::npos);
+  value.replace(kind, std::string("release_smoke").size(), "ctest");
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end, ",\"ctest_not_applicable\":true");
+  EXPECT_EQ(execute(value, "non_wrapper_not_applicable"), 1);
+  const auto manifest = read(root_ / "non_wrapper_not_applicable" / "release-manifest.json");
+  EXPECT_NE(manifest.find("ctest_not_applicable is restricted to reviewed wrapper kinds"), std::string::npos);
 }
 
 TEST_F(AuditTest, UnknownKindAndHardwarePassAreRejected)

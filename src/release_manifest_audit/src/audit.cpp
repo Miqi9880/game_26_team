@@ -489,7 +489,8 @@ bool counts_valid(const Object & root, std::string * why)
   for (const auto & item : cases) { const auto & entry = object(item, "case"); const auto value = text(required(entry, "status", "case"), "case.status"); if (!actual.count(value)) { *why = "case has unknown status"; return false; } ++actual[value]; }
   for (const auto & [key, total] : actual) { const auto * item = find(counts, key); if (!item || !std::holds_alternative<double>(*item) || std::get<double>(*item) != total) { *why = "counts disagree with cases for " + key; return false; } } return true;
 }
-bool status_matches_results(const Object & root, Status reported, std::string * why)
+bool status_matches_results(const Object & root, Status reported, std::string * why,
+                            bool wrapper_kind = false)
 {
   const auto * counts_item = find(root, "counts"); const auto * cases_item = find(root, "cases");
   if (!counts_item && !cases_item) return true;
@@ -506,6 +507,17 @@ bool status_matches_results(const Object & root, Status reported, std::string * 
   else if (totals["NOT_VERIFIED"] > 0) aggregate = Status::NotVerified;
   else if (totals["NOT_RUN"] > 0) aggregate = Status::NotRun;
   else if (totals["UNAVAILABLE"] > 0) aggregate = Status::Unavailable;
+  // Reviewed release wrappers summarize a wider software/hardware matrix.
+  // Their top-level PASS may legitimately contain unavailable, not-run, or
+  // not-verified sub-checks, but it can never hide a failed case.  A
+  // non-PASS wrapper status remains bound to the conservative aggregate.
+  if (wrapper_kind && reported == Status::Pass) {
+    if (totals["FAIL"] > 0) {
+      *why = "report top-level PASS hides failed wrapper case";
+      return false;
+    }
+    return true;
+  }
   if (reported != aggregate) { *why = "top-level status " + std::string(name(reported)) + " contradicts aggregated case status " + name(aggregate); return false; }
   return true;
 }
@@ -917,12 +929,33 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
         source.reasons.push_back("hardware source cannot claim PASS");
       }
       if (!counts_valid(root, &reason)) source.reasons.push_back(reason);
-      if (reported_status && !reported_warn && !status_matches_results(root, *reported_status, &reason)) source.reasons.push_back(reason);
+      const bool wrapper_kind = source.kind == "release_smoke" || source.kind == "ros_e2e" || source.kind == "ros_message_e2e";
+      if (reported_status && !reported_warn && !status_matches_results(root, *reported_status, &reason, wrapper_kind)) source.reasons.push_back(reason);
       if (reported_warn && !warn_matches_results(root, &reason)) source.reasons.push_back(reason);
+      bool ctest_not_applicable = false;
+      if (const auto * ctest_marker = find(source_config, "ctest_not_applicable")) {
+        if (!std::holds_alternative<bool>(*ctest_marker) || !std::get<bool>(*ctest_marker) || !wrapper_kind) {
+          source.reasons.push_back("ctest_not_applicable is restricted to reviewed wrapper kinds");
+        } else {
+          ctest_not_applicable = true;
+        }
+      }
+      if (ctest_not_applicable && find(source_config, "ctest_xml")) {
+        source.reasons.push_back("ctest_not_applicable cannot be combined with ctest_xml");
+        ctest_not_applicable = false;
+      }
       if (const auto ctest_path = optional_text(source_config, "ctest_xml")) {
         if (!ctest_matches_report(root, *ctest_path, &reason)) source.reasons.push_back(reason);
-      } else if (find(root, "counts") || find(root, "cases")) {
+      } else if ((find(root, "counts") || find(root, "cases")) && !ctest_not_applicable) {
         source.reasons.push_back("CTest-backed report requires explicit ctest_xml");
+      } else if (ctest_not_applicable &&
+        (find(root, "counts") || find(root, "cases")) &&
+        (!find(root, "counts") || !find(root, "cases"))) {
+        source.reasons.push_back("CTest-backed report must provide both counts and cases");
+      } else if (ctest_not_applicable &&
+        (source.kind == "ros_e2e" || source.kind == "ros_message_e2e") &&
+        (!find(root, "counts") || !find(root, "cases"))) {
+        source.reasons.push_back("ROS E2E wrapper requires counts and cases when CTest is not applicable");
       }
       std::optional<std::string> declared_commit;
       std::optional<std::string> declared_base;

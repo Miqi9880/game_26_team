@@ -17,6 +17,10 @@ from tools.software_freeze.software_freeze_gate import (
     _github_observations,
     _git_observations,
     _command_record,
+    _load_observations,
+    _manifest_status_hint,
+    _manifest_ctest_counts,
+    _manifest_hash_references,
     assess_observations,
     build_input_manifest_report,
     build_report,
@@ -661,12 +665,25 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                 "production_ready": False,
                 "safety_assertions": SAFE_DEFAULTS.copy(),
                 "node_liveness": {
+                    "alive_before_sampling": True,
                     "alive_during_sampling": True,
+                    "alive_after_sampling": True,
                     "expected_exit_code": 0,
                     "observed_exit_code": 0,
+                    "exit_code_matches": True,
                 },
                 "counts": {"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
-                "cases": [{"status": "PASS"}],
+                "cases": [{
+                    "name": "e2e", "status": "PASS",
+                    "node_liveness": {
+                        "alive_before_sampling": True,
+                        "alive_during_sampling": True,
+                        "alive_after_sampling": True,
+                        "expected_exit_code": 0,
+                        "observed_exit_code": 0,
+                        "exit_code_matches": True,
+                    },
+                }],
                 "model_xml_sha256": model_hash,
             }, sort_keys=True), encoding="utf-8")
             ctest_path.write_text(
@@ -681,9 +698,15 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                     "main_baseline": "b" * 40,
                     "branch": "codex/software-freeze",
                     "worktree_clean": True,
+                    "git_object_verified": True,
+                    "origin_main_verified": True,
+                    "ancestry_verified": True,
                 },
                 "required_kinds": ["ros_e2e"],
-                "inputs": [{"id": "e2e", "kind": "ros_e2e", "path": str(report_path), "ctest_xml": str(ctest_path)}],
+                "inputs": [{"id": "e2e", "kind": "ros_e2e", "path": str(report_path),
+                            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                            "ctest_xml": str(ctest_path),
+                            "ctest_xml_sha256": hashlib.sha256(ctest_path.read_bytes()).hexdigest()}],
                 "artifacts": [{"role": "model_xml", "path": str(model_path), "sha256": model_hash}],
             }
             assessed = build_input_manifest_report(manifest, manifest_path=root / "inputs.json")
@@ -706,8 +729,12 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             base = {
                 "schema": "software-freeze-inputs", "schema_version": 1,
                 "candidate": {"head": "a" * 40, "main_baseline": "b" * 40,
-                               "branch": "feature", "worktree_clean": True},
-                "inputs": [{"id": "e2e", "kind": "ros_e2e", "path": str(report_path)}],
+                               "branch": "feature", "worktree_clean": True,
+                               "git_object_verified": True, "origin_main_verified": True,
+                               "ancestry_verified": True},
+                "required_kinds": ["ros_e2e"],
+                "inputs": [{"id": "e2e", "kind": "ros_e2e", "path": str(report_path),
+                            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}],
             }
             assessed = build_input_manifest_report(base, manifest_path=root / "inputs.json")
             self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
@@ -747,17 +774,212 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                     "main_baseline": "b" * 40,
                     "branch": "feature",
                     "worktree_clean": True,
+                    "git_object_verified": True,
+                    "origin_main_verified": True,
+                    "ancestry_verified": True,
                 },
+                "required_kinds": ["ros_e2e"],
                 "inputs": [{
                     "id": "e2e",
                     "kind": "ros_e2e",
                     "path": str(report_path),
+                    "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
                 }],
             }
             assessed = build_input_manifest_report(manifest, manifest_path=root / "inputs.json")
             self.assertEqual(assessed["software_candidate_status"], "NOT_VERIFIED")
             self.assertEqual(assessed["inputs"][0]["status"], "NOT_VERIFIED")
             self.assertIn("node_liveness evidence missing or contradictory", assessed["inputs"][0]["failure_reasons"])
+
+    def _minimal_input_manifest(self, root: Path, report: dict, *, kind: str = "build", **declaration):
+        report_path = root / f"{kind}.json"
+        report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+        source = {
+            "id": kind,
+            "kind": kind,
+            "path": str(report_path),
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+        source.update(declaration)
+        return {
+            "schema": "software-freeze-inputs",
+            "schema_version": 1,
+            "candidate": {
+                "head": "a" * 40,
+                "main_baseline": "b" * 40,
+                "branch": "feature",
+                "worktree_clean": True,
+                "git_object_verified": True,
+                "origin_main_verified": True,
+                "ancestry_verified": True,
+            },
+            "required_kinds": [kind],
+            "inputs": [source],
+        }
+
+    def _safe_report(self, **extra):
+        report = {
+            "schema_version": 1,
+            "status": "PASS",
+            "baseline_main": "b" * 40,
+            "candidate_commit": "a" * 40,
+            "safety_assertions": SAFE_DEFAULTS.copy(),
+        }
+        report.update(extra)
+        return report
+
+    def test_manifest_rejects_unknown_and_non_string_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            for value in ("bogus", 123, ["build"]):
+                report = self._safe_report()
+                manifest = self._minimal_input_manifest(root, report, kind="build")
+                manifest["inputs"][0]["kind"] = value
+                assessed = build_input_manifest_report(manifest)
+                self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+                self.assertTrue(any("INPUT_build_FAILED" == item for item in assessed["blockers"]))
+
+    def test_manifest_status_alias_conflict_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            manifest = self._minimal_input_manifest(root, self._safe_report(overall_status="FAIL"))
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("conflicting status aliases", assessed["inputs"][0]["failure_reasons"])
+            self.assertEqual(_manifest_status_hint({"status": "PASS", "result": "FAIL"})[0], None)
+
+    def test_manifest_requires_nonempty_allowed_required_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            for value in (None, [], [""], ["bogus"], [123]):
+                manifest = self._minimal_input_manifest(root, self._safe_report())
+                if value is None:
+                    manifest.pop("required_kinds")
+                else:
+                    manifest["required_kinds"] = value
+                with self.assertRaises(ValueError):
+                    build_input_manifest_report(manifest)
+
+    def test_manifest_rejects_parent_symlink(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink unavailable")
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            real = root / "real"
+            real.mkdir()
+            report_path = real / "report.json"
+            report_path.write_text(json.dumps(self._safe_report()), encoding="utf-8")
+            link = root / "linked"
+            os.symlink(real, link, target_is_directory=True)
+            manifest = self._minimal_input_manifest(root, self._safe_report())
+            manifest["inputs"][0]["path"] = str(link / "report.json")
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("declared input path traverses a symlink", assessed["inputs"][0]["failure_reasons"])
+
+    def test_manifest_requires_source_and_artifact_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report()
+            manifest = self._minimal_input_manifest(root, report)
+            manifest["inputs"][0].pop("sha256")
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("source sha256 is required for a present source", assessed["inputs"][0]["failure_reasons"])
+            artifact = root / "model.xml"
+            artifact.write_text("model", encoding="utf-8")
+            manifest = self._minimal_input_manifest(root, report)
+            manifest["artifacts"] = [{"role": "model_xml", "path": str(artifact)}]
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("artifact sha256 is required for a present artifact", assessed["artifacts"][0]["failure_reasons"])
+
+    def test_manifest_rejects_ctest_skip_and_bad_case_consistency(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report(
+                counts={"PASS": 1, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0},
+                cases=[{"name": "one", "status": "PASS"}],
+            )
+            ctest = root / "Test.xml"
+            ctest.write_text("<Site><Testing><Test Status=\"passed\"><Name>one</Name></Test></Testing></Site>", encoding="utf-8")
+            manifest = self._minimal_input_manifest(root, report, kind="ctest", ctest_xml=str(ctest), skip_ctest=True)
+            # ctest is an allowed input kind; skip_ctest is not.
+            manifest["inputs"][0]["ctest_xml_sha256"] = hashlib.sha256(ctest.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("skip_ctest is not permitted in explicit admission mode", assessed["inputs"][0]["failure_reasons"])
+            manifest["inputs"][0].pop("skip_ctest")
+            report["cases"] = [{"name": "two", "status": "PASS"}]
+            report_path = Path(manifest["inputs"][0]["path"])
+            report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("report case names disagree with CTest XML", assessed["inputs"][0]["failure_reasons"])
+
+    def test_manifest_rejects_liveness_exit_aliases_and_hardware_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            for code in (-1, 130, 137):
+                report = self._safe_report(
+                    node_liveness={
+                        "alive_before_sampling": True, "alive_during_sampling": True,
+                        "alive_after_sampling": True, "exit_code_matches": True,
+                        "expected_exit_code": code, "observed_exit_code": code,
+                    }
+                )
+                manifest = self._minimal_input_manifest(root, report, kind="ros_e2e")
+                assessed = build_input_manifest_report(manifest)
+                self.assertNotEqual(assessed["software_candidate_status"], "READY_CANDIDATE")
+            manifest = self._minimal_input_manifest(root, self._safe_report(), kind="hardware")
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+
+    def test_manifest_artifact_role_map_and_duplicate_json_key_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            artifact = root / "model.xml"
+            artifact.write_text("model", encoding="utf-8")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            report = self._safe_report(artifact_hashes={"model_xml": "0" * 64})
+            manifest = self._minimal_input_manifest(root, report)
+            manifest["artifacts"] = [{"role": "model_xml", "path": str(artifact), "sha256": digest}]
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertFalse(assessed["consistency"]["artifact_hash_consistent"])
+            duplicate = root / "duplicate.json"
+            duplicate.write_text('{"status":"FAIL","status":"PASS"}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _load_observations(duplicate)
+
+    def test_manifest_negative_evidence_requires_exact_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            fixture = "fixture-data"
+            fixture_sha = hashlib.sha256(fixture.encode()).hexdigest()
+            report = self._safe_report(
+                status="FAIL", report_status="FAIL", production_claim_rejected=True,
+                negative_test=True, expected_failure=True,
+                fixture_sha256=fixture_sha,
+                exit_code=1,
+                diagnostics={"errors": [{"code": "calibration_promotion"}], "warnings": []},
+                synthetic=True, test_only=True, production_ready=False,
+            )
+            manifest = self._minimal_input_manifest(
+                root, report, kind="evidence_bundle", negative_test=True,
+                expected_failure=True, expected_diagnostic_code="calibration_promotion",
+                expected_exit_code=1, fixture_sha256=fixture_sha,
+            )
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "READY_CANDIDATE")
+            report["status"] = "PASS"
+            report_path = Path(manifest["inputs"][0]["path"])
+            report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+            manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
 
 
 if __name__ == "__main__":

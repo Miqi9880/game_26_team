@@ -352,10 +352,49 @@ def _json_bytes(value: Mapping[str, Any]) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _parse_json(text: str) -> Any:
+class _DuplicateJsonKeyError(ValueError):
+    """Raised when a JSON object tries to hide an earlier value."""
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build one JSON object while refusing ambiguous duplicate keys.
+
+    Python's default ``json.loads`` keeps the last duplicate key.  That is a
+    dangerous default for release evidence: a later ``status=PASS`` or
+    ``allow_fire=false`` could mask an earlier contradictory declaration.
+    Keep this hook deliberately small so it applies at every nesting level.
+    """
+
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_json_strict(text: str, *, context: str = "JSON") -> Any:
+    """Parse JSON while preserving the reason an unsafe payload is rejected."""
+
     try:
-        return json.loads(text)
-    except (TypeError, json.JSONDecodeError):
+        return json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except _DuplicateJsonKeyError as exc:
+        raise ValueError(f"{context} contains {exc}") from exc
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{context} is invalid JSON: {exc}") from exc
+
+
+def _parse_json(text: str) -> Any:
+    """Best-effort JSON parser for non-admission informational probes.
+
+    Admission paths call :func:`_parse_json_strict` so they can report a
+    duplicate-key violation precisely.  The older optional probes retain
+    their ``None`` convention, but duplicate keys are still never accepted.
+    """
+
+    try:
+        return _parse_json_strict(text)
+    except ValueError:
         return None
 
 
@@ -1236,13 +1275,24 @@ def assess_observations(observations: Mapping[str, Any]) -> dict[str, Any]:
     if type(total) is not int or total <= 0:
         blockers.append("CPP_TEST_COUNT_INVALID")
     required_results = {}
+    duplicate_required_names: set[str] = set()
     if isinstance(cpp.get("tests"), list):
         for item in cpp["tests"]:
             if isinstance(item, Mapping):
                 normalized_item = dict(item)
                 normalized_item["status"] = _normalise_check_status(item.get("status"))
-                required_results[str(item.get("name"))] = normalized_item
+                item_name = str(item.get("name"))
+                if item_name in required_results:
+                    duplicate_required_names.add(item_name)
+                    # Keep the conservative outcome when duplicate records
+                    # occur; a trailing PASS must not mask an earlier FAIL.
+                    prior = required_results[item_name]
+                    if str(prior.get("status")) != "PASS":
+                        continue
+                required_results[item_name] = normalized_item
         cpp["tests"] = list(required_results.values())
+    for name in sorted(duplicate_required_names):
+        blockers.append(f"TEST_{name}_DUPLICATE_RECORD")
     for name in REQUIRED_CTEST_NAMES:
         result = required_results.get(name)
         if result is None:
@@ -1648,6 +1698,8 @@ def _run_single_test_command(
 
 def _read_regular_file(path: Path) -> tuple[bytes | None, str | None]:
     try:
+        if _path_has_symlink_component(path):
+            return None, "path traverses a symlink"
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
             return None, "not a regular non-link file"
@@ -1955,7 +2007,14 @@ def _external_report_observation(
     input-manifest adapter instead of copying either producer's parser.
     """
 
-    declaration = {"id": kind, "kind": kind, "path": str(path), "skip_ctest": True}
+    declaration: dict[str, Any] = {
+        "id": kind, "kind": kind, "path": str(path), "ctest_not_applicable": True,
+    }
+    payload, _ = _read_regular_file(path)
+    if payload is not None:
+        # Wrapper output is generated in this invocation; bind the observed
+        # bytes before passing through the same strict source validator.
+        declaration["sha256"] = _sha256_bytes(payload)
     record, _ = _manifest_source_record(declaration, base_dir=base_dir, candidate=candidate)
     return record
 
@@ -2058,7 +2117,19 @@ def run_gate(
         tests = []
         discovered_ctest_names = _discover_ctest_names(build_base)
         xml_results = _parse_ctest_xml_results(build_base)
-        xml_by_name = {str(item.get("name")): item for item in xml_results}
+        xml_by_name: dict[str, dict[str, Any]] = {}
+        duplicate_xml_names: set[str] = set()
+        for item in xml_results:
+            item_name = str(item.get("name"))
+            if item_name in xml_by_name:
+                duplicate_xml_names.add(item_name)
+                # Preserve a non-PASS record if one exists; duplicate result
+                # files are themselves invalid evidence and are recorded
+                # below rather than silently overwritten.
+                if str(xml_by_name[item_name].get("status")) == "PASS":
+                    xml_by_name[item_name] = dict(item)
+            else:
+                xml_by_name[item_name] = dict(item)
         for name in REQUIRED_CTEST_NAMES:
             # A test is considered covered only when CTest declares it in the
             # generated test files.  XML gives per-test counts for gtests;
@@ -2066,10 +2137,17 @@ def run_gate(
             if name in xml_by_name:
                 tests.append(dict(xml_by_name[name]))
             elif name in discovered_ctest_names:
-                tests.append({"name": name, "status": "PASS" if test_result.ok else "FAIL"})
+                # Discovery in CTestTestfile.cmake is not execution evidence.
+                # A missing/malformed result must remain NOT_VERIFIED instead
+                # of falling back to the shell exit code (which used to let a
+                # damaged XML report become an apparent PASS).
+                tests.append({"name": name, "status": "NOT_VERIFIED"})
             else:
                 tests.append({"name": name, "status": "NOT_RUN"})
         observations["cpp_tests"] = {"status": "PASS" if test_result.ok else "FAIL", **counts, "tests": tests}
+        if duplicate_xml_names:
+            observations["cpp_tests"]["status"] = "FAIL"
+            observations["cpp_tests"]["xml_duplicate_names"] = sorted(duplicate_xml_names)
 
         result_cmd = [
             "bash", "-lc",
@@ -2261,7 +2339,7 @@ def _load_observations(path: Path) -> dict[str, Any]:
     payload, error = _read_regular_file(path)
     if payload is None:
         raise ValueError(error or "cannot read observations")
-    value = _parse_json(payload.decode("utf-8"))
+    value = _parse_json_strict(payload.decode("utf-8"), context=str(path))
     if not isinstance(value, Mapping):
         raise ValueError("observations JSON must be an object")
     return dict(value)
@@ -2291,6 +2369,7 @@ _HARDWARE_INPUT_KINDS = frozenset({
     "model", "production_model", "formal_model", "formal_calibration",
     "camera", "orin", "cdc", "gimbal", "firing", "hardware",
 })
+_ALL_INPUT_KINDS = frozenset(_SOFTWARE_INPUT_KINDS | _HARDWARE_INPUT_KINDS)
 _REQUIRED_ARTIFACT_ROLES = (
     "model_xml", "model_bin", "model_profile", "pnp_config",
     "calibration_manifest",
@@ -2298,7 +2377,40 @@ _REQUIRED_ARTIFACT_ROLES = (
 
 
 def _manifest_kind(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    # Do not stringify arbitrary JSON values.  ``kind=123`` and
+    # ``kind=["build"]`` must not turn into an unrecognised token that then
+    # bypasses all kind-specific safety checks.
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    """Return whether an existing component of *path* is a symlink.
+
+    Checking only ``path.lstat()`` protects the final component but still lets
+    ``link-dir/report.json`` escape the declared tree.  Walk every existing
+    component without resolving it; a missing final file remains a truthful
+    absence, while a symlink at any depth is rejected.
+    """
+
+    absolute = Path(os.path.abspath(str(path)))
+    current = Path(absolute.anchor) if absolute.anchor else Path()
+    for component in absolute.parts:
+        if component == absolute.anchor:
+            continue
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            # Once a component is absent, no later component can be an
+            # existing path.  The caller will report the missing file.
+            break
+        except OSError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            return True
+    return False
 
 
 def _manifest_path(raw: Any, *, base_dir: Path) -> Path:
@@ -2310,7 +2422,10 @@ def _manifest_path(raw: Any, *, base_dir: Path) -> Path:
     value = Path(raw).expanduser()
     if not value.is_absolute():
         value = base_dir / value
-    return Path(os.path.abspath(str(value)))
+    path = Path(os.path.abspath(str(value)))
+    if _path_has_symlink_component(path):
+        raise ValueError("declared input path traverses a symlink")
+    return path
 
 
 def _manifest_sha(value: Any, *, context: str) -> str | None:
@@ -2319,6 +2434,15 @@ def _manifest_sha(value: Any, *, context: str) -> str | None:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
         raise ValueError(f"{context} sha256 must be 64 hexadecimal characters")
     return value.lower()
+
+
+def _manifest_absence_status(value: Any) -> str | None:
+    """Parse an explicit absence state; aliases such as WARN are forbidden."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip().upper()
+    return text if text in {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"} else None
 
 
 def _manifest_status(value: Any) -> str | None:
@@ -2336,13 +2460,37 @@ def _manifest_status(value: Any) -> str | None:
     return text if text in ALLOWED_STATUSES else None
 
 
+_STATUS_ALIAS_KEYS = (
+    "status", "overall_status", "result", "software_candidate_status",
+    "report_status", "bundle_status", "bundle_report_status",
+)
+
+
 def _manifest_status_hint(root: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    for key in ("status", "overall_status", "result", "software_candidate_status"):
-        if key in root:
-            raw = root.get(key)
-            status = _manifest_status(raw)
-            return status, str(raw)
-    return None, None
+    """Return one status only when every status alias agrees.
+
+    Producers use different names for the same outcome.  Selecting the first
+    key is unsafe because a contradictory later alias can hide a failure.
+    ``CONFLICTING_STATUS_ALIASES`` is returned as the raw marker so callers
+    retain the historical two-value API while still exposing a useful reason.
+    """
+
+    values: list[tuple[str, Any, str | None]] = []
+    for key in _STATUS_ALIAS_KEYS:
+        if key not in root:
+            continue
+        raw = root.get(key)
+        values.append((key, raw, _manifest_status(raw)))
+    if not values:
+        return None, None
+    if any(status is None for _, _, status in values):
+        invalid = next(key for key, _, status in values if status is None)
+        return None, f"INVALID_STATUS_ALIAS:{invalid}"
+    normalized = {status for _, _, status in values}
+    if len(normalized) != 1:
+        return None, "CONFLICTING_STATUS_ALIASES"
+    status = next(iter(normalized))
+    return status, str(values[0][1])
 
 
 def _manifest_find_safety(value: Any) -> Mapping[str, Any] | None:
@@ -2385,40 +2533,66 @@ def _manifest_normalise_safety(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _manifest_ctest_counts(path: Path) -> tuple[dict[str, int] | None, str | None]:
-    """Parse one explicitly supplied CTest XML result file."""
+def _manifest_ctest_records(path: Path) -> tuple[list[dict[str, str]] | None, bytes | None, str | None]:
+    """Parse explicit CTest XML records, preserving names and source bytes."""
 
     payload, error = _read_regular_file(path)
     if payload is None:
-        return None, error or "CTest XML is unavailable"
+        return None, None, error or "CTest XML is unavailable"
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(payload)
     except ET.ParseError as exc:
-        return None, f"CTest XML is malformed: {exc}"
+        return None, payload, f"CTest XML is malformed: {exc}"
     local_name = lambda tag: str(tag).rsplit("}", 1)[-1]
     if local_name(root.tag) != "Site":
-        return None, "CTest XML root must be Site"
+        return None, payload, "CTest XML root must be Site"
     testing_nodes = [node for node in root if isinstance(node.tag, str) and local_name(node.tag) == "Testing"]
     if len(testing_nodes) != 1:
-        return None, "CTest XML must contain exactly one Testing element"
+        return None, payload, "CTest XML must contain exactly one Testing element"
     records = [node for node in testing_nodes[0] if isinstance(node.tag, str) and local_name(node.tag) == "Test"]
     if not records:
-        return None, "CTest XML contains no Test result records"
-    counts = {"PASS": 0, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0}
+        return None, payload, "CTest XML contains no Test result records"
+    parsed: list[dict[str, str]] = []
+    names: set[str] = set()
     for node in records:
-        raw = node.attrib.get("Status")
-        if raw is None:
-            return None, "CTest result Test record has no Status attribute"
-        status = raw.strip().lower().replace("-", "_")
-        if status == "passed":
-            counts["PASS"] += 1
-        elif status == "failed":
-            counts["FAIL"] += 1
-        elif status in {"notrun", "not_run", "skipped"}:
-            counts["NOT_RUN"] += 1
-        else:
-            return None, f"CTest Test record has unsupported Status: {raw}"
+        raw_status = node.attrib.get("Status")
+        if not isinstance(raw_status, str):
+            return None, payload, "CTest result Test record has no Status attribute"
+        status = raw_status.strip().lower().replace("-", "_")
+        status_map = {
+            "passed": "PASS",
+            "failed": "FAIL",
+            "notrun": "NOT_RUN",
+            "not_run": "NOT_RUN",
+            "skipped": "NOT_RUN",
+            "unavailable": "UNAVAILABLE",
+            "notverified": "NOT_VERIFIED",
+            "not_verified": "NOT_VERIFIED",
+        }
+        normalized = status_map.get(status)
+        if normalized is None:
+            return None, payload, f"CTest Test record has unsupported Status: {raw_status}"
+        name_node = next((child for child in node if isinstance(child.tag, str) and local_name(child.tag) == "Name"), None)
+        name = str(name_node.text or "").strip() if name_node is not None else ""
+        if not name:
+            return None, payload, "CTest result Test record has no Name"
+        if name in names:
+            return None, payload, f"CTest XML contains duplicate test name: {name}"
+        names.add(name)
+        parsed.append({"name": name, "status": normalized})
+    return parsed, payload, None
+
+
+def _manifest_ctest_counts(path: Path) -> tuple[dict[str, int] | None, str | None]:
+    """Parse one explicitly supplied CTest XML result file."""
+
+    records, _, error = _manifest_ctest_records(path)
+    if records is None:
+        return None, error
+    counts = {"PASS": 0, "FAIL": 0, "UNAVAILABLE": 0, "NOT_RUN": 0, "NOT_VERIFIED": 0}
+    for record in records:
+        counts[record["status"]] += 1
     return counts, None
 
 
@@ -2432,19 +2606,90 @@ def _manifest_number(value: Any) -> int | None:
     return None
 
 
-def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | None:
+_MANIFEST_STATUS_PRIORITY = {
+    "PASS": 0,
+    "UNAVAILABLE": 1,
+    "NOT_RUN": 2,
+    "NOT_VERIFIED": 3,
+    "FAIL": 4,
+}
+
+
+def _manifest_aggregate_status(statuses: Iterable[str]) -> str | None:
+    normalized = list(statuses)
+    if not normalized:
+        return None
+    if any(value not in _MANIFEST_STATUS_PRIORITY for value in normalized):
+        return None
+    return max(normalized, key=lambda value: _MANIFEST_STATUS_PRIORITY[value])
+
+
+def _manifest_report_counts_and_cases(root: Mapping[str, Any]) -> tuple[dict[str, int] | None, list[dict[str, Any]] | None, str | None]:
+    """Validate a producer's counts/cases pair and derive its aggregate state."""
+
     counts_value = root.get("counts")
     cases_value = root.get("cases")
     if not isinstance(counts_value, Mapping) or not isinstance(cases_value, list):
-        return "CTest-backed report must provide both counts and cases"
-    actual, error = _manifest_ctest_counts(xml_path)
-    if actual is None:
+        return None, None, "CTest-backed report must provide both counts and cases"
+    expected_keys = {"PASS", "FAIL", "UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}
+    unknown = [str(key) for key in counts_value if str(key) not in expected_keys]
+    if unknown:
+        return None, None, "report counts contain unknown status keys: " + ", ".join(sorted(unknown))
+    counts: dict[str, int] = {}
+    for key in expected_keys:
+        number = _manifest_number(counts_value.get(key))
+        if number is None or number < 0:
+            return None, None, f"report counts.{key} must be a non-negative integer"
+        counts[key] = number
+    if sum(counts.values()) != len(cases_value) or not cases_value:
+        return None, None, "report case total disagrees with report counts"
+    names: set[str] = set()
+    normalized_cases: list[dict[str, Any]] = []
+    case_counts = {key: 0 for key in expected_keys}
+    for index, item in enumerate(cases_value):
+        if not isinstance(item, Mapping):
+            return None, None, f"report case {index} must be an object"
+        name = item.get("name", item.get("id"))
+        if not isinstance(name, str) or not name.strip():
+            return None, None, f"report case {index} requires a non-empty name"
+        name = name.strip()
+        if name in names:
+            return None, None, f"report contains duplicate case name: {name}"
+        names.add(name)
+        raw_status = item.get("status")
+        status = _manifest_status(raw_status)
+        if status not in expected_keys:
+            return None, None, f"report case {name} has invalid status"
+        case_counts[status] += 1
+        normalized_cases.append({"name": name, "status": status})
+    if case_counts != counts:
+        return None, None, "report counts disagree with case statuses"
+    return counts, normalized_cases, None
+
+
+def _manifest_compare_ctest(root: Mapping[str, Any], xml_path: Path) -> str | None:
+    counts, cases, report_error = _manifest_report_counts_and_cases(root)
+    if counts is None or cases is None:
+        return report_error
+    xml_records, payload, error = _manifest_ctest_records(xml_path)
+    if xml_records is None:
         return error
-    for key, expected in actual.items():
-        if _manifest_number(counts_value.get(key)) != expected:
-            return f"report counts disagree with CTest XML for {key}"
-    if len(cases_value) != sum(actual.values()):
-        return "report case total disagrees with CTest XML"
+    assert payload is not None
+    xml_counts = {key: 0 for key in ("PASS", "FAIL", "UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED")}
+    for item in xml_records:
+        xml_counts[item["status"]] += 1
+    if counts != xml_counts:
+        return "report counts disagree with CTest XML"
+    report_names = [str(item["name"]) for item in cases]
+    xml_names = [str(item["name"]) for item in xml_records]
+    if sorted(report_names) != sorted(xml_names):
+        return "report case names disagree with CTest XML"
+    report_status, _ = _manifest_status_hint(root)
+    aggregate = _manifest_aggregate_status(item["status"] for item in cases)
+    if report_status is None:
+        return "report status is missing or aliases conflict"
+    if aggregate != report_status:
+        return "report top-level status disagrees with counts/cases"
     return None
 
 
@@ -2478,11 +2723,134 @@ def _manifest_hash_references(value: Any, path: str = "$") -> list[tuple[str, st
                     references.append((role_hint, child.lower(), child_path))
                 elif "sha256" in key_text:
                     references.append((_manifest_role(key_text), child.lower(), child_path))
+                # ``artifact_hashes``/``expected_hashes`` are role -> digest
+                # maps, not ``{role: {sha256: ...}}`` objects.  The previous
+                # walker ignored these common forms, allowing a stale model
+                # hash to pass when all individual artifacts were present.
+                elif key_text not in {"artifact_hashes", "expected_hashes"}:
+                    parent_key = path.rsplit(".", 1)[-1].lower()
+                    if parent_key in {"artifact_hashes", "expected_hashes"}:
+                        references.append((_manifest_role(key_text), child.lower(), child_path))
             references.extend(_manifest_hash_references(child, child_path))
     elif isinstance(value, list):
         for index, child in enumerate(value):
             references.extend(_manifest_hash_references(child, f"{path}[{index}]"))
     return references
+
+
+def _manifest_negative_evidence(
+    declaration: Mapping[str, Any], root: Mapping[str, Any]
+) -> tuple[bool, list[str]]:
+    """Validate an explicitly declared negative evidence fixture.
+
+    A failed evidence bundle is normally a blocker.  The sole exception is a
+    test whose manifest says exactly what rejection it is proving: both
+    ``negative_test`` and ``expected_failure`` are true, one fixed diagnostic
+    code is expected, the process exits with a declared non-zero code, and the
+    fixture digest is pinned.  This prevents a generic ``status=PASS`` (or a
+    free-form ``production_claim_rejected`` boolean) from laundering a real
+    production failure into a passing candidate.
+    """
+
+    marker = any(
+        value is True
+        for value in (
+            declaration.get("negative_test"),
+            declaration.get("expected_failure"),
+            root.get("negative_test"),
+            root.get("expected_failure"),
+            root.get("production_claim_rejected"),
+        )
+    )
+    if not marker:
+        return False, []
+    failures: list[str] = []
+    if declaration.get("negative_test") is not True or declaration.get("expected_failure") is not True:
+        failures.append("negative evidence requires negative_test=true and expected_failure=true")
+    if root.get("production_claim_rejected") is not True:
+        failures.append("negative evidence must assert production_claim_rejected=true")
+    for key in _STATUS_ALIAS_KEYS:
+        if key in root and _manifest_status(root.get(key)) != "FAIL":
+            failures.append(f"negative evidence {key} must report FAIL")
+
+    expected_code = declaration.get("expected_diagnostic_code")
+    if not isinstance(expected_code, str) or not expected_code.strip():
+        failures.append("negative evidence requires expected_diagnostic_code")
+        expected_code = ""
+    expected_code = expected_code.strip().lower()
+
+    expected_exit = declaration.get("expected_exit_code", declaration.get("expected_failure_exit_code"))
+    expected_exit_number = _manifest_number(expected_exit)
+    if expected_exit_number is None or expected_exit_number == 0:
+        failures.append("negative evidence requires a non-zero expected_exit_code")
+
+    expected_fixture = declaration.get("fixture_sha256", declaration.get("expected_fixture_sha256"))
+    try:
+        expected_fixture = _manifest_sha(expected_fixture, context="negative fixture")
+    except ValueError as exc:
+        failures.append(str(exc))
+        expected_fixture = None
+    if expected_fixture is None:
+        failures.append("negative evidence requires fixture_sha256")
+
+    actual_exit = None
+    for key in ("exit_code", "observed_exit_code", "returncode", "process_exit_code"):
+        if key in root:
+            actual_exit = _manifest_number(root.get(key))
+            break
+    if expected_exit_number is not None and actual_exit != expected_exit_number:
+        failures.append("negative evidence exit code does not match expected_exit_code")
+
+    actual_fixture = None
+    for key in ("fixture_sha256", "fixture_hash", "expected_fixture_sha256"):
+        value = root.get(key)
+        if isinstance(value, str):
+            actual_fixture = value.lower()
+            break
+    if actual_fixture is None and isinstance(root.get("fixture"), Mapping):
+        value = root["fixture"].get("sha256", root["fixture"].get("sha"))
+        if isinstance(value, str):
+            actual_fixture = value.lower()
+    if expected_fixture is not None and actual_fixture != expected_fixture:
+        failures.append("negative evidence fixture SHA-256 does not match declaration")
+
+    diagnostics = root.get("diagnostics", root.get("bundle_diagnostics"))
+    if not isinstance(diagnostics, Mapping):
+        failures.append("negative evidence diagnostics must be an object")
+        errors: list[Any] = []
+    else:
+        errors_value = diagnostics.get("errors")
+        if not isinstance(errors_value, list):
+            failures.append("negative evidence diagnostics.errors must be an array")
+            errors = []
+        else:
+            errors = errors_value
+        warnings = diagnostics.get("warnings")
+        if warnings not in (None, [], ()):  # warnings indicate an extra outcome
+            failures.append("negative evidence diagnostics contain unexpected warnings")
+    diagnostic_codes: list[str] = []
+    for item in errors:
+        if not isinstance(item, Mapping) or not isinstance(item.get("code"), str):
+            failures.append("negative evidence diagnostics contain malformed errors")
+            continue
+        diagnostic_codes.append(item["code"].strip().lower())
+    if expected_code and diagnostic_codes != [expected_code]:
+        failures.append("negative evidence diagnostics do not exactly match expected_diagnostic_code")
+
+    # A rejected production claim may contain the one expected unsafe claim,
+    # but no residual motion, serial, firing, or additional production claim.
+    for item in scan_evidence_claims(root).get("unsafe_claims", []):
+        if not isinstance(item, Mapping):
+            failures.append("negative evidence contains malformed unsafe claim")
+            continue
+        path = str(item.get("path", "")).lower()
+        value = item.get("value")
+        if path.rsplit(".", 1)[-1] == "production_ready" and value is True:
+            continue
+        if "production_ready=true" in str(value).lower() and path.startswith("$.diagnostics"):
+            continue
+        failures.append(f"negative evidence contains unexpected unsafe claim: {path}")
+    return True, failures
 
 
 def _manifest_source_record(
@@ -2496,19 +2864,25 @@ def _manifest_source_record(
     record: dict[str, Any] = {
         "id": str(source_id) if isinstance(source_id, str) else "",
         "kind": kind,
+        "kind_raw": declaration.get("kind"),
         "path": None,
         "schema": None,
         "sha256": None,
         "status": "FAIL",
         "failure_reasons": [],
     }
+    if declaration.get("negative_test") is True or declaration.get("expected_failure") is True:
+        record["negative_test"] = declaration.get("negative_test") is True
+        record["expected_failure"] = declaration.get("expected_failure") is True
     reasons: list[str] = record["failure_reasons"]
     invalid_identity = not isinstance(source_id, str) or not source_id.strip()
-    invalid_identity = invalid_identity or not kind
+    invalid_identity = invalid_identity or not kind or kind not in _ALL_INPUT_KINDS
     if not isinstance(source_id, str) or not source_id.strip():
         reasons.append("source id must be a non-empty string")
-    if not kind:
+    if not isinstance(declaration.get("kind"), str) or not kind:
         reasons.append("source kind must be a non-empty string")
+    elif kind not in _ALL_INPUT_KINDS:
+        reasons.append(f"unsupported source kind: {declaration.get('kind')}")
     try:
         path = _manifest_path(declaration.get("path"), base_dir=base_dir)
     except ValueError as exc:
@@ -2516,7 +2890,7 @@ def _manifest_source_record(
         return record, None
     record["path"] = str(path)
     absence_raw = declaration.get("absence_status")
-    absence = _manifest_status(absence_raw)
+    absence = _manifest_absence_status(absence_raw)
     invalid_absence = absence_raw is not None and absence not in {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}
     if invalid_absence:
         reasons.append("absence_status must be UNAVAILABLE, NOT_RUN, or NOT_VERIFIED")
@@ -2555,10 +2929,18 @@ def _manifest_source_record(
         reasons.append(str(exc))
         expected_digest = None
         fatal = True
+    if expected_digest is None and not (absence is not None and len(payload) == 0):
+        reasons.append("source sha256 is required for a present source")
+        fatal = True
     if expected_digest is not None and digest != expected_digest:
         reasons.append("declared SHA-256 mismatch")
         fatal = True
-    parsed = _parse_json(payload.decode("utf-8", errors="replace"))
+    try:
+        parsed = _parse_json_strict(payload.decode("utf-8", errors="replace"), context=f"source {source_id}")
+    except ValueError as exc:
+        reasons.append(str(exc))
+        record["reason"] = reasons[0]
+        return record, None
     if not isinstance(parsed, Mapping):
         reasons.append("source is not a JSON object")
         record["reason"] = reasons[0]
@@ -2576,18 +2958,40 @@ def _manifest_source_record(
         fatal = True
         fatal = True
 
+    negative_test, negative_failures = _manifest_negative_evidence(declaration, root)
     declared_status, raw_status = _manifest_status_hint(root)
     if declared_status is None:
-        reasons.append("missing or invalid report status")
+        if raw_status == "CONFLICTING_STATUS_ALIASES":
+            reasons.append("conflicting status aliases")
+        elif isinstance(raw_status, str) and raw_status.startswith("INVALID_STATUS_ALIAS:"):
+            reasons.append("invalid status alias")
+        else:
+            reasons.append("missing or invalid report status")
         fatal = True
     elif declared_status == "FAIL":
-        reasons.append(f"source reports {raw_status}")
-        fatal = True
+        if negative_test and not negative_failures:
+            reasons.append("source reports expected negative-test failure")
+        else:
+            reasons.append(f"source reports {raw_status}")
+            fatal = True
     elif declared_status in {"NOT_RUN", "UNAVAILABLE", "NOT_VERIFIED"}:
         reasons.append(f"source reports {raw_status}")
         unverified = True
-    if scan_evidence_claims(root).get("status") != "PASS":
+    if negative_test:
+        reasons.extend(negative_failures)
+        if negative_failures:
+            fatal = True
+    claim_scan = scan_evidence_claims(root)
+    if claim_scan.get("status") != "PASS" and not negative_test:
         reasons.append("production or unsafe control claim detected")
+        fatal = True
+    elif negative_test and negative_failures:
+        # Keep the negative fixture's exact rejection diagnostics as the
+        # normative reason; unsafe claims were already checked above.
+        fatal = True
+
+    if kind in _HARDWARE_INPUT_KINDS and declared_status == "PASS":
+        reasons.append("hardware PASS evidence is not admissible in a software candidate")
         fatal = True
 
     required_safety = kind in _SOFTWARE_INPUT_KINDS or kind in _HARDWARE_INPUT_KINDS
@@ -2610,6 +3014,31 @@ def _manifest_source_record(
                 fatal = True
 
     ctest_declared = declaration.get("ctest_xml")
+    if "skip_ctest" in declaration and declaration.get("skip_ctest") is not False:
+        reasons.append("skip_ctest is not permitted in explicit admission mode")
+        fatal = True
+    ctest_not_applicable = declaration.get("ctest_not_applicable")
+    if ctest_not_applicable is not None:
+        if ctest_not_applicable is not True or kind not in {"release_smoke", "ros_e2e", "ros_message_e2e"}:
+            reasons.append("ctest_not_applicable is restricted to reviewed wrapper kinds")
+            fatal = True
+        elif ctest_declared is not None:
+            reasons.append("ctest_not_applicable cannot be combined with ctest_xml")
+            fatal = True
+        elif "counts" in root or "cases" in root:
+            _, normalized_cases, report_error = _manifest_report_counts_and_cases(root)
+            if report_error:
+                reasons.append(report_error)
+                fatal = True
+            elif normalized_cases is not None:
+                report_status, _ = _manifest_status_hint(root)
+                aggregate = _manifest_aggregate_status(item["status"] for item in normalized_cases)
+                if report_status is None or aggregate != report_status:
+                    reasons.append("report top-level status disagrees with counts/cases")
+                    fatal = True
+        elif kind in {"ros_e2e", "ros_message_e2e"}:
+            reasons.append("ROS E2E wrapper requires counts and cases when CTest is not applicable")
+            fatal = True
     if ctest_declared is not None:
         try:
             ctest_path = _manifest_path(ctest_declared, base_dir=base_dir)
@@ -2618,11 +3047,30 @@ def _manifest_source_record(
             reasons.append(str(exc))
             ctest_path = None
         if ctest_path is not None:
+            payload, ctest_read_error = _read_regular_file(ctest_path)
+            if payload is None:
+                reasons.append(ctest_read_error or "CTest XML is unavailable")
+                fatal = True
+            else:
+                record["ctest_xml_sha256"] = _sha256_bytes(payload)
+                expected_xml_sha = declaration.get("ctest_xml_sha256", root.get("ctest_xml_sha256"))
+                try:
+                    expected_xml_sha = _manifest_sha(expected_xml_sha, context=f"CTest XML for {source_id}")
+                except ValueError as exc:
+                    reasons.append(str(exc))
+                    expected_xml_sha = None
+                    fatal = True
+                if expected_xml_sha is None:
+                    reasons.append("CTest XML sha256 is required")
+                    fatal = True
+                if expected_xml_sha is not None and expected_xml_sha != record["ctest_xml_sha256"]:
+                    reasons.append("declared CTest XML SHA-256 mismatch")
+                    fatal = True
             ctest_failure = _manifest_compare_ctest(root, ctest_path)
             if ctest_failure:
                 reasons.append(ctest_failure)
                 fatal = True
-    elif ("counts" in root or "cases" in root) and not declaration.get("skip_ctest"):
+    elif ("counts" in root or "cases" in root) and ctest_not_applicable is not True:
         reasons.append("CTest-backed report requires explicit ctest_xml")
         fatal = True
 
@@ -2643,42 +3091,33 @@ def _manifest_source_record(
             break
 
     if kind in {"ros_e2e", "ros_message_e2e"}:
-        liveness = root.get("node_liveness")
-        valid_liveness = isinstance(liveness, Mapping)
-        if valid_liveness:
-            # The release-manifest contract requires the during-sampling
-            # observation and equal expected/observed stop codes.  The E2E
-            # runner also emits before/after and an explicit equality flag;
-            # whenever those optional fields are present, reject a
-            # contradictory value instead of silently accepting a report
-            # whose own liveness evidence says the node died.
-            phase_values_valid = all(
-                liveness.get(key) is True
-                for key in (
-                    "alive_before_sampling",
-                    "alive_during_sampling",
-                    "alive_after_sampling",
-                )
-                if key in liveness
-            )
-            matches_value_valid = (
-                "exit_code_matches" not in liveness or
-                liveness.get("exit_code_matches") is True
-            )
-            alive = liveness.get("alive_during_sampling")
-            expected_exit = liveness.get("expected_exit_code")
-            observed_exit = liveness.get("observed_exit_code")
-            valid_liveness = (
-                phase_values_valid
-                and matches_value_valid
-                and alive is True
-                and _manifest_number(expected_exit) is not None
-                and _manifest_number(observed_exit) is not None
-                and _manifest_number(expected_exit) == _manifest_number(observed_exit)
-            )
-        if not valid_liveness:
+        def _valid_liveness(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            if any(value.get(key) is not True for key in (
+                "alive_before_sampling", "alive_during_sampling", "alive_after_sampling",
+            )):
+                return False
+            if value.get("exit_code_matches") is not True:
+                return False
+            expected_exit = _manifest_number(value.get("expected_exit_code"))
+            observed_exit = _manifest_number(value.get("observed_exit_code"))
+            return expected_exit == 0 and observed_exit == 0
+
+        suite_liveness = root.get("node_liveness")
+        if not _valid_liveness(suite_liveness):
             reasons.append("node_liveness evidence missing or contradictory")
             unverified = True
+        cases = root.get("cases")
+        if not isinstance(cases, list) or not cases:
+            reasons.append("ROS E2E report requires non-empty cases for liveness validation")
+            unverified = True
+        else:
+            for index, case in enumerate(cases):
+                case_id = case.get("name", case.get("id", index)) if isinstance(case, Mapping) else index
+                if not isinstance(case, Mapping) or not _valid_liveness(case.get("node_liveness")):
+                    reasons.append(f"node_liveness evidence missing or contradictory for case {case_id}")
+                    unverified = True
 
     if fatal:
         record["status"] = "FAIL"
@@ -2703,6 +3142,9 @@ def _manifest_artifact_record(
         "failure_reasons": [],
     }
     reasons: list[str] = record["failure_reasons"]
+    raw_role = declaration.get("role", declaration.get("id", ""))
+    if not isinstance(raw_role, str) or not raw_role.strip() or not role:
+        reasons.append("artifact role must be a non-empty string")
     try:
         path = _manifest_path(declaration.get("path"), base_dir=base_dir)
     except ValueError as exc:
@@ -2711,7 +3153,7 @@ def _manifest_artifact_record(
         return record
     record["path"] = str(path)
     absence_raw = declaration.get("absence_status")
-    absence = _manifest_status(absence_raw)
+    absence = _manifest_absence_status(absence_raw)
     if absence_raw is not None and absence not in {"UNAVAILABLE", "NOT_RUN", "NOT_VERIFIED"}:
         reasons.append("absence_status must be UNAVAILABLE, NOT_RUN, or NOT_VERIFIED")
         absence = None
@@ -2746,6 +3188,8 @@ def _manifest_artifact_record(
     except ValueError as exc:
         reasons.append(str(exc))
         expected = None
+    if expected is None:
+        reasons.append("artifact sha256 is required for a present artifact")
     if expected is not None and expected != digest:
         reasons.append("declared SHA-256 mismatch")
     record["status"] = "FAIL" if reasons else "PASS"
@@ -2753,8 +3197,83 @@ def _manifest_artifact_record(
     return record
 
 
+def _candidate_sha_alias(
+    candidate: Mapping[str, Any], keys: Sequence[str], label: str, failures: list[str]
+) -> str | None:
+    """Read a SHA alias group and reject contradictions/type smuggling."""
+
+    values: list[tuple[str, Any]] = [(key, candidate[key]) for key in keys if key in candidate]
+    if not values:
+        failures.append(f"candidate {label} SHA is missing")
+        return None
+    normalized: list[tuple[str, str]] = []
+    for key, value in values:
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+            failures.append(f"candidate {key} must be a 40-character SHA-1")
+            continue
+        normalized.append((key, value.lower()))
+    if not normalized:
+        return None
+    expected = normalized[0][1]
+    if any(value != expected for _, value in normalized[1:]):
+        failures.append(f"candidate {label} SHA aliases conflict")
+    return expected
+
+
+def _validate_candidate_git_binding(
+    candidate: Mapping[str, Any],
+    *,
+    head: str | None,
+    baseline: str | None,
+    repo_root: Path | None,
+    runner: Runner,
+    failures: list[str],
+) -> dict[str, Any]:
+    """Bind explicit-manifest SHAs to the actual Git object/remote when possible."""
+
+    binding: dict[str, Any] = {"status": "FAIL", "verified": False}
+    initial_failure_count = len(failures)
+    if repo_root is not None:
+        observations = _git_observations(repo_root, runner, [])
+        actual_head = observations.get("head_sha")
+        actual_origin = observations.get("origin_main_sha")
+        binding.update({
+            "repo_root": str(repo_root),
+            "observed_head": actual_head,
+            "observed_origin_main": actual_origin,
+            "worktree_clean": observations.get("worktree_clean"),
+            "ancestry_verified": observations.get("candidate_base_matches_origin_main") is True,
+        })
+        if head is None or actual_head is None or str(actual_head).lower() != head.lower():
+            failures.append("candidate HEAD does not match actual Git HEAD")
+        if baseline is None or actual_origin is None or str(actual_origin).lower() != baseline.lower():
+            failures.append("candidate main_baseline does not match origin/main")
+        if observations.get("worktree_clean") is not True:
+            failures.append("candidate Git worktree is not clean")
+        if observations.get("candidate_base_matches_origin_main") is not True:
+            failures.append("candidate HEAD is not a descendant of remote main")
+        binding["verified"] = len(failures) == initial_failure_count
+        binding["status"] = "PASS" if binding["verified"] else "FAIL"
+        return binding
+
+    # API callers that cannot provide a repository must carry explicit,
+    # machine-readable proof.  A free-form ``observed_*`` string is not proof.
+    proof_keys = (
+        "git_object_verified", "origin_main_verified", "ancestry_verified",
+    )
+    if not all(candidate.get(key) is True for key in proof_keys):
+        failures.append("candidate Git binding requires repo_root or explicit verification evidence")
+    remote_sha = candidate.get("observed_origin_main", candidate.get("origin_main_sha"))
+    if remote_sha is not None and (baseline is None or not isinstance(remote_sha, str) or remote_sha.lower() != baseline.lower()):
+        failures.append("candidate observed origin/main SHA does not match main_baseline")
+    binding_verified = len(failures) == initial_failure_count
+    binding.update({"status": "PASS" if binding_verified else "FAIL", "verified": binding_verified})
+    return binding
+
+
 def build_input_manifest_report(
-    manifest: Mapping[str, Any], *, manifest_path: str | Path | None = None
+    manifest: Mapping[str, Any], *, manifest_path: str | Path | None = None,
+    repo_root: str | Path | None = None, runner: Runner | None = None,
 ) -> dict[str, Any]:
     """Assess a caller-provided, explicit software-freeze input manifest.
 
@@ -2770,26 +3289,38 @@ def build_input_manifest_report(
         raise ValueError(f"input manifest schema must be {INPUT_MANIFEST_SCHEMA}")
     if _manifest_number(manifest.get("schema_version")) != INPUT_MANIFEST_VERSION:
         raise ValueError("input manifest requires schema_version 1")
-    base_dir = Path(manifest_path).resolve().parent if manifest_path is not None else Path.cwd()
+    base_dir = Path(os.path.abspath(str(manifest_path))).parent if manifest_path is not None else Path.cwd()
     candidate_value = manifest.get("candidate")
     if not isinstance(candidate_value, Mapping):
         raise ValueError("input manifest requires candidate object")
     candidate = dict(candidate_value)
-    head = candidate.get("head", candidate.get("head_sha"))
-    baseline = candidate.get("main_baseline", candidate.get("main_baseline_sha"))
-    branch = candidate.get("branch")
     candidate_failures: list[str] = []
-    if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
-        candidate_failures.append("candidate head must be a 40-character SHA-1")
-    if not isinstance(baseline, str) or re.fullmatch(r"[0-9a-fA-F]{40}", baseline) is None:
-        candidate_failures.append("candidate main_baseline must be a 40-character SHA-1")
+    head = _candidate_sha_alias(
+        candidate, ("head", "head_sha", "candidate_commit", "candidate_sha"), "HEAD", candidate_failures
+    )
+    baseline = _candidate_sha_alias(
+        candidate,
+        ("main_baseline", "main_baseline_sha", "origin_main_sha", "baseline_main", "baseline_sha"),
+        "main_baseline", candidate_failures,
+    )
+    branch = candidate.get("branch")
     if not isinstance(branch, str) or not branch.strip():
         candidate_failures.append("candidate branch must be a non-empty string")
     if candidate.get("worktree_clean") is not True:
         candidate_failures.append("candidate worktree_clean must be true")
-    for observed_key, expected in (("observed_head", head), ("observed_head_sha", head), ("observed_main_baseline", baseline)):
-        if observed_key in candidate and candidate.get(observed_key) != expected:
-            candidate_failures.append(f"candidate {observed_key} does not match declared SHA")
+    for observed_key, expected in (("observed_head", head), ("observed_head_sha", head), ("observed_main_baseline", baseline), ("observed_origin_main", baseline)):
+        if observed_key in candidate:
+            observed = candidate.get(observed_key)
+            if not isinstance(observed, str) or expected is None or observed.lower() != expected.lower():
+                candidate_failures.append(f"candidate {observed_key} does not match declared SHA")
+    git_binding = _validate_candidate_git_binding(
+        candidate,
+        head=head,
+        baseline=baseline,
+        repo_root=Path(repo_root).resolve() if repo_root is not None else None,
+        runner=runner or _default_runner,
+        failures=candidate_failures,
+    )
 
     declarations = manifest.get("inputs", manifest.get("sources"))
     if not isinstance(declarations, list) or not declarations:
@@ -2843,15 +3374,25 @@ def build_input_manifest_report(
         elif status in {"NOT_RUN", "UNAVAILABLE", "NOT_VERIFIED"}:
             non_blocking_hardware.append(role)
 
-    required_kinds = manifest.get("required_kinds", [])
-    if required_kinds is not None:
-        if not isinstance(required_kinds, list) or any(not isinstance(value, str) for value in required_kinds):
-            raise ValueError("required_kinds must be an array of strings")
-        seen_kinds = {_manifest_kind(item.get("kind")) for item in source_records}
-        for required in required_kinds:
-            normalized = _manifest_kind(required)
-            if normalized and normalized not in seen_kinds:
-                not_verified.append(f"missing:{normalized}")
+    if "required_kinds" not in manifest:
+        raise ValueError("input manifest requires a non-empty required_kinds array")
+    required_kinds = manifest.get("required_kinds")
+    if not isinstance(required_kinds, list) or not required_kinds:
+        raise ValueError("required_kinds must be a non-empty array of strings")
+    normalized_required: list[str] = []
+    for required in required_kinds:
+        if not isinstance(required, str) or not required.strip():
+            raise ValueError("required_kinds entries must be non-empty strings")
+        normalized = _manifest_kind(required)
+        if normalized not in _ALL_INPUT_KINDS:
+            raise ValueError(f"required_kinds contains unsupported kind: {required}")
+        if normalized in normalized_required:
+            raise ValueError(f"required_kinds contains duplicate kind: {required}")
+        normalized_required.append(normalized)
+    seen_kinds = {_manifest_kind(item.get("kind")) for item in source_records}
+    for normalized in normalized_required:
+        if normalized not in seen_kinds:
+            not_verified.append(f"missing:{normalized}")
 
     # A duplicate role or a producer's declared role hash disagreement is a
     # safety contradiction, not an optional hardware gap.
@@ -2862,20 +3403,27 @@ def build_input_manifest_report(
         role = _manifest_role(item.get("role", item.get("id", "")))
         if item.get("status") == "PASS" and isinstance(digest, str):
             previous = artifact_hashes.get(role)
-            if previous is not None and previous != digest:
-                consistency_failures.append(f"artifact hash differs for {role}")
+            if previous is not None:
+                if previous != digest:
+                    consistency_failures.append(f"artifact hash differs for {role}")
+                else:
+                    consistency_failures.append(f"duplicate artifact role: {role}")
             artifact_hashes[role] = digest
     for record, root in source_roots:
         for role, digest, path in _manifest_hash_references(root):
             expected = artifact_hashes.get(role)
             if expected is not None and expected != digest:
                 consistency_failures.append(f"{record['id']} hash reference {path} disagrees for {role}")
+            elif expected is None and role in _REQUIRED_ARTIFACT_ROLES:
+                consistency_failures.append(f"{record['id']} hash reference {path} has no declared artifact for {role}")
     for reference_root, reference_label in ((candidate, "$.candidate"), (manifest.get("expected_hashes"), "$.expected_hashes")):
         if isinstance(reference_root, Mapping):
             for role, digest, path in _manifest_hash_references(reference_root, reference_label):
                 expected = artifact_hashes.get(role)
                 if expected is not None and expected != digest:
                     consistency_failures.append(f"hash reference {path} disagrees for {role}")
+                elif expected is None and role in _REQUIRED_ARTIFACT_ROLES:
+                    consistency_failures.append(f"hash reference {path} has no declared artifact for {role}")
     blockers.extend(f"HASH_CONSISTENCY_{index + 1}" for index, _ in enumerate(consistency_failures))
 
     # Missing formal model/calibration/PnP artifacts remain explicit
@@ -2900,6 +3448,7 @@ def build_input_manifest_report(
         "status": status,
         "software_candidate_status": status,
         "candidate": candidate,
+        "git_binding": git_binding,
         "inputs": sorted(source_records, key=lambda item: (str(item.get("id")), str(item.get("kind")))),
         "artifacts": sorted(artifact_records, key=lambda item: (str(item.get("role")), str(item.get("id")))),
         "artifact_hashes": {key: artifact_hashes[key] for key in sorted(artifact_hashes)},
@@ -2989,6 +3538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = build_input_manifest_report(
                 _load_observations(args.input_manifest),
                 manifest_path=args.input_manifest,
+                repo_root=args.repo_root,
             )
         elif args.observations_json:
             report = build_report(_load_observations(args.observations_json))

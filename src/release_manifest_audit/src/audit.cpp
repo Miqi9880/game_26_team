@@ -352,19 +352,18 @@ std::optional<Status> parse_status_value(const Json & value, const std::string &
 std::optional<Status> status_hint(const Object & root, std::vector<std::string> * reasons,
                                   std::string * raw_hint = nullptr)
 {
-  static const std::array<const char *, 7> aliases{{
-    "status", "overall_status", "result", "software_candidate_status",
-    "report_status", "bundle_status", "bundle_report_status"}};
+  static const std::set<std::string> aliases{
+    "status", "overallstatus", "result", "softwarecandidatestatus",
+    "reportstatus", "bundlestatus", "bundlereportstatus"};
   std::optional<Status> selected;
-  for (const auto * key : aliases) {
-    const auto * value = find(root, key);
-    if (value == nullptr) continue;
-    const auto parsed = parse_status_value(*value, key, reasons);
+  for (const auto & [key, value] : root) {
+    if (aliases.count(canonical_claim_key(key)) == 0U) continue;
+    const auto parsed = parse_status_value(value, key, reasons);
     if (!parsed) continue;
     if (raw_hint != nullptr && !raw_hint->empty()) {
       // Keep the first raw value for diagnostics; all aliases are still checked.
-    } else if (raw_hint != nullptr && std::holds_alternative<std::string>(*value)) {
-      *raw_hint = std::get<std::string>(*value);
+    } else if (raw_hint != nullptr && std::holds_alternative<std::string>(value)) {
+      *raw_hint = std::get<std::string>(value);
     }
     if (!selected) {
       selected = parsed;
@@ -729,7 +728,7 @@ bool negative_claim_rejection_valid(const Object & root, const Object & declarat
     return false;
   }
   const auto integer_nonzero = [](const std::optional<double> & value) {
-    return value && std::isfinite(*value) && *value != 0.0 &&
+    return value && std::isfinite(*value) && *value > 0.0 &&
       std::floor(*value) == *value;
   };
   const auto expected_exit = json_number(declaration, "expected_exit_code");
@@ -927,22 +926,22 @@ int run(const fs::path & config_path, const fs::path & output_dir, std::ostream 
       }
       std::optional<std::string> declared_commit;
       std::optional<std::string> declared_base;
-      for (const auto * key : {"commit", "candidate_commit", "head_sha", "candidate_sha"}) {
+      for (const auto * key : {"head", "commit", "candidate_commit", "head_sha", "candidate_sha"}) {
         if (const auto * value = find(root, key)) {
           if (!std::holds_alternative<std::string>(*value)) source.reasons.push_back(std::string(key) + " must be a string");
           else if (!declared_commit) declared_commit = std::get<std::string>(*value);
-          else if (declared_commit != std::get<std::string>(*value)) source.reasons.push_back("candidate Git SHA aliases disagree");
+          else if (lower_token(*declared_commit) != lower_token(std::get<std::string>(*value))) source.reasons.push_back("candidate Git SHA aliases disagree");
         }
       }
-      for (const auto * key : {"baseline_main", "main_baseline", "baseline_sha"}) {
+      for (const auto * key : {"main_baseline", "main_baseline_sha", "origin_main_sha", "baseline_main", "baseline_sha"}) {
         if (const auto * value = find(root, key)) {
           if (!std::holds_alternative<std::string>(*value)) source.reasons.push_back(std::string(key) + " must be a string");
           else if (!declared_base) declared_base = std::get<std::string>(*value);
-          else if (declared_base != std::get<std::string>(*value)) source.reasons.push_back("main baseline SHA aliases disagree");
+          else if (lower_token(*declared_base) != lower_token(std::get<std::string>(*value))) source.reasons.push_back("main baseline SHA aliases disagree");
         }
       }
-      if (declared_commit && *declared_commit != head) source.reasons.push_back("candidate Git SHA mismatch");
-      if (declared_base && *declared_base != baseline) source.reasons.push_back("main baseline SHA mismatch");
+      if (declared_commit && lower_token(*declared_commit) != lower_token(head)) source.reasons.push_back("candidate Git SHA mismatch");
+      if (declared_base && lower_token(*declared_base) != lower_token(baseline)) source.reasons.push_back("main baseline SHA mismatch");
       const auto configured_ctest_path = optional_text(source_config, "ctest_xml");
       const auto declared_xml_digest = optional_text(source_config, "ctest_xml_sha256");
       const auto root_xml_digest = find(root, "ctest_xml_sha256");

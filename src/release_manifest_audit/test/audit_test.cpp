@@ -336,6 +336,11 @@ TEST_F(AuditTest, EveryStatusAliasMustAgree)
   EXPECT_EQ(execute(config((root_ / "status_alias.json").string()), "status_alias"), 1);
   const auto manifest = read(root_ / "status_alias" / "release-manifest.json");
   EXPECT_NE(manifest.find("status aliases disagree"), std::string::npos);
+
+  auto camel = safe_report();
+  camel.insert(camel.find("{\"schema_version\":1") + 1, "\"overallStatus\":\"FAIL\",");
+  write(root_ / "camel_status_alias.json", camel);
+  EXPECT_EQ(execute(config((root_ / "camel_status_alias.json").string()), "camel_status_alias"), 1);
 }
 
 TEST_F(AuditTest, CTestXmlDigestMustBeDeclaredByConfiguration)
@@ -538,6 +543,31 @@ TEST_F(AuditTest, NegativeEvidenceFixtureAliasesBindFixtureNotReportBytes)
   EXPECT_EQ(execute(nested_config, "negative_nested_unsafe"), 1);
   const auto nested_manifest = read(root_ / "negative_nested_unsafe" / "release-manifest.json");
   EXPECT_NE(nested_manifest.find("production or hardware claim detected"), std::string::npos);
+}
+
+TEST_F(AuditTest, NegativeEvidenceRejectsUnavailableExitSentinel)
+{
+  const auto report = std::string(
+    "{\"schema_version\":1,\"status\":\"FAIL\",\"production_claim_rejected\":true,"
+    "\"production_ready\":true,\"exit_code\":-1,\"fixture_hash\":\"" + std::string(64, 'a') +
+    "\",\"commit\":\"" + kHead + "\",\"baseline_main\":\"" + kBase +
+    "\",\"synthetic\":true,\"test_only\":true,\"safety_defaults\":{\"serial_enabled\":false,\"dry_run\":true,\"allow_fire\":false,\"fire_command\":0,\"yaw_vel\":0,\"pitch_vel\":0,\"yaw_acc\":0,\"pitch_acc\":0},\"diagnostics\":{\"errors\":[{\"code\":\"calibration_promotion\"}],\"warnings\":[]}}");
+  write(root_ / "negative_unavailable_exit.json", report);
+  auto value = config((root_ / "negative_unavailable_exit.json").string());
+  const auto ctest = value.find(",\"ctest_xml\":");
+  ASSERT_NE(ctest, std::string::npos);
+  const auto source_close = value.find('}', ctest);
+  ASSERT_NE(source_close, std::string::npos);
+  value.erase(ctest, source_close - ctest);
+  const auto source_end = value.rfind("}]");
+  ASSERT_NE(source_end, std::string::npos);
+  value.insert(source_end,
+    ",\"negative_test\":true,\"expected_failure\":true,"
+    "\"expected_diagnostic_code\":\"calibration_promotion\","
+    "\"expected_exit_code\":-1,\"fixture_sha256\":\"" + std::string(64, 'a') + "\"");
+  EXPECT_EQ(execute(value, "negative_unavailable_exit"), 1);
+  const auto manifest = read(root_ / "negative_unavailable_exit" / "release-manifest.json");
+  EXPECT_NE(manifest.find("expected/observed exit codes must match and be non-zero"), std::string::npos);
 }
 
 TEST_F(AuditTest, RosE2EPassCasesRequireApplicableLivenessEvidence)

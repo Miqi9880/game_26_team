@@ -399,11 +399,15 @@ def _parse_json(text: str) -> Any:
 
 
 def _parse_sha_from_ls_remote(text: str) -> str | None:
+    matches: list[str] = []
     for line in str(text).splitlines():
         fields = line.split()
         if len(fields) >= 2 and fields[-1] == "refs/heads/main" and re.fullmatch(r"[0-9a-fA-F]{40}", fields[0]):
-            return fields[0].lower()
-    return None
+            matches.append(fields[0].lower())
+    # ``ls-remote`` should return exactly one ref for an exact ref query.  A
+    # duplicated/conflicting answer is ambiguous evidence and must not let a
+    # first matching line bless the candidate.
+    return matches[0] if len(matches) == 1 else None
 
 
 def _parse_status_lines(text: str) -> list[str]:
@@ -602,6 +606,32 @@ def _check_safety_values(values: Mapping[str, Any]) -> tuple[str, list[str], dic
             type_ok = isinstance(actual, (int, float)) and not isinstance(actual, bool)
         if not type_ok or actual != expected:
             violations.append(f"{key} expected {expected!r}, got {actual!r}")
+    # Numeric safety fields are emitted under both compact and unit-qualified
+    # names by different producers.  Validate every supplied alias instead of
+    # trusting whichever spelling happens to be canonicalized first; a
+    # non-zero alias must not be hidden by a zero canonical value.
+    numeric_aliases = {
+        "yaw_vel": "yaw_vel_rad_s",
+        "pitch_vel": "pitch_vel_rad_s",
+        "yaw_acc": "yaw_acc_rad_s2",
+        "pitch_acc": "pitch_acc_rad_s2",
+    }
+    for canonical, alias in numeric_aliases.items():
+        if alias not in values:
+            continue
+        alias_actual = values.get(alias)
+        alias_type_ok = isinstance(alias_actual, (int, float)) and not isinstance(alias_actual, bool)
+        if not alias_type_ok or alias_actual != 0:
+            violations.append(f"{alias} expected 0, got {alias_actual!r}")
+        if canonical in values:
+            canonical_actual = values.get(canonical)
+            canonical_type_ok = isinstance(canonical_actual, (int, float)) and not isinstance(canonical_actual, bool)
+            if (
+                not canonical_type_ok
+                or not alias_type_ok
+                or canonical_actual != alias_actual
+            ):
+                violations.append(f"safety aliases disagree for {canonical} and {alias}")
     return ("FAIL" if violations else "PASS"), violations, {key: normalized.get(key, expected) for key, expected in SAFE_DEFAULTS.items()}
 
 
@@ -2414,10 +2444,20 @@ def _path_has_symlink_component(path: Path) -> bool:
     absence, while a symlink at any depth is rejected.
     """
 
-    absolute = Path(os.path.abspath(str(path)))
+    # Inspect the lexical path before normalizing ``..``.  Normalizing first
+    # would erase a component such as ``link/../report.json`` and allow a
+    # symlink traversal to evade the boundary check.
+    absolute = Path(path)
+    if not absolute.is_absolute():
+        absolute = Path.cwd() / absolute
     current = Path(absolute.anchor) if absolute.anchor else Path()
     for component in absolute.parts:
-        if component == absolute.anchor:
+        if component in {absolute.anchor, ".", ""}:
+            continue
+        if component == "..":
+            # The preceding component has already been lstat'ed.  Move the
+            # lexical cursor upward without resolving any symlink target.
+            current = current.parent
             continue
         current = current / component
         try:
@@ -2442,6 +2482,8 @@ def _manifest_path(raw: Any, *, base_dir: Path) -> Path:
     value = Path(raw).expanduser()
     if not value.is_absolute():
         value = base_dir / value
+    if _path_has_symlink_component(value):
+        raise ValueError("declared input path traverses a symlink")
     path = Path(os.path.abspath(str(value)))
     if _path_has_symlink_component(path):
         raise ValueError("declared input path traverses a symlink")
@@ -2495,12 +2537,19 @@ def _manifest_status_hint(root: Mapping[str, Any]) -> tuple[str | None, str | No
     retain the historical two-value API while still exposing a useful reason.
     """
 
+    # Treat case/separator variants (``overallStatus``, ``overall-status``)
+    # as the same alias.  Otherwise a producer could put a failing value in a
+    # differently styled key while a canonical ``status=PASS`` remains the
+    # only field inspected by the gate.
+    alias_tokens = {
+        re.sub(r"[^a-z0-9]", "", key.lower()): key for key in _STATUS_ALIAS_KEYS
+    }
     values: list[tuple[str, Any, str | None]] = []
-    for key in _STATUS_ALIAS_KEYS:
-        if key not in root:
+    for key, raw in root.items():
+        token = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        if token not in alias_tokens:
             continue
-        raw = root.get(key)
-        values.append((key, raw, _manifest_status(raw)))
+        values.append((str(key), raw, _manifest_status(raw)))
     if not values:
         return None, None
     if any(status is None for _, _, status in values):
@@ -2796,8 +2845,11 @@ def _manifest_negative_evidence(
         failures.append("negative evidence requires negative_test=true and expected_failure=true")
     if root.get("production_claim_rejected") is not True:
         failures.append("negative evidence must assert production_claim_rejected=true")
-    for key in _STATUS_ALIAS_KEYS:
-        if key in root and _manifest_status(root.get(key)) != "FAIL":
+    alias_tokens = {
+        re.sub(r"[^a-z0-9]", "", key.lower()) for key in _STATUS_ALIAS_KEYS
+    }
+    for key, value in root.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).lower()) in alias_tokens and _manifest_status(value) != "FAIL":
             failures.append(f"negative evidence {key} must report FAIL")
 
     expected_code = declaration.get("expected_diagnostic_code")
@@ -2811,8 +2863,8 @@ def _manifest_negative_evidence(
         if key not in declaration:
             continue
         number = _manifest_number(declaration.get(key))
-        if number is None or number == 0:
-            failures.append(f"negative evidence {key} must be a non-zero integer")
+        if number is None or number <= 0:
+            failures.append(f"negative evidence {key} must be a positive integer exit code")
             continue
         expected_exit_values.append(number)
     if len(set(expected_exit_values)) > 1:
@@ -2850,6 +2902,8 @@ def _manifest_negative_evidence(
     if len(set(actual_exit_values)) > 1:
         failures.append("negative evidence observed exit-code aliases disagree")
     actual_exit = actual_exit_values[0] if actual_exit_values else None
+    if actual_exit is not None and actual_exit <= 0:
+        failures.append("negative evidence observed exit code must be a positive integer")
     if expected_exit_number is not None and actual_exit != expected_exit_number:
         failures.append("negative evidence exit code does not match expected_exit_code")
 
@@ -3172,6 +3226,12 @@ def _manifest_source_record(
         if kind not in {"release_smoke", "ros_e2e", "ros_message_e2e"}:
             reasons.append("ctest_not_applicable requires a CTest-shaped reviewed wrapper report")
             fatal = True
+    elif "ctest_xml_sha256" in root:
+        # A producer-side XML digest has no meaning without an explicitly
+        # bound XML path.  Reject it rather than allowing stale metadata to
+        # appear authoritative in a report that omitted CTest evidence.
+        reasons.append("source ctest_xml_sha256 requires explicit ctest_xml")
+        fatal = True
     elif ("counts" in root or "cases" in root) and ctest_not_applicable is not True:
         reasons.append("CTest-backed report requires explicit ctest_xml")
         fatal = True
@@ -3181,12 +3241,12 @@ def _manifest_source_record(
     def _sha_equal(left: Any, right: Any) -> bool:
         return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
 
-    for key in ("commit", "candidate_commit", "head_sha", "candidate_sha"):
+    for key in ("head", "commit", "candidate_commit", "head_sha", "candidate_sha"):
         if key in root and not _sha_equal(root.get(key), head):
             reasons.append("candidate Git SHA mismatch")
             fatal = True
             break
-    for key in ("baseline_main", "main_baseline", "baseline_sha"):
+    for key in ("main_baseline", "main_baseline_sha", "origin_main_sha", "baseline_main", "baseline_sha"):
         if key in root and not _sha_equal(root.get(key), baseline):
             reasons.append("main baseline SHA mismatch")
             fatal = True

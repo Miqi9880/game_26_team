@@ -21,6 +21,7 @@ from tools.software_freeze.software_freeze_gate import (
     _manifest_status_hint,
     _manifest_ctest_counts,
     _manifest_hash_references,
+    _check_safety_values,
     assess_observations,
     build_input_manifest_report,
     build_report,
@@ -178,6 +179,27 @@ class SoftwareFreezeGateTests(unittest.TestCase):
         result = _git_observations(Path("/tmp/fake-worktree"), fake_runner, [])
         self.assertFalse(result["candidate_base_matches_origin_main"])
         self.assertIn(("git", "merge-base", "--is-ancestor", remote_sha, "HEAD"), calls)
+
+    def test_duplicate_remote_main_answers_are_unavailable(self) -> None:
+        remote_sha = "b" * 40
+
+        def fake_runner(argv, **_kwargs):
+            command = tuple(str(item) for item in argv)
+            if command[:3] == ("git", "rev-parse", "HEAD"):
+                return CommandResult(0, "a" * 40 + "\n")
+            if command[:3] == ("git", "branch", "--show-current"):
+                return CommandResult(0, "feature\n")
+            if command[:3] == ("git", "status", "--porcelain"):
+                return CommandResult(0, "")
+            if command == ("git", "diff", "--check"):
+                return CommandResult(0)
+            if command == ("git", "ls-remote", "origin", "refs/heads/main"):
+                return CommandResult(0, f"{remote_sha}\trefs/heads/main\n{remote_sha}\trefs/heads/main\n")
+            return CommandResult(127, "", "unexpected command")
+
+        result = _git_observations(Path("/tmp/fake-worktree"), fake_runner, [])
+        self.assertIsNone(result["origin_main_sha"])
+        self.assertFalse(result["candidate_base_matches_origin_main"])
 
     def test_command_output_redacts_host_and_normalizes_timings(self) -> None:
         first = _command_record(
@@ -635,6 +657,21 @@ class SoftwareFreezeGateTests(unittest.TestCase):
         self.assertIn("offline_build", report["not_run"])
         self.assertEqual(report["software_candidate_status"], "BLOCKED")
 
+    def test_safety_numeric_aliases_are_checked_together(self) -> None:
+        status, failures, _ = _check_safety_values({
+            **SAFE_DEFAULTS,
+            "yaw_vel_rad_s": 1,
+        })
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("yaw_vel_rad_s" in item for item in failures))
+        status, failures, _ = _check_safety_values({
+            **SAFE_DEFAULTS,
+            "yaw_vel_rad_s": 1,
+            "yaw_vel": 0,
+        })
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("aliases disagree" in item for item in failures))
+
     def test_hardware_unverified_is_non_blocking(self) -> None:
         report = build_report(passing_observations())
         self.assertIn("model", report["non_blocking_hardware"])
@@ -938,6 +975,13 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("conflicting status aliases", assessed["inputs"][0]["failure_reasons"])
             self.assertEqual(_manifest_status_hint({"status": "PASS", "result": "FAIL"})[0], None)
+            self.assertEqual(_manifest_status_hint({"status": "PASS", "overallStatus": "FAIL"})[0], None)
+
+            report = self._safe_report(head="c" * 40)
+            manifest = self._minimal_input_manifest(root, report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("candidate Git SHA mismatch", assessed["inputs"][0]["failure_reasons"])
 
     def test_manifest_requires_nonempty_allowed_required_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
@@ -965,6 +1009,13 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             manifest = self._minimal_input_manifest(root, self._safe_report())
             manifest["inputs"][0]["path"] = str(link / "report.json")
             manifest["inputs"][0]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn("declared input path traverses a symlink", assessed["inputs"][0]["failure_reasons"])
+
+            # Lexical ``..`` must not erase the linked component before it is
+            # inspected.
+            manifest["inputs"][0]["path"] = str(link / ".." / "real" / "report.json")
             assessed = build_input_manifest_report(manifest)
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertIn("declared input path traverses a symlink", assessed["inputs"][0]["failure_reasons"])
@@ -1105,6 +1156,18 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                 assessed["inputs"][0]["failure_reasons"],
             )
 
+    def test_manifest_rejects_orphan_source_ctest_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            report = self._safe_report(ctest_xml_sha256="0" * 64)
+            manifest = self._minimal_input_manifest(root, report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertIn(
+                "source ctest_xml_sha256 requires explicit ctest_xml",
+                assessed["inputs"][0]["failure_reasons"],
+            )
+
     def test_manifest_rejects_liveness_exit_aliases_and_hardware_pass(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)
@@ -1224,6 +1287,25 @@ class SoftwareFreezeGateTests(unittest.TestCase):
             self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
             self.assertTrue(any(
                 "unexpected unsafe claim" in reason
+                for reason in assessed["inputs"][0]["failure_reasons"]
+            ))
+
+            report = make_report(overallStatus="PASS")
+            manifest = make_manifest(report)
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertTrue(any(
+                "negative evidence overallStatus must report FAIL" in reason
+                for reason in assessed["inputs"][0]["failure_reasons"]
+            ))
+
+            report = make_report(exit_code=-1)
+            manifest = make_manifest(report)
+            manifest["inputs"][0]["expected_exit_code"] = -1
+            assessed = build_input_manifest_report(manifest)
+            self.assertEqual(assessed["software_candidate_status"], "BLOCKED")
+            self.assertTrue(any(
+                "must be a positive integer exit code" in reason
                 for reason in assessed["inputs"][0]["failure_reasons"]
             ))
 

@@ -3354,7 +3354,6 @@ def build_input_manifest_report(
     blockers = list(candidate_failures)
     not_verified: list[str] = []
     non_blocking_hardware: list[str] = []
-    source_by_id = {item["id"]: item for item in source_records}
     hardware_kinds = _HARDWARE_INPUT_KINDS
     for item in source_records:
         status = item.get("status")

@@ -3692,6 +3692,14 @@ def build_input_manifest_report(
         failures=candidate_failures,
     )
 
+    # ``inputs`` is the canonical spelling in the software-freeze manifest;
+    # ``sources`` remains a compatibility alias for older release-manifest
+    # documents.  Supplying both is ambiguous: silently preferring one lets a
+    # stale or malicious second list hide a contradictory artifact.  Require
+    # callers to choose exactly one spelling so the bytes being admitted are
+    # unambiguous and reproducible.
+    if "inputs" in manifest and "sources" in manifest:
+        raise ValueError("input manifest must not contain both inputs and sources")
     declarations = manifest.get("inputs", manifest.get("sources"))
     if not isinstance(declarations, list) or not declarations:
         raise ValueError("input manifest requires a non-empty inputs array")

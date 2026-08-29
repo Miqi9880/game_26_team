@@ -1042,6 +1042,21 @@ class SoftwareFreezeGateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_input_manifest_report(manifest)
 
+    def test_manifest_rejects_inputs_and_sources_alias_conflict(self) -> None:
+        """Both declaration spellings must not silently select one list."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            manifest = self._minimal_input_manifest(root, self._safe_report())
+            manifest["sources"] = [{
+                "id": "contradictory",
+                "kind": "build",
+                "path": str(root / "missing.json"),
+                "sha256": "0" * 64,
+            }]
+            with self.assertRaises(ValueError):
+                build_input_manifest_report(manifest)
+
     def test_manifest_rejects_parent_symlink(self) -> None:
         if not hasattr(os, "symlink"):
             self.skipTest("symlink unavailable")

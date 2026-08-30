@@ -74,7 +74,17 @@ camera rotation, extrinsics, coordinate transforms, or control.
 - gain
 
 `camera_serial`, `camera_name`, `camera_info_url`, `frame_id`,
-`use_sensor_data_qos`, and
-the white-balance parameters are also accepted. See
+and `use_sensor_data_qos` are also accepted. See
 `config/camera_params.yaml` and the root bring-up document for units,
 calibration provenance and stop conditions.
+
+Manual white-balance ratios are currently not configured, read, or written by
+the node. Startup and runtime parameter updates leave the camera's current
+white-balance state unchanged. Future white-balance control must be implemented
+separately with the Hikrobot SDK's dedicated integer APIs and validated on the
+target camera and SDK; these ratios must not be routed through the generic
+GenICam float interface.
+
+This compatibility behavior does not validate color quality, exposure quality,
+an automatic or manual white-balance strategy, or formal vision performance.
+Those remain separate hardware-validation tasks.

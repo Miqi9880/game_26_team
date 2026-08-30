@@ -133,6 +133,8 @@ if(BUILD_TESTING)
   if(TARGET camera_safety_test)
     target_compile_definitions(camera_safety_test PRIVATE
       HIK_CAMERA_UNVERIFIED_EXAMPLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/camera_info.yaml"
+      HIK_CAMERA_DEFAULT_PARAMS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/camera_params.yaml"
+      HIK_CAMERA_NODE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/hik_camera_node.cpp"
     )
     target_link_libraries(camera_safety_test
       ${PROJECT_NAME}_safety

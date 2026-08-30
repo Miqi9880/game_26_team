@@ -1,0 +1,34 @@
+# Calibrated 2026-08-31 with auto_aim_camera_calibrate (merged 4-run dataset).
+# Board: 11x8 inner corners, 20 mm squares. Accepted 97/97 views, global RMS 0.1478 px.
+# Camera serial DA4302286, lens MV-CS016-10UC (10 mm), operator xu, code 6f7c33d.
+image_width: 1440
+image_height: 1080
+camera_name: narrow_stereo
+
+distortion_model: plumb_bob
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1814.1656271049733, 0.0, 724.71855849275437,
+         0.0, 1813.46032716116, 575.90169989101173,
+         0.0, 0.0, 1.0]
+
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.089388401646495072, 2.9512707432545957, -0.00179825173144803, -0.0013181919073637981, -1.0665972873590799]
+
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1814.1656271049733, 0.0, 724.71855849275437, 0.0,
+         0.0, 1813.46032716116, 575.90169989101173, 0.0,
+         0.0, 0.0, 1.0, 0.0]

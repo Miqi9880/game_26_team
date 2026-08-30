@@ -5,6 +5,7 @@
 # Run from the repo root with the workspace sourced:
 #   bash tools/collect_lookat_poses.sh
 set -e
+rm -rf "$HOME/calib"
 n=0
 while read -r y p; do
   n=$((n + 1))

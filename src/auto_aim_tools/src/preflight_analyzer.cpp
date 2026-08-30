@@ -698,28 +698,19 @@ std::vector<Finding> PreflightAnalyzer::relationship_findings(double now_s) cons
     };
   const auto stale_images = stale_count(unmatched_images_);
   const auto stale_camera_info = stale_count(unmatched_camera_info_);
-  const auto unmatched_count = unmatched_images_.size() + unmatched_camera_info_.size();
-  const auto unmatched_is_final_tail = [&]() {
-      if (unmatched_count == 0U) {
-        return true;
-      }
-      if (unmatched_count != 1U || stale_images != 0U || stale_camera_info != 0U ||
-        !last_matched_stamp_ns_.has_value())
-      {
-        return false;
-      }
-      const auto unmatched_stamp = !unmatched_images_.empty() ?
-        unmatched_images_.begin()->first : unmatched_camera_info_.begin()->first;
-      return unmatched_stamp > *last_matched_stamp_ns_;
-    }();
   const auto & image_stats = stats_.at(kImageTopic);
   const auto & camera_stats = stats_.at(kCameraInfoTopic);
   const bool timestamps_well_formed =
     image_stats.invalid_timestamps == 0U && image_stats.unset_timestamps == 0U &&
     camera_stats.invalid_timestamps == 0U && camera_stats.unset_timestamps == 0U;
   const bool base_pairing_valid = matched_pairs_ > 0U && timestamps_well_formed;
-  const auto pairing_status = !base_pairing_valid || !unmatched_is_final_tail ?
-    Status::Fail : unmatched_count == 0U ? Status::Pass : Status::Warn;
+  const bool paired_fields_valid =
+    dimension_mismatches_ == 0U && frame_id_mismatches_ == 0U;
+  const bool camera_info_only_surplus =
+    unmatched_images_.empty() && !unmatched_camera_info_.empty();
+  const auto pairing_status = !base_pairing_valid || !paired_fields_valid ||
+    !unmatched_images_.empty() ? Status::Fail :
+    camera_info_only_surplus ? Status::Warn : Status::Pass;
   result.push_back(
     Finding{
       pairing_status,
@@ -727,17 +718,20 @@ std::vector<Finding> PreflightAnalyzer::relationship_findings(double now_s) cons
       pairing_status == Status::Pass ?
       "Every Image has a CameraInfo with the exact same non-zero Header timestamp" :
       pairing_status == Status::Warn ?
-      "One final message is still within the DDS delivery grace; repeat or extend observation" :
-      "Image and CameraInfo require one-to-one exact non-zero Header timestamp pairing",
+      "Every received Image is exactly paired, but surplus CameraInfo may indicate image-side "
+      "BEST_EFFORT DDS delivery loss; this is not end-to-end lossless-delivery proof" :
+      "Every received Image requires an exact non-zero Header timestamp CameraInfo pair",
       {
         {"images", size_value(image_count)},
         {"camera_info", size_value(camera_info_count)},
         {"matched", size_value(matched_pairs_)},
         {"unmatched_images", size_value(unmatched_images_.size())},
         {"unmatched_camera_info", size_value(unmatched_camera_info_.size())},
+        {"surplus_camera_info",
+          size_value(camera_info_only_surplus ? unmatched_camera_info_.size() : 0U)},
         {"stale_unmatched_images", size_value(stale_images)},
         {"stale_unmatched_camera_info", size_value(stale_camera_info)},
-        {"unmatched_is_final_tail", unmatched_is_final_tail ? "true" : "false"},
+        {"camera_info_only_surplus", camera_info_only_surplus ? "true" : "false"},
         {"delivery_grace_ms", "100"},
       }});
 

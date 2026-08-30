@@ -116,7 +116,10 @@ step == width * 3 且 data.size() == step * height。
 总帧上限的 Image 会在复制前立即停止并写 rejected manifest。--max-buffered-image-bytes（默认
 256 MiB）独立限制内存中的原始 Image 字节，超过上限同样在复制前拒绝。manifest 的
 summary/limits 记录总接收数、缓存数/字节数和未配对峰值。超时、中断、publisher 数量/类型/QoS
-变化、输入缺失或未配对消息都会写 rejected manifest 并返回非零。ROS rgb8 按原像素无损写入
+变化、输入缺失或未配对 Image 都会写 rejected manifest 并返回非零。若所有归档 Image 已精确
+配对且字段契约通过，仅剩 surplus CameraInfo，则数据集可保持 evidence_only accepted，但 manifest
+必须记录 surplus 数量和 warning：BEST_EFFORT/VOLATILE 下可能存在 image-side DDS delivery loss，
+这不是同步、无丢包或端到端无损投递证明。surplus 不会被静默隐藏。ROS rgb8 按原像素无损写入
 PNG，记录的 SHA-256 针对归档 PNG 字节；width、height、encoding、step、data size 等
 字段描述原始 ROS message。
 

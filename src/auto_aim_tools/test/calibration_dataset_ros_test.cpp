@@ -174,6 +174,58 @@ TEST_F(CalibrationDatasetRosTest, MissingCameraInfoTimesOutToInputEvidence)
   EXPECT_FALSE(manifest["records"][0]["camera_info"]["present"].as<bool>());
 }
 
+TEST_F(CalibrationDatasetRosTest, SurplusCameraInfoCreatesAcceptedManifestWithWarning)
+{
+  TemporaryDirectory temporary;
+  auto recorder = std::make_shared<auto_aim_tools::CalibrationDatasetRecorderNode>(
+    ros_config(), temporary.path() / "dataset", 2, 2s, "abcdef0");
+  auto publisher_node = std::make_shared<rclcpp::Node>("calibration_dataset_surplus_info_pub");
+  auto image_publisher = publisher_node->create_publisher<sensor_msgs::msg::Image>(
+    "/image_raw", rclcpp::SensorDataQoS());
+  auto camera_publisher = publisher_node->create_publisher<sensor_msgs::msg::CameraInfo>(
+    "/camera_info", rclcpp::SensorDataQoS());
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(recorder);
+  executor.add_node(publisher_node);
+
+  const auto discovery_deadline = std::chrono::steady_clock::now() + 1s;
+  while ((image_publisher->get_subscription_count() == 0U ||
+    camera_publisher->get_subscription_count() == 0U) &&
+    std::chrono::steady_clock::now() < discovery_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(20ms);
+  }
+  ASSERT_GT(image_publisher->get_subscription_count(), 0U);
+  ASSERT_GT(camera_publisher->get_subscription_count(), 0U);
+  camera_publisher->publish(camera_info(9));
+  image_publisher->publish(image(10, 17));
+  camera_publisher->publish(camera_info(10));
+  image_publisher->publish(image(11, 29));
+  camera_publisher->publish(camera_info(11));
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (!recorder->finished() && std::chrono::steady_clock::now() < deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(10ms);
+  }
+
+  ASSERT_TRUE(recorder->finished());
+  const auto result = recorder->result();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->accepted);
+  const auto manifest = YAML::LoadFile(result->manifest_path.string());
+  EXPECT_EQ(manifest["profile"].as<std::string>(), "evidence_only");
+  EXPECT_FALSE(manifest["production_ready"].as<bool>());
+  EXPECT_EQ(manifest["summary"]["received_image_count"].as<std::size_t>(), 2U);
+  EXPECT_EQ(manifest["summary"]["received_camera_info_count"].as<std::size_t>(), 3U);
+  EXPECT_EQ(manifest["summary"]["surplus_camera_info_count"].as<std::size_t>(), 1U);
+  ASSERT_EQ(manifest["warnings"].size(), 1U);
+  const auto warning = manifest["warnings"][0].as<std::string>();
+  EXPECT_NE(warning.find("surplus_camera_info_count=1"), std::string::npos);
+  EXPECT_NE(warning.find("BEST_EFFORT/VOLATILE"), std::string::npos);
+  EXPECT_NE(warning.find("not end-to-end lossless-delivery proof"), std::string::npos);
+}
+
 TEST_F(CalibrationDatasetRosTest, HighRateMissingCameraInfoIsHardBoundedByMaxFrames)
 {
   TemporaryDirectory temporary;

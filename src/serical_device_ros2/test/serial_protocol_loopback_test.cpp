@@ -19,7 +19,8 @@ constexpr std::size_t kFramePrefixAndCrcOverhead =
   sizeof(io::FrameHeader) + sizeof(std::uint16_t) + sizeof(std::uint16_t);
 constexpr std::size_t kVisionFrameOverhead =
   kFramePrefixAndCrcOverhead + sizeof(io::MsgEndInfo);
-constexpr std::size_t kRobotCtrlFrameOverhead = kFramePrefixAndCrcOverhead;
+constexpr std::size_t kRobotCtrlFrameOverhead =
+  kFramePrefixAndCrcOverhead + sizeof(io::MsgEndInfo);
 constexpr std::uint8_t kUntouchedByte = 0x5aU;
 
 std::uint8_t reference_crc8(const std::uint8_t * data, std::size_t length)
@@ -142,7 +143,7 @@ TEST(SerialProtocolLayout, PackedOffsetsAndFrameLengths)
   EXPECT_EQ(offsetof(io::RobotCtrlData, fire_command), 25U);
 
   EXPECT_EQ(sizeof(io::VisionData) + kVisionFrameOverhead, 58U);
-  EXPECT_EQ(sizeof(io::RobotCtrlData) + kRobotCtrlFrameOverhead, 35U);
+  EXPECT_EQ(sizeof(io::RobotCtrlData) + kRobotCtrlFrameOverhead, 37U);
 }
 
 TEST(SerialCrc, KnownVectorsAndCrc16LittleEndianWireOrder)
@@ -243,7 +244,7 @@ TEST(SerialProtocolLoopback, RobotControlPack)
 
   const auto length = pack(sender, input, io::CHASSIS_CTRL_CMD_ID, frame);
   ASSERT_EQ(length, sizeof(input) + kRobotCtrlFrameOverhead);
-  EXPECT_EQ(length, 35U);
+  EXPECT_EQ(length, 37U);
 
   io::FrameHeader header{};
   std::memcpy(&header, frame.data(), sizeof(header));
@@ -263,16 +264,16 @@ TEST(SerialProtocolLoopback, RobotControlPack)
 
   const auto crc16_offset = payload_offset + sizeof(input);
   ASSERT_EQ(crc16_offset, 33U);
-  EXPECT_EQ(crc16_offset + sizeof(std::uint16_t), length);
+  EXPECT_EQ(crc16_offset + sizeof(std::uint16_t) + sizeof(io::MsgEndInfo), length);
   const auto expected_crc16 = reference_crc16(frame.data(), crc16_offset);
   EXPECT_EQ(frame[crc16_offset], static_cast<std::uint8_t>(expected_crc16 & 0xffU));
   EXPECT_EQ(frame[crc16_offset + 1], static_cast<std::uint8_t>((expected_crc16 >> 8U) & 0xffU));
   EXPECT_TRUE(Verify_CRC16_Check_Sum(frame.data(), length));
 
-  // The two bytes after the transmitted 35-byte range remain untouched;
-  // 0x0102 must not append MsgEndInfo{0D, 0A} after its CRC16.
-  EXPECT_EQ(frame[length], kUntouchedByte);
-  EXPECT_EQ(frame[length + 1], kUntouchedByte);
+  // 0x0102 carries the same 0D 0A terminator as every other frame; the MCU
+  // appends it to all of its own packets (wire capture 2026-08-31).
+  EXPECT_EQ(frame[length - 2], io::END1_SOF);
+  EXPECT_EQ(frame[length - 1], io::END2_SOF);
 }
 
 TEST(SerialProtocolLoopback, RejectsCorruptedFramesAndInvalidInputs)
@@ -297,13 +298,18 @@ TEST(SerialProtocolLoopback, RejectsCorruptedFramesAndInvalidInputs)
   bad_crc16[54] ^= 0x01U;
   EXPECT_EQ(receiver.ReceiveDataSolve(bad_crc16.data()), 0U);
 
-  std::array<std::uint8_t, sizeof(io::VisionData)> short_payload{};
-  std::array<std::uint8_t, 512> wrong_length_frame{};
+  // A 46-byte Vision payload (struct without game_progress) matches the MCU
+  // wire format and must be accepted with the missing byte left at zero.
+  std::array<std::uint8_t, sizeof(io::VisionData) - 1U> short_payload{};
+  std::memcpy(short_payload.data(), &input, short_payload.size());
+  std::array<std::uint8_t, 512> short_frame{};
   ASSERT_EQ(
     sender.SenderPackSolve(
-      short_payload.data(), sizeof(short_payload) - 1U, io::VISION_ID, wrong_length_frame.data()),
+      short_payload.data(), short_payload.size(), io::VISION_ID, short_frame.data()),
     57U);
-  EXPECT_EQ(receiver.ReceiveDataSolve(wrong_length_frame.data()), 0U);
+  EXPECT_EQ(receiver.ReceiveDataSolve(short_frame.data()), 57U);
+  EXPECT_EQ(std::memcmp(&receiver.vision_msg_, short_payload.data(), short_payload.size()), 0);
+  EXPECT_EQ(receiver.vision_msg_.game_progress, 0U);
 
   std::array<std::uint8_t, 512> oversized_frame{};
   oversized_frame[0] = io::HEADER_SOF;
@@ -317,22 +323,20 @@ TEST(SerialProtocolLoopback, RejectsCorruptedFramesAndInvalidInputs)
     reinterpret_cast<std::uint8_t *>(&input), sizeof(input), io::VISION_ID, nullptr), 0U);
   EXPECT_EQ(sender.SenderPackSolve(
     valid_frame.data(), 502U, io::VISION_ID, valid_frame.data()), 0U);
-
-  EXPECT_EQ(std::memcmp(&receiver.vision_msg_, &input, sizeof(input)), 0);
 }
 
-TEST(SerialFrameParser, DistinguishesRobotControl35ByteFrameFromVisionTailFrame)
+TEST(SerialFrameParser, DistinguishesRobotControlFrameFromVisionTailFrame)
 {
   const auto vision = make_vision();
   const auto control = make_control();
   SerialMain sender;
   std::array<std::uint8_t, 512> robot_frame{};
   std::array<std::uint8_t, 512> vision_frame{};
-  ASSERT_EQ(pack(sender, control, io::CHASSIS_CTRL_CMD_ID, robot_frame), 35U);
+  ASSERT_EQ(pack(sender, control, io::CHASSIS_CTRL_CMD_ID, robot_frame), 37U);
   ASSERT_EQ(pack(sender, vision, io::VISION_ID, vision_frame), 58U);
 
   std::vector<std::uint8_t> stream;
-  stream.insert(stream.end(), robot_frame.begin(), robot_frame.begin() + 35);
+  stream.insert(stream.end(), robot_frame.begin(), robot_frame.begin() + 37);
   stream.insert(stream.end(), vision_frame.begin(), vision_frame.begin() + 58);
 
   SerialFrameParser parser;
@@ -344,7 +348,7 @@ TEST(SerialFrameParser, DistinguishesRobotControl35ByteFrameFromVisionTailFrame)
       return true;
     }), 2U);
   ASSERT_EQ(accepted_lengths.size(), 2U);
-  EXPECT_EQ(accepted_lengths[0], 35U);
+  EXPECT_EQ(accepted_lengths[0], 37U);
   EXPECT_EQ(accepted_lengths[1], 58U);
   EXPECT_EQ(parser.buffered_length(), 0U);
 }
@@ -363,13 +367,15 @@ TEST(SerialFrameParser, RejectsHeaderCrc8AndWrongPayloadLengthThenRecovers)
   bad_crc8[4] ^= 0x01U;
   io::FrameHeader bad_length_header{};
   std::memcpy(&bad_length_header, bad_length.data(), sizeof(bad_length_header));
-  bad_length_header.data_length = static_cast<std::uint16_t>(sizeof(io::VisionData) - 1U);
+  // 46 is the valid MCU wire length; 45 is genuinely unknown.
+  bad_length_header.data_length = static_cast<std::uint16_t>(sizeof(io::VisionData) - 2U);
   std::memcpy(bad_length.data(), &bad_length_header, sizeof(bad_length_header));
   Append_CRC8_Check_Sum(bad_length.data(), sizeof(io::FrameHeader));
+  constexpr std::size_t kBadLengthFrameSize = sizeof(io::VisionData) - 2U + 11;
 
   std::vector<std::uint8_t> stream;
   stream.insert(stream.end(), bad_crc8.begin(), bad_crc8.begin() + 58);
-  stream.insert(stream.end(), bad_length.begin(), bad_length.begin() + 58);
+  stream.insert(stream.end(), bad_length.begin(), bad_length.begin() + kBadLengthFrameSize);
   stream.insert(stream.end(), valid.begin(), valid.begin() + 58);
 
   SerialFrameParser parser;

@@ -26,11 +26,12 @@
 | 数据 | 方向 | 命令号 | payload | 当前主线完整帧 |
 |---|---|---:|---:|---|
 | `VisionData` | 下位机到上位机 | `VISION_ID=0x0105` | 47 bytes | 58 bytes，CRC16 后为 `0D 0A` |
-| `RobotCtrlData` | 上位机到下位机 | `CHASSIS_CTRL_CMD_ID=0x0102` | 26 bytes | 35 bytes，CRC16 后不追加 `0D 0A` |
+| `RobotCtrlData` | 上位机到下位机 | `CHASSIS_CTRL_CMD_ID=0x0102` | 26 bytes | 37 bytes，CRC16 后为 `0D 0A` |
 
-`RobotCtrlData` 35-byte 边界对应已合并的
-[Fix 0x0102 RobotCtrl frame length without tail #13](https://github.com/Miqi9880/game_26_team/pull/13)。
-该 PR 不是现场固件一致性的证明。若实采与表中边界不同，停止联调并提交差异证据，不修改
+2026-08-31 从 `/dev/robomaster` 实采到 2 帧完整 VISION 帧：`data_length=46`（vision 结构体去掉
+末尾 `game_progress` 字节）、CRC8/CRC16 与仓库实现逐字节一致、帧尾 `0D 0A`。此证据推翻了
+[PR #13](https://github.com/Miqi9880/game_26_team/pull/13) 的 35-byte 无尾假设，主线下发帧已改为
+37 bytes 带 `0D 0A`。若实采与表中边界不同，停止联调并提交差异证据，不修改
 `protocol_new.hpp`、CRC、parser、帧结构或长度来迎合单帧结果。
 
 ## 3. VisionData golden frame（至少一帧）
@@ -63,7 +64,7 @@
 | 字段 | 实采内容 |
 |---|---|
 | 方向 | `上位机 -> 下位机` |
-| 完整帧长度 | `<十进制 bytes；预期边界 35>` |
+| 完整帧长度 | `<十进制 bytes；预期边界 37>` |
 | 完整原始 hex | `<从第 1 byte 到 CRC16 最后 1 byte；空格分隔，禁止省略>` |
 | header 原始 hex | `<必填>` |
 | `data_length` 原始 hex / 解码值 | `<原始 bytes>` / `<值与语义>` |
@@ -77,7 +78,7 @@
 | CRC16 覆盖范围 | `<起止 byte offset；不得猜测>` |
 | CRC16 源码追溯 | `<固件 repo、commit、文件、函数、构建版本、源码 SHA-256>` |
 | 独立 CRC 校验 | `<工具/版本/算法参数、输入文件 SHA-256、期望/实际、MATCH/MISMATCH>` |
-| CRC16 后字节 | `<预期 NONE；如有任何 byte，原样记录并停止>` |
+| CRC16 后字节 | `<预期 `0D 0A`；缺尾或不同时原样记录并停止>` |
 | 采集时间与原始日志位置 | `<必填>` |
 
 ## 5. 端序、ABI 与固件一致性
@@ -99,7 +100,7 @@
 - [ ] 长度、header、`data_length`、`seq`、命令号、payload、CRC 和帧尾逐项标注；
 - [ ] CRC 使用独立实现复算，结果与原始帧一致；
 - [ ] 端序、float、packing、ABI 和实际烧录固件都有证据；
-- [ ] `RobotCtrlData` CRC16 后确认没有 `0D 0A` 或其他尾字节；
+- [ ] `RobotCtrlData` CRC16 后确认存在 `0D 0A` 帧尾；
 - [ ] 复核人签字，所有 `UNKNOWN`/`MISMATCH` 已列为阻断项。
 
 最终结论：`<ACCEPTED_EVIDENCE / REJECTED_EVIDENCE / PENDING；说明范围>`

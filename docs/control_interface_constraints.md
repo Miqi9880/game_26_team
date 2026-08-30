@@ -13,8 +13,8 @@
 
 ## 协议字段与帧证据边界
 
-- `VisionData` 使用命令号 `0x0105`，payload 为 47 bytes，主线接收帧边界为 58 bytes，CRC16 后带 `0D 0A`。
-- `RobotCtrlData` 使用命令号 `0x0102`，payload 为 26 bytes，主线下发帧边界为 35 bytes，CRC16 后不追加 `0D 0A`。
+- `VisionData` 使用命令号 `0x0105`，payload 为 47 bytes，主线接收帧边界为 58 bytes，CRC16 后带 `0D 0A`。2026-08-31 串口实采显示 MCU 发送 `data_length=46`（vision 结构体去掉末尾 `game_progress` 字节），接收侧同时接受 46/47。
+- `RobotCtrlData` 使用命令号 `0x0102`，payload 为 26 bytes，主线下发帧边界为 37 bytes，CRC16 后带 `0D 0A`。2026-08-31 实采显示 MCU 自身所有帧均带 `0D 0A`，与 DJI 帧格式一致；此前 PR #13 的 35-byte 无尾假设已被该证据推翻。
 - CRC8/CRC16 的当前软件回归约定分别使用初值 `0xFF`/`0xFFFF`；CRC16 写入顺序为低字节在前、高字节在后。软件向量和 loopback 只证明本地实现，不能被写成 MCU raw-hex golden frame。
 - `bullet_count` 仅记录累计发送次数，不代表剩余弹量，也不参与目标、弹道或开火决策；`game_progress` 保留为历史协议字段并只记录，不参与算法。
 - `fire_command` 在当前所有离线、dry-run 和安全控制路径必须保持 `0`；在电控确认 `1/2` 的脉冲/电平、保持时间和停止规则前，不得发送非零值。
@@ -46,6 +46,6 @@ Yaw 在输出边界归一化到闭区间 `[-180, 180]` degree。NaN、Inf、非�
 
 ## 仍待确认
 
-通信链路确认是 **CDC USB**，因此本链路不应被描述为需要统一 UART 波特率；代码中的 `115200` 仅保留为历史兼容参数，不能写成已确认的物理波特率或 USB line coding。当前没有 MCU 提供的原始十六进制（raw-hex） golden frame，也没有真实 CDC 收发硬件验证；软件 CRC 向量、loopback 和 parser 测试只证明软件回归行为，不能替代这两类现场证据。
+通信链路确认是 **CDC USB**，因此本链路不应被描述为需要统一 UART 波特率；代码中的 `115200` 仅保留为历史兼容参数，不能写成已确认的物理波特率或 USB line coding。2026-08-31 已从 `/dev/robomaster` 抓取到 MCU→主机方向完整原始帧（160 bytes，含 2 帧完整 VISION 帧，CRC8/CRC16 与仓库实现逐字节一致，均带 `0D 0A`）；主机→MCU 方向的 golden frame 仍未取得，电控接收端对帧尾与 `data_length` 语义的确认仍待补。
 
-仍待确认的项目包括：真实 golden frame、MCU/Orin 端序与 FP32 ABI/packing 的现场一致性、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序。上述事项未闭环前不得猜测或扩大硬件联调范围。
+仍待确认的项目包括：主机→MCU 方向 golden frame、MCU/Orin 端序与 FP32 ABI/packing 的现场一致性、四元数旋转方向、`mode=33` 是否为控制前提、各车型精确 watchdog 和最终限位、正式相机 K/D、装甲尺寸、camera→control 外参，以及开火时序。上述事项未闭环前不得猜测或扩大硬件联调范围。

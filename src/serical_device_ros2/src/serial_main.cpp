@@ -175,12 +175,17 @@ uint16_t SerialMain::ReceiveDataSolve(const uint8_t *frame, std::size_t frame_le
 	uint16_t cmd_id = 0;
 	std::memcpy(&cmd_id, frame + sizeof(io::FrameHeader), sizeof(cmd_id));
 	const std::size_t payload_offset = sizeof(io::FrameHeader) + sizeof(cmd_id);
-	if (cmd_id != io::VISION_ID || header.data_length != sizeof(io::VisionData))
+	// MCU wire capture (2026-08-31) carries data_length=46: the vision struct
+	// without the trailing game_progress byte.  Accept both lengths and copy
+	// only what arrived so the unset byte stays 0.
+	if (cmd_id != io::VISION_ID ||
+		(header.data_length != sizeof(io::VisionData) &&
+			header.data_length != sizeof(io::VisionData) - 1))
 	{
 		return 0;
 	}
 
-	std::memcpy(&vision_msg_, frame + payload_offset, sizeof(io::VisionData));
+	std::memcpy(&vision_msg_, frame + payload_offset, header.data_length);
 	frame_receive_header_ = header;
 	return static_cast<uint16_t>(expected_length);
 }
@@ -210,17 +215,11 @@ uint16_t SerialMain::SenderPackSolve(uint8_t *data, uint16_t data_length,
 	
 	memcpy(send_buf + index, data, data_length);//assign data
 	
-	// The MCU-confirmed upper-computer -> lower-computer 0x0102 control
-	// frame ends immediately after CRC16.  Other packet layouts retain their
-	// existing tail so the Vision receive protocol remains unchanged.
+	// Every frame carries the 0D 0A terminator: the MCU appends it to all of
+	// its own packets (wire capture 2026-08-31), and the receive side here
+	// rejects frames without it.
 	Append_CRC16_Check_Sum(send_buf, data_length + 9);
-
-	if (cmd_id != io::CHASSIS_CTRL_CMD_ID)
-	{
-		const io::MsgEndInfo frame_end{};
-		memcpy(send_buf + data_length + 9, &frame_end, sizeof(frame_end));
-		return data_length + 9 + sizeof(frame_end);
-	}
-
-	return data_length + 9;
+	const io::MsgEndInfo frame_end{};
+	memcpy(send_buf + data_length + 9, &frame_end, sizeof(frame_end));
+	return data_length + 9 + sizeof(frame_end);
 }

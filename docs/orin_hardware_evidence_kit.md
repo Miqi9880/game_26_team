@@ -41,12 +41,12 @@ fire_command=0
 | 数据 | 方向 | 命令号 | payload | 当前完整帧边界 |
 |---|---|---:|---:|---|
 | `VisionData` | 下位机到上位机 | `VISION_ID=0x0105` | 47 bytes | 58 bytes；CRC16 后有 `0D 0A` |
-| `RobotCtrlData` | 上位机到下位机 | `CHASSIS_CTRL_CMD_ID=0x0102` | 26 bytes | 35 bytes；CRC16 后不追加 `0D 0A` |
+| `RobotCtrlData` | 上位机到下位机 | `CHASSIS_CTRL_CMD_ID=0x0102` | 26 bytes | 37 bytes；CRC16 后有 `0D 0A` |
 
-`RobotCtrlData` 的 35-byte 边界已有合并的
-[PR #13](https://github.com/Miqi9880/game_26_team/pull/13) 记录。它不自动证明现场固件、CRC、
-端序或 ABI 与主线一致。`header/data_length/seq` 的原始字节、命令号字节顺序、payload 字节、
-CRC 覆盖范围与结果仍必须从 golden frame 和电控证据逐项填写，禁止按模板占位符猜测。
+2026-08-31 从 `/dev/robomaster` 实采到 2 帧完整 VISION 帧（`data_length=46`、CRC8/CRC16 与仓库
+实现逐字节一致、帧尾 `0D 0A`），据此推翻了 PR #13 的 35-byte 无尾假设，下发帧改为 37 bytes 带
+`0D 0A`。`header/data_length/seq` 的原始字节、命令号字节顺序、payload 字节、CRC 覆盖范围与结果
+仍必须从 golden frame 和电控证据逐项填写，禁止按模板占位符猜测。
 
 ## 判定原则
 

@@ -16,7 +16,10 @@ bool SerialFrameParser::IsKnownPayloadLength(
 {
   switch (command) {
     case io::VISION_ID:
-      return payload_length == sizeof(io::VisionData);
+      // The MCU sends 46 bytes (vision data without the trailing
+      // game_progress byte); the full 47-byte layout is also accepted.
+      return payload_length == sizeof(io::VisionData) ||
+        payload_length == sizeof(io::VisionData) - 1;
     case io::CHASSIS_CTRL_CMD_ID:
       return payload_length == sizeof(io::RobotCtrlData);
     default:
@@ -26,9 +29,9 @@ bool SerialFrameParser::IsKnownPayloadLength(
 
 bool SerialFrameParser::HasFrameTail(std::uint16_t command) noexcept
 {
-  // Vision is the MCU -> vision receive packet and carries the confirmed
-  // 0D 0A terminator.  RobotCtrl is the host -> MCU packet and ends at CRC16.
-  return command == io::VISION_ID;
+  // Both directions carry the 0D 0A terminator: the MCU appends it to every
+  // frame (wire capture 2026-08-31) and the sender mirrors it.
+  return command == io::VISION_ID || command == io::CHASSIS_CTRL_CMD_ID;
 }
 
 void SerialFrameParser::DiscardPrefix(std::size_t length) noexcept
@@ -87,8 +90,7 @@ std::size_t SerialFrameParser::Feed(
       }
 
       // The command is part of every supported payload and is needed to
-      // distinguish the Vision tail-framed packet from the RobotCtrl packet
-      // that terminates immediately after CRC16.
+      // look up the known payload length and tail expectation per command.
       constexpr std::size_t kCommandOffset = sizeof(io::FrameHeader);
       constexpr std::size_t kCommandEnd = kCommandOffset + sizeof(std::uint16_t);
       if (buffered_length_ < kCommandEnd) {

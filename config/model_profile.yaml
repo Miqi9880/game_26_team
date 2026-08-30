@@ -1,5 +1,8 @@
 # Production model profile: sp_vision_25 assets yolov5 armor detector.
 # Origin: TongjiSuperPower/sp_vision_25 (public) assets/yolov5.xml + .bin.
+# XML is the layout-patched re-serialization (NCHW/NRC injected via
+# tools/patch_layout.py); the original upstream xml sha256 was
+# 1cf9f2eb20e0312e8277ec457cfc67fb6867c4ff634d337c9c441a6aea052f8a.
 # Contract matches the checked-in test profile exactly (22-channel NRC layout)
 # and the tutorial parse code (lecture3 YOLOV5::parse: kp@0-7, obj@8, color@9-12, armor@13-21).
 # Acquired on Orin 2026-08-31; SHA-256 verified (see artifacts).
@@ -17,7 +20,7 @@ model:
   artifacts:
     xml:
       path: /home/nvidia/game_26_orin_main/models/yolov5.xml
-      sha256: 1cf9f2eb20e0312e8277ec457cfc67fb6867c4ff634d337c9c441a6aea052f8a
+      sha256: 21cc51dbbfc7ebfe2a9ca818847a2ad8db7418746152af210f0a378e9410b2e
     bin:
       path: /home/nvidia/game_26_orin_main/models/yolov5.bin
       sha256: aeae1db78494b631ddc1420a04714608b5dcf8bdf11f360ce503309757b1a7de

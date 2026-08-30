@@ -167,33 +167,39 @@ TEST(PreflightAnalyzerTest, PairedFramesRequireExactStampDimensionsAndFrameId)
   EXPECT_EQ(finding(frame_report, "image_camera.frame_id")->status, Status::Fail);
 }
 
-TEST(PreflightAnalyzerTest, PairingGraceAllowsOnlyOneFinalInFlightMessage)
+TEST(PreflightAnalyzerTest, CameraInfoOnlySurplusWarnsButUnmatchedImageFails)
 {
-  PreflightAnalyzer final_tail({}, 0.0);
-  final_tail.observe_image(image(1), 0.1);
-  final_tail.observe_camera_info(camera_info(1), 0.1);
-  final_tail.observe_image(image(2), 0.15);
-  EXPECT_EQ(
-    finding(final_tail.build_report(0.2), "image_camera.timestamp_pairing")->status,
-    Status::Warn);
+  PreflightConfig config;
+  config.vehicle_profile = "new_turtle";
+  config.shared_clock_domain = true;
+  PreflightAnalyzer surplus(config, 0.0);
+  surplus.observe_camera_info(camera_info(1), 0.1);
+  surplus.observe_image(image(2), 0.2);
+  surplus.observe_camera_info(camera_info(2), 0.2);
+  surplus.observe_vision(vision(2), 0.2);
+  surplus.observe_image(image(3), 0.3);
+  surplus.observe_camera_info(camera_info(3), 0.3);
+  surplus.observe_vision(vision(3), 0.3);
+  surplus.observe_camera_info(camera_info(4), 0.4);
+  const auto surplus_report = surplus.build_report(0.6);
+  EXPECT_EQ(surplus_report.overall, Status::Warn);
+  const auto * pairing = finding(surplus_report, "image_camera.timestamp_pairing");
+  ASSERT_NE(pairing, nullptr);
+  EXPECT_EQ(pairing->status, Status::Warn);
+  EXPECT_EQ(pairing->details.at("matched"), "2");
+  EXPECT_EQ(pairing->details.at("unmatched_images"), "0");
+  EXPECT_EQ(pairing->details.at("unmatched_camera_info"), "2");
+  EXPECT_EQ(pairing->details.at("surplus_camera_info"), "2");
+  EXPECT_EQ(pairing->details.at("stale_unmatched_camera_info"), "2");
+  EXPECT_EQ(pairing->details.at("camera_info_only_surplus"), "true");
+  EXPECT_NE(pairing->reason.find("image-side BEST_EFFORT DDS delivery loss"), std::string::npos);
 
-  PreflightAnalyzer multiple_unmatched({}, 0.0);
-  multiple_unmatched.observe_image(image(1), 0.1);
-  multiple_unmatched.observe_camera_info(camera_info(1), 0.1);
-  multiple_unmatched.observe_image(image(2), 0.15);
-  multiple_unmatched.observe_camera_info(camera_info(3), 0.15);
+  PreflightAnalyzer unmatched_image({}, 0.0);
+  unmatched_image.observe_image(image(1), 0.1);
+  unmatched_image.observe_camera_info(camera_info(1), 0.1);
+  unmatched_image.observe_image(image(2), 0.15);
   EXPECT_EQ(
-    finding(
-      multiple_unmatched.build_report(0.2),
-      "image_camera.timestamp_pairing")->status,
-    Status::Fail);
-
-  PreflightAnalyzer middle_gap({}, 0.0);
-  middle_gap.observe_image(image(2), 0.1);
-  middle_gap.observe_camera_info(camera_info(2), 0.1);
-  middle_gap.observe_image(image(1), 0.15);
-  EXPECT_EQ(
-    finding(middle_gap.build_report(0.2), "image_camera.timestamp_pairing")->status,
+    finding(unmatched_image.build_report(0.2), "image_camera.timestamp_pairing")->status,
     Status::Fail);
 }
 

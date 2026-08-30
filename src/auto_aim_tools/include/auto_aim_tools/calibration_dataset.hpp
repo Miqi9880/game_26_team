@@ -80,8 +80,10 @@ struct DatasetRequest
   DatasetConfig config;
   std::vector<FrameInput> frames;
   std::vector<std::string> input_errors;
+  std::vector<std::string> input_warnings{};
   std::size_t received_image_count{0};
   std::size_t received_camera_info_count{0};
+  std::size_t surplus_camera_info_count{0};
   std::size_t peak_unpaired_image_count{0};
   std::size_t peak_unpaired_image_bytes{0};
   std::size_t buffered_image_bytes{0};

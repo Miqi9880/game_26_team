@@ -262,8 +262,11 @@ void CalibrationDatasetRecorderNode::finish_locked(const std::string & reason)
   }
   pending_images_.clear();
   if (!pending_camera_info_.empty()) {
-    request_.input_errors.push_back(
-      "unmatched_camera_info_count=" + std::to_string(pending_camera_info_.size()));
+    request_.surplus_camera_info_count = pending_camera_info_.size();
+    request_.input_warnings.push_back(
+      "surplus_camera_info_count=" + std::to_string(pending_camera_info_.size()) +
+      "; all archived Images were exactly paired; BEST_EFFORT/VOLATILE delivery may have "
+      "lost Images on the subscriber path; this is not end-to-end lossless-delivery proof");
     pending_camera_info_.clear();
   }
   if (!reason.empty()) {

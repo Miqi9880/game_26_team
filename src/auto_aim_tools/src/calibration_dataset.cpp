@@ -650,11 +650,13 @@ DatasetResult build_dataset(
   root["summary"]["archived_image_count"] = archived_image_count;
   root["summary"]["received_image_count"] = request.received_image_count;
   root["summary"]["received_camera_info_count"] = request.received_camera_info_count;
+  root["summary"]["surplus_camera_info_count"] = request.surplus_camera_info_count;
   root["summary"]["peak_unpaired_image_count"] = request.peak_unpaired_image_count;
   root["summary"]["peak_unpaired_image_bytes"] = request.peak_unpaired_image_bytes;
   root["summary"]["buffered_image_bytes"] = request.buffered_image_bytes;
   root["limits"]["image_count"] = request.image_count_limit;
   root["limits"]["image_bytes"] = request.image_bytes_limit;
+  root["warnings"] = string_sequence(request.input_warnings);
   root["rejection_reasons"] = string_sequence(result.rejection_reasons);
 
   YAML::Node records(YAML::NodeType::Sequence);

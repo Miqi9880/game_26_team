@@ -125,7 +125,7 @@ quaternion 只检查恰为 4 项、接口声明顺序为 `wxyz` 且元素有限�
 - 频率使用本机单调时钟和订阅到达时间统计，不等同于传感器曝光频率、端到端延迟或 DDS 无丢包证明。
 - 相机到检测契约只接受 `rgb8`；其他 encoding 直接 `FAIL`。同时要求 `step == width * 3` 和 `len(data) == step * height`。工具不解码像素，也不启动相机验证画质。
 - `CameraInfo` 检查尺寸、K、D、有限值及常见 distortion model 的长度，不验证标定精度、外参或重投影误差。
-- Image 与 CameraInfo 必须精确同 stamp 配对，并分别检查单调性。100 ms 只容纳观测结束时的一条最终 DDS 尾帧并报告 `WARN`；多条、中间或更旧的未配对消息失败。跨 Image/Vision 比较仍必须显式声明共同时间域，比较结果也不是同步证明。
+- 每条已收到的 Image 都必须有精确同 stamp 的 CameraInfo；任一未配对 Image 直接 `FAIL`。若所有已收到 Image 都精确配对、配对字段均通过，而只多收到 CameraInfo，则明确报告 surplus/stale 数量并降为 `WARN`。这可能表示 BEST_EFFORT 下 image-side DDS delivery loss，不是源端错配结论，也不是端到端同步、无丢包或无损投递证明。时间戳非法/回退和任何实际字段错配仍 `FAIL`。跨 Image/Vision 比较仍必须显式声明共同时间域，比较结果也不是同步证明。
 - Humble/Fast DDS 可能在 graph API 中把 history/depth 返回为 unknown/0。此时 best-effort/volatile 可自动检查，但 keep-last/depth 5 报告 `WARN`，必须用 `ros2 topic info -v` 人工复核。
 - quaternion 的真实方向、参考系和传感器时序未在本工具中验证。
 - fake publisher 是离线 ROS 验收证据，不替代 Orin、真实相机、下位机或实车记录。

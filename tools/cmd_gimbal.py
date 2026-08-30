@@ -9,6 +9,7 @@ Usage:
 """
 
 import sys
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -22,16 +23,25 @@ def main() -> None:
     rclpy.init()
     node = Node("cmd_gimbal")
     publisher = node.create_publisher(RobotCtrl, "/Robot_ctrl_data", 10)
+    # Wait for the serial bridge to subscribe; discovery can take longer
+    # than the publish window.
+    deadline = time.monotonic() + 5.0
+    while publisher.get_subscription_count() < 1 and time.monotonic() < deadline:
+        time.sleep(0.1)
+    subscribers = publisher.get_subscription_count()
     message = RobotCtrl()
     message.yaw = yaw
     message.pitch = pitch
     message.target_lock = 49
     message.fire_command = 0
-    for _ in range(10):
+    sent = 0
+    for _ in range(50):
         publisher.publish(message)
-        rclpy.spin_once(node, timeout_sec=0.1)
+        sent += 1
+        time.sleep(0.2)
     node.get_logger().info(
-        f"commanded yaw={yaw} deg pitch={pitch} deg lock=49 fire=0")
+        f"commanded yaw={yaw} pitch={pitch} lock=49 fire=0 "
+        f"subscribers={subscribers} sent={sent}")
     node.destroy_node()
     rclpy.shutdown()
 

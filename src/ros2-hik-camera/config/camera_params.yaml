@@ -7,6 +7,3 @@
 
     exposure_time: 3000 #2000
     gain: 15.0
-    balance_ratio_r: 1314.0
-    balance_ratio_g: 1024.0
-    balance_ratio_b: 2800.0

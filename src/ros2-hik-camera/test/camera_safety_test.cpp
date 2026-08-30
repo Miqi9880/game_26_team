@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -36,6 +37,14 @@ CameraInfoContractSample validCameraInfo()
   }};
   sample.d.assign(5U, 0.0);
   return sample;
+}
+
+std::string readTextFile(const std::string & path)
+{
+  std::ifstream input(path);
+  return std::string(
+    std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>());
 }
 
 class TemporaryCalibrationFile
@@ -347,6 +356,29 @@ TEST(ParameterRange, RejectsInvalidValuesAndRanges)
     isFiniteInRange(
       std::numeric_limits<double>::infinity(), 1.0, 2.0));
   EXPECT_FALSE(isFiniteInRange(1.5, 2.0, 1.0));
+}
+
+TEST(CameraParameterContract, DefaultConfigDoesNotSetManualWhiteBalanceRatios)
+{
+  const auto config = readTextFile(HIK_CAMERA_DEFAULT_PARAMS_PATH);
+  ASSERT_FALSE(config.empty());
+
+  const std::string manual_ratio_prefix = "balance_" "ratio_";
+  EXPECT_EQ(config.find(manual_ratio_prefix), std::string::npos);
+}
+
+TEST(CameraParameterContract, GenericFloatPolicyDoesNotMapWhiteBalanceRatios)
+{
+  const auto node_source = readTextFile(HIK_CAMERA_NODE_SOURCE_PATH);
+  ASSERT_FALSE(node_source.empty());
+
+  const std::string ros_parameter_prefix = "balance_" "ratio_";
+  EXPECT_EQ(node_source.find(ros_parameter_prefix), std::string::npos);
+
+  for (const char channel : {'R', 'G', 'B'}) {
+    const std::string sdk_field = "Balance" "Ratio_" + std::string(1U, channel);
+    EXPECT_EQ(node_source.find(sdk_field), std::string::npos);
+  }
 }
 
 TEST(BoundedByteString, StopsAtNullTerminator)

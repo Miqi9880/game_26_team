@@ -211,12 +211,10 @@ private:
   {
     declareExposureParameter();
     declareDoubleParameter("gain", "Gain", "Camera gain");
-    declareDoubleParameter(
-      "balance_ratio_r", "BalanceRatio_R", "Red balance ratio");
-    declareDoubleParameter(
-      "balance_ratio_g", "BalanceRatio_G", "Green balance ratio");
-    declareDoubleParameter(
-      "balance_ratio_b", "BalanceRatio_B", "Blue balance ratio");
+    RCLCPP_INFO(
+      get_logger(),
+      "Manual white-balance ratios are not configured; preserving the camera's current "
+      "white-balance state");
   }
 
   MVCC_FLOATVALUE getFloatValue(const char * sdk_name)
@@ -419,12 +417,6 @@ private:
         sdk_name = "ExposureTime";
       } else if (parameter.get_name() == "gain") {
         sdk_name = "Gain";
-      } else if (parameter.get_name() == "balance_ratio_r") {
-        sdk_name = "BalanceRatio_R";
-      } else if (parameter.get_name() == "balance_ratio_g") {
-        sdk_name = "BalanceRatio_G";
-      } else if (parameter.get_name() == "balance_ratio_b") {
-        sdk_name = "BalanceRatio_B";
       }
 
       if (sdk_name == nullptr) {

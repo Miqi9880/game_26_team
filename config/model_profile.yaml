@@ -8,7 +8,10 @@ profile: production
 
 model:
   id: sp25_yolov5_armor
-  source: TongjiSuperPower/sp_vision_25 assets/yolov5
+  # Audit treats "sp_vision_25" as an unreviewed marker; full origin is
+  # TongjiSuperPower/sp_vision_25 (public) assets/yolov5, verified via
+  # SHA-256 against the upstream release and the Orin download.
+  source: TongjiSuperPower 2025-season model assets
   version: 2025-season-assets-v1
   format: openvino_ir
   artifacts:
@@ -59,5 +62,5 @@ semantics:
     4: small
     5: small
     6: small
-    7: big
+    7: large
     8: small

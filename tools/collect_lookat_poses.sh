@@ -14,5 +14,5 @@ while read -r y p; do
   ros2 run auto_aim_tools auto_aim_calibration_dataset_recorder \
     --config "$PWD/config/lookat_dataset.yaml" \
     --output "$HOME/calib/pose0$n" --max-frames 5 --timeout-s 15
-done < config/lookat_poses.txt
+done < <(grep -v '^#' config/lookat_poses.txt)
 echo "recorded $n poses under $HOME/calib/pose01..pose0$n"

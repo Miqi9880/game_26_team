@@ -1,0 +1,70 @@
+# Production PnP configuration (2026-08-31).
+# - camera K/D: calibrated 2026-08-31, 97/97 views RMS 0.1478px, serial
+#   DA4302286, lens MV-CS016-10UC (10 mm); matches
+#   src/ros2-hik-camera/config/camera_info_calibrated.yaml.
+# - armor sizes: measured on the competition plates 2026-08-31 (outer frame,
+#   same rectangle the detector keypoints mark).  Verify once on the venue at
+#   a known 3 m distance: solved range should read ~3.0 m.
+# - camera_to_gimbal: NOT CALIBRATED.  configured=false is fail-closed: the
+#   aimer emits camera-frame pose only, no gimbal angles.  Fill R/t after
+#   hand-eye calibration, set configured: true, then re-qualify.
+schema_version: 1
+profile: production
+
+camera:
+  image_width: 1440
+  image_height: 1080
+  camera_matrix: [1814.1656271049733, 0.0, 724.71855849275437,
+                  0.0, 1813.46032716116, 575.90169989101173,
+                  0.0, 0.0, 1.0]
+  distortion_coefficients: [-0.089388401646495072, 2.9512707432545957,
+                            -0.00179825173144803, -0.0013181919073637981,
+                            -1.0665972873590799]
+  source: camera_info_calibrated.yaml DA4302286 MV-CS016-10UC 10mm
+  version: 2026-08-31-calibration-v1
+  coordinate_frame: opencv_camera_optical
+
+armor_geometry:
+  corner_order: [top_left, top_right, bottom_right, bottom_left]
+  small:
+    width_m: 0.135
+    height_m: 0.125
+    object_points_m:
+      [[-0.0675, -0.0625, 0.0], [0.0675, -0.0625, 0.0],
+       [0.0675, 0.0625, 0.0], [-0.0675, 0.0625, 0.0]]
+    source: measured 2026-08-31 competition plate outer frame
+    version: measured-v1
+    object_frame: armor_local_x_right_y_down_z_forward
+  large:
+    width_m: 0.230
+    height_m: 0.127
+    object_points_m:
+      [[-0.115, -0.0635, 0.0], [0.115, -0.0635, 0.0],
+       [0.115, 0.0635, 0.0], [-0.115, 0.0635, 0.0]]
+    source: measured 2026-08-31 competition plate outer frame
+    version: measured-v1
+    object_frame: armor_local_x_right_y_down_z_forward
+
+# Must match config/model_profile.yaml (sp25_yolov5_armor) exactly:
+# base=7 is the large plate per the upstream ARMOR_NAMES convention.
+class_to_armor_type:
+  0: small
+  1: small
+  2: small
+  3: small
+  4: small
+  5: small
+  6: small
+  7: large
+  8: small
+
+pnp:
+  method: ITERATIVE
+  max_reprojection_error_px: 3.0
+
+camera_to_gimbal:
+  configured: false
+  source: pending hand-eye calibration
+  version: not-calibrated-2026-08-31
+  source_frame: opencv_camera_optical
+  target_frame: gimbal_x_forward_y_left_z_up

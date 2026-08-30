@@ -9,7 +9,8 @@ Each CSV row: yaw_deg pitch_deg tx ty tz
 
 Direction model: n_gimbal = R_gimbal_from_camera * n_cam, solved by
 orthogonal Procrustes (SVD).  Translation is not recoverable from
-directions; supply the measured t with --translation-m.
+directions; supply the measured t with --translation-m or put the three
+metre values in config/lookat_translation.txt (used by build_samples.sh).
 
 Samples MUST mix yaw and pitch changes (pure-yaw poses are coplanar and
 degenerate).  Keep the target within a few degrees of the image center.
@@ -21,6 +22,7 @@ Usage:
 
 import csv
 import math
+import os
 import sys
 
 import numpy as np
@@ -36,6 +38,11 @@ def main() -> None:
         translation = [float(value) for value in sys.argv[index + 1].split(",")]
         if len(translation) != 3:
             sys.exit("--translation-m must have exactly three values")
+    elif os.path.exists("config/lookat_translation.txt"):
+        with open("config/lookat_translation.txt", encoding="utf-8") as handle:
+            values = handle.read().split()
+        if len(values) == 3:
+            translation = [float(value) for value in values]
     rows: list[list[float]] = []
     with open(path, newline="", encoding="utf-8") as handle:
         for record in csv.reader(handle):

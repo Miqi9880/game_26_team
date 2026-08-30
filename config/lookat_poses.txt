@@ -1,0 +1,8 @@
+# Gimbal poses (absolute yaw pitch in degrees) for the look-at calibration.
+# Must mix yaw and pitch changes; keep the plate in view at ~3m.
+0 0
+12 0
+-12 0
+0 8
+0 -8
+8 -6

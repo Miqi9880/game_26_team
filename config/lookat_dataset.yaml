@@ -1,0 +1,23 @@
+# Recorder config for the camera->gimbal look-at calibration samples.
+# Board fields are required by the schema; they are not used by the solver.
+# One pose per recorder run: ~5 raw 1440x1080 frames of the armor plate.
+schema_version: 1
+camera_info_required: true
+source:
+  mode: ros
+  timestamp_source: ros_header
+board:
+  type: chessboard
+  inner_corners_cols: 11
+  inner_corners_rows: 8
+  square_size_m: 0.02
+acceptance:
+  min_views: 3
+  max_global_rms_reprojection_error_px: 0.5
+metadata:
+  dataset_id: gimbal-lookat-2026-09-01
+  report_id: handeye-lookat-pose
+  camera_serial: DA4302286
+  lens_identifier: MV-CS016-10UC-10mm
+  acquisition_date: 2026-09-01
+  operator: luanxuxu

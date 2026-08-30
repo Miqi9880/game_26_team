@@ -20,7 +20,7 @@ model:
   artifacts:
     xml:
       path: /home/nvidia/game_26_orin_main/models/yolov5.xml
-      sha256: 21cc51dbbfc7ebfe2a9ca818847a2ad8db7418746152af210f0a378e9410b2e
+      sha256: 21cc51dbbfc7ebfe2a9ca818847a2ad8db7418746152af210f0a378e9410b2e8
     bin:
       path: /home/nvidia/game_26_orin_main/models/yolov5.bin
       sha256: aeae1db78494b631ddc1420a04714608b5dcf8bdf11f360ce503309757b1a7de

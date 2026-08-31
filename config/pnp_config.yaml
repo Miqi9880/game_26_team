@@ -5,9 +5,11 @@
 # - armor sizes: measured on the competition plates 2026-08-31 (outer frame,
 #   same rectangle the detector keypoints mark).  Verify once on the venue at
 #   a known 3 m distance: solved range should read ~3.0 m.
-# - camera_to_gimbal: NOT CALIBRATED.  configured=false is fail-closed: the
-#   aimer emits camera-frame pose only, no gimbal angles.  Fill R/t after
-#   hand-eye calibration, set configured: true, then re-qualify.
+# - camera_to_gimbal: NOT hand-eye calibrated (calibration deferred).  R is the
+#   mechanical-assumption orthogonal mounting; t is an estimate to be measured
+#   on the venue.  Verify at a known 3 m distance: solved range ~3.0 m and the
+#   gimbal should point at the plate; adjust t (and R only if skew is visible)
+#   before the ladder matches.
 schema_version: 1
 profile: production
 
@@ -63,8 +65,23 @@ pnp:
   max_reprojection_error_px: 3.0
 
 camera_to_gimbal:
-  configured: false
-  source: pending hand-eye calibration
-  version: not-calibrated-2026-08-31
+  configured: true
+  # Extrinsic borrowed from the Tongji (TJU) hand-eye calibration
+  # (reprojection RMS 0.1820 px); NOT measured on this vehicle.  Its frame
+  # convention matches ours: camera +x right / +y down / +z front maps to
+  # gimbal +x front / +y left / +z up (verified: columns of R are the camera
+  # axes in the gimbal frame, proper rotation det=+1).  Camera intrinsics
+  # above remain ours (DA4302286, RMS 0.1478 px).  MUST re-verify on the
+  # venue at a known 3 m distance: solved range ~3.0 m and aim at the plate;
+  # re-calibrate or adjust before the ladder matches.
+  rotation_gimbal_from_camera: [-0.027182119030230909, -0.12616154330853446,
+                                0.99163723074269183, -0.99949106557517331,
+                                0.019998323121329122, -0.024853106601381177,
+                                -0.016695575474690555, -0.99180811252093692,
+                                -0.12664093215554434]
+  translation_gimbal_from_camera_m: [0.13160669975045827, 0.10377721766577375,
+                                     0.024908271912914642]
+  source: tongji-tju-hand-eye-borrowed-2026-08-31 (not measured on this vehicle)
+  version: borrowed-tju-v1
   source_frame: opencv_camera_optical
   target_frame: gimbal_x_forward_y_left_z_up

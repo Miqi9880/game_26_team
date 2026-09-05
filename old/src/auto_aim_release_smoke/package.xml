@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>auto_aim_release_smoke</name>
+  <version>0.1.0</version>
+  <description>SDK-independent installed-release smoke checks and reports.</description>
+  <maintainer email="hj@todo.todo">hj</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>auto_aim_interfaces</exec_depend>
+  <exec_depend>auto_aim_ros2</exec_depend>
+  <exec_depend>auto_aim_tools</exec_depend>
+  <exec_depend>hik_camera</exec_depend>
+  <exec_depend>python3</exec_depend>
+  <exec_depend>serical_device_ros2</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

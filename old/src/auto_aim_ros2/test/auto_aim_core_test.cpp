@@ -1,0 +1,364 @@
+#include "auto_aim_ros2/auto_aim_core.hpp"
+#include "auto_aim_ros2/ros_adapters.hpp"
+
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <memory>
+
+#include <gtest/gtest.h>
+
+namespace
+{
+using namespace rm_auto_aim::pipeline;
+
+AutoAimPipeline make_pipeline(std::optional<Detection> detection, CoreConfig config = {})
+{
+  std::unique_ptr<YoloStage> yolo;
+  if (detection.has_value()) {
+    yolo = std::make_unique<MockYoloStage>(detection);
+  } else {
+    yolo = std::make_unique<NullYoloStage>();
+  }
+  return AutoAimPipeline(
+    std::move(yolo), std::make_unique<PassThroughArmorStage>(),
+    std::make_unique<LatestTargetTracker>(), std::make_unique<FirstTargetStage>(),
+    std::make_unique<CommandAimer>(), config);
+}
+
+ImageFrame frame()
+{
+  ImageFrame result;
+  result.width = 640;
+  result.height = 480;
+  result.encoding = "rgb8";
+  return result;
+}
+}  // namespace
+
+TEST(AutoAimCore, NoTargetReportsUnlockedAndNoFire)
+{
+  auto pipeline = make_pipeline(std::nullopt);
+  const auto command = pipeline.process(frame(), std::chrono::steady_clock::now());
+  EXPECT_EQ(command.target_lock, kTargetUnlocked);
+  EXPECT_EQ(command.fire_command, kFireNone);
+}
+
+TEST(AutoAimCore, ValidTargetReportsLockedAndPreservesInternalRadians)
+{
+  Detection detection{};
+  detection.valid = true;
+  detection.yaw_rad = 0.25F;
+  detection.pitch_rad = -0.125F;
+  detection.yaw_vel_rad_s = 0.5F;
+  detection.pitch_acc_rad_s2 = -0.75F;
+  auto pipeline = make_pipeline(detection);
+  const auto command = pipeline.process(frame(), std::chrono::steady_clock::now());
+  EXPECT_EQ(command.target_lock, kTargetLocked);
+  EXPECT_FLOAT_EQ(command.yaw_rad, detection.yaw_rad);
+  EXPECT_FLOAT_EQ(command.pitch_rad, detection.pitch_rad);
+  EXPECT_FLOAT_EQ(command.yaw_vel_rad_s, detection.yaw_vel_rad_s);
+  EXPECT_FLOAT_EQ(command.pitch_acc_rad_s2, detection.pitch_acc_rad_s2);
+  EXPECT_EQ(command.fire_command, kFireNone);
+}
+
+TEST(AutoAimCore, FireIsDisabledWhenConfigurationDisallowsIt)
+{
+  Detection detection{};
+  detection.valid = true;
+  detection.fire_request = true;
+  auto pipeline = make_pipeline(detection, CoreConfig{false, kFireBurst, kFireSingle});
+  const auto command = pipeline.process(frame(), std::chrono::steady_clock::now());
+  EXPECT_EQ(command.target_lock, kTargetLocked);
+  EXPECT_EQ(command.fire_command, kFireNone);
+}
+
+TEST(AutoAimCore, FireUsesConfiguredCommandOnlyWhenEnabled)
+{
+  Detection detection{};
+  detection.valid = true;
+  detection.fire_request = true;
+  auto pipeline = make_pipeline(detection, CoreConfig{true, 7, 9});
+  const auto command = pipeline.process(frame(), std::chrono::steady_clock::now());
+  EXPECT_EQ(command.fire_command, 7);
+}
+
+TEST(AutoAimCore, InvalidMotionIsRejectedAsNoTarget)
+{
+  Detection detection{};
+  detection.valid = true;
+  detection.yaw_rad = std::numeric_limits<float>::quiet_NaN();
+  auto pipeline = make_pipeline(detection);
+  const auto command = pipeline.process(frame(), std::chrono::steady_clock::now());
+  EXPECT_EQ(command.target_lock, kTargetUnlocked);
+  EXPECT_EQ(command.fire_command, kFireNone);
+}
+
+TEST(AutoAimCore, VisionBookkeepingFieldsAreOutsidePipelineInput)
+{
+  Detection detection{};
+  detection.valid = true;
+  detection.yaw_rad = 0.3F;
+  auto pipeline = make_pipeline(detection);
+  auto first = frame();
+  first.shoot_speed_mps = 25.0F;
+  first.bullet_count = 1;
+  first.game_progress = 2;
+  auto second = first;
+  second.shoot_speed_mps = 30.0F;
+  second.bullet_count = 999;
+  second.game_progress = 17;
+
+  const auto command_first = pipeline.process(first, std::chrono::steady_clock::now());
+  const auto command_second = pipeline.process(second, std::chrono::steady_clock::now());
+  EXPECT_EQ(command_first.target_lock, command_second.target_lock);
+  EXPECT_FLOAT_EQ(command_first.yaw_rad, command_second.yaw_rad);
+  EXPECT_FLOAT_EQ(command_first.pitch_rad, command_second.pitch_rad);
+  EXPECT_EQ(command_first.fire_command, command_second.fire_command);
+}
+
+TEST(RosAdapter, ConvertsRadiansToDegreesAndZerosMotionUntilMcuSemanticsAreConfirmed)
+{
+  AimCommand command{};
+  command.yaw_rad = static_cast<float>(rm_auto_aim::units::kPi / 2.0);
+  command.yaw_vel_rad_s = -0.3F;
+  command.yaw_acc_rad_s2 = 0.4F;
+  command.pitch_rad = rm_auto_aim::units::degrees_to_radians(-10.0F);
+  command.pitch_vel_rad_s = 0.6F;
+  command.pitch_acc_rad_s2 = -0.7F;
+  command.target_lock = kTargetLocked;
+  command.fire_command = kFireNone;
+  const auto message = rm_auto_aim::ros_adapters::to_ros(
+    command, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_NEAR(message.yaw, 90.0F, 1e-5F);
+  EXPECT_NEAR(message.pitch, -10.0F, 1e-5F);
+  EXPECT_FLOAT_EQ(message.yaw_vel, 0.0F);
+  EXPECT_FLOAT_EQ(message.yaw_acc, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch_vel, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch_acc, 0.0F);
+  EXPECT_EQ(message.target_lock, command.target_lock);
+  EXPECT_EQ(message.fire_command, command.fire_command);
+}
+
+TEST(RosAdapter, SuppressesNonzeroFireAtRobotCtrlBoundary)
+{
+  AimCommand command{};
+  command.yaw_rad = 0.25F;
+  command.pitch_rad = -0.1F;
+  command.target_lock = kTargetLocked;
+
+  for (const auto requested_fire : {kFireBurst, kFireSingle}) {
+    command.fire_command = requested_fire;
+    const auto result = rm_auto_aim::ros_adapters::to_ros_with_profile(
+      command, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+    ASSERT_TRUE(result.accepted());
+    EXPECT_EQ(result.message.target_lock, kTargetLocked);
+    EXPECT_EQ(result.message.fire_command, kFireNone);
+  }
+}
+
+TEST(RosAdapter, InvalidAimCommandFailsClosedAtRobotCtrlBoundary)
+{
+  using rm_auto_aim::pipeline::AimCommand;
+  using rm_auto_aim::pipeline::kFireBurst;
+  using rm_auto_aim::pipeline::kFireNone;
+  using rm_auto_aim::pipeline::kTargetLocked;
+  using rm_auto_aim::pipeline::kTargetUnlocked;
+
+  AimCommand non_finite_angle{};
+  non_finite_angle.yaw_rad = std::numeric_limits<float>::quiet_NaN();
+  non_finite_angle.pitch_rad = 0.2F;
+  non_finite_angle.target_lock = kTargetLocked;
+  non_finite_angle.fire_command = kFireBurst;
+  auto message = rm_auto_aim::ros_adapters::to_ros(
+    non_finite_angle, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand invalid_lock{};
+  invalid_lock.yaw_rad = 0.2F;
+  invalid_lock.pitch_rad = -0.1F;
+  invalid_lock.target_lock = 0;
+  message = rm_auto_aim::ros_adapters::to_ros(
+    invalid_lock, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand invalid_fire{};
+  invalid_fire.yaw_rad = 0.2F;
+  invalid_fire.pitch_rad = -0.1F;
+  invalid_fire.target_lock = kTargetLocked;
+  invalid_fire.fire_command = 99;
+  message = rm_auto_aim::ros_adapters::to_ros(
+    invalid_fire, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+
+  AimCommand unlocked_fire{};
+  unlocked_fire.yaw_rad = 0.2F;
+  unlocked_fire.pitch_rad = -0.1F;
+  unlocked_fire.target_lock = kTargetUnlocked;
+  unlocked_fire.fire_command = kFireBurst;
+  message = rm_auto_aim::ros_adapters::to_ros(
+    unlocked_fire, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_FLOAT_EQ(message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch, 0.0F);
+  EXPECT_EQ(message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(message.fire_command, kFireNone);
+}
+
+TEST(RosAdapter, ConvertsCanonicalAnglesBothDirections)
+{
+  EXPECT_FLOAT_EQ(rm_auto_aim::units::degrees_to_radians(0.0F), 0.0F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::degrees_to_radians(90.0F),
+    static_cast<float>(rm_auto_aim::units::kPi / 2.0), 1e-6F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::degrees_to_radians(-90.0F),
+    static_cast<float>(-rm_auto_aim::units::kPi / 2.0), 1e-6F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::degrees_to_radians(180.0F),
+    static_cast<float>(rm_auto_aim::units::kPi), 1e-6F);
+
+  EXPECT_FLOAT_EQ(rm_auto_aim::units::radians_to_degrees(0.0F), 0.0F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::radians_to_degrees(static_cast<float>(rm_auto_aim::units::kPi / 2.0)),
+    90.0F, 1e-5F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::radians_to_degrees(static_cast<float>(-rm_auto_aim::units::kPi / 2.0)),
+    -90.0F, 1e-5F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::radians_to_degrees(static_cast<float>(rm_auto_aim::units::kPi)),
+    180.0F, 1e-5F);
+}
+
+TEST(RosAdapter, ConvertsVisionPositionAnglesToInternalRadians)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  message.header.stamp.sec = 12;
+  message.header.stamp.nanosec = 345;
+  message.header.frame_id = "imu";
+  message.id = 7;
+  message.mode = 33;
+  message.yaw = 90.0F;
+  message.yaw_vel = 123.0F;  // degree/s; retained only as diagnostic evidence.
+  message.pitch = -90.0F;
+  message.pitch_vel = -456.0F;  // degree/s; retained only as diagnostic evidence.
+  message.roll = 180.0F;
+  message.quaternion = {1.0F, 0.0F, 0.0F, 0.0F};
+  message.shoot_speed = 24.5F;
+  message.bullet_count = 19;
+  message.game_progress = 4;
+
+  const auto state = rm_auto_aim::ros_adapters::to_algorithm_vision(message);
+  ASSERT_TRUE(state.has_value());
+  EXPECT_EQ(state->stamp_ns, 12'000'000'345LL);
+  EXPECT_EQ(state->frame_id, "imu");
+  EXPECT_EQ(state->id, 7U);
+  EXPECT_EQ(state->mode, 33U);
+  EXPECT_NEAR(state->yaw_rad, rm_auto_aim::units::kPi / 2.0, 1e-6);
+  EXPECT_NEAR(
+    state->yaw_vel_rad_s,
+    rm_auto_aim::units::degrees_per_second_to_radians_per_second(123.0F), 1e-6);
+  EXPECT_NEAR(state->pitch_rad, -rm_auto_aim::units::kPi / 2.0, 1e-6);
+  EXPECT_NEAR(
+    state->pitch_vel_rad_s,
+    rm_auto_aim::units::degrees_per_second_to_radians_per_second(-456.0F), 1e-6);
+  EXPECT_NEAR(state->roll_rad, rm_auto_aim::units::kPi, 1e-6);
+  EXPECT_EQ(state->quaternion_wxyz, (std::array<float, 4>{{1.0F, 0.0F, 0.0F, 0.0F}}));
+  EXPECT_FLOAT_EQ(state->shoot_speed_mps, 24.5F);
+  EXPECT_EQ(state->bullet_count, 19U);
+  EXPECT_EQ(state->game_progress, 4U);
+}
+
+TEST(RosAdapter, RejectsNonFiniteVisionEvidence)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  message.yaw = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+
+  message.yaw = 0.0F;
+  message.quaternion[2] = std::numeric_limits<float>::infinity();
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}
+
+TEST(RosAdapter, RejectsNonCanonicalVisionTimestamp)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  message.header.stamp.sec = -1;
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+
+  message.header.stamp.sec = 0;
+  message.header.stamp.nanosec = 1'000'000'000U;
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}
+
+TEST(RosAdapter, RejectsUnsetVisionTimestamp)
+{
+  auto message = auto_aim_interfaces::msg::Vision{};
+  EXPECT_FALSE(rm_auto_aim::ros_adapters::to_algorithm_vision(message).has_value());
+}
+
+TEST(RosAdapter, UnselectedVehicleProfileFailsClosed)
+{
+  AimCommand command{};
+  command.yaw_rad = 0.25F;
+  command.pitch_rad = -0.1F;
+  command.target_lock = kTargetLocked;
+  const auto result = rm_auto_aim::ros_adapters::to_ros_with_profile(
+    command, auto_aim_interfaces::control::VehicleProfile::Unselected);
+  EXPECT_FALSE(result.accepted());
+  EXPECT_EQ(result.message.target_lock, kTargetUnlocked);
+  EXPECT_EQ(result.message.fire_command, kFireNone);
+  EXPECT_FLOAT_EQ(result.message.yaw, 0.0F);
+  EXPECT_FLOAT_EQ(result.message.pitch, 0.0F);
+}
+
+TEST(RosAdapter, WrapsYawAndClampsPitchAtRobotCtrlBoundary)
+{
+  AimCommand command{};
+  command.yaw_rad = rm_auto_aim::units::degrees_to_radians(540.0F);
+  command.pitch_rad = rm_auto_aim::units::degrees_to_radians(45.0F);
+  command.target_lock = kTargetLocked;
+  const auto result = rm_auto_aim::ros_adapters::to_ros_with_profile(
+    command, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  ASSERT_TRUE(result.accepted());
+  EXPECT_FLOAT_EQ(result.message.yaw, 180.0F);
+  EXPECT_FLOAT_EQ(result.message.pitch, 19.0F);
+  EXPECT_TRUE(result.position_constraint.yaw_wrapped());
+  EXPECT_TRUE(result.position_constraint.pitch_clamped());
+}
+
+TEST(RosAdapter, ConvertsVelocityAndAccelerationUnitsWithoutEnablingFeedforward)
+{
+  EXPECT_NEAR(
+    rm_auto_aim::units::radians_per_second_to_degrees_per_second(
+      rm_auto_aim::units::degrees_per_second_to_radians_per_second(12.5F)),
+    12.5F, 1e-5F);
+  EXPECT_NEAR(
+    rm_auto_aim::units::radians_per_second_squared_to_degrees_per_second_squared(
+      rm_auto_aim::units::degrees_per_second_squared_to_radians_per_second_squared(-7.25F)),
+    -7.25F, 1e-5F);
+
+  AimCommand command{};
+  command.yaw_rad = 0.1F;
+  command.pitch_rad = -0.1F;
+  command.yaw_vel_rad_s = 1.0F;
+  command.yaw_acc_rad_s2 = 2.0F;
+  command.pitch_vel_rad_s = 3.0F;
+  command.pitch_acc_rad_s2 = 4.0F;
+  command.target_lock = kTargetLocked;
+  const auto message = rm_auto_aim::ros_adapters::to_ros(
+    command, auto_aim_interfaces::control::VehicleProfile::NewTurtle);
+  EXPECT_FLOAT_EQ(message.yaw_vel, 0.0F);
+  EXPECT_FLOAT_EQ(message.yaw_acc, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch_vel, 0.0F);
+  EXPECT_FLOAT_EQ(message.pitch_acc, 0.0F);
+}

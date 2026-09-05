@@ -1,0 +1,10 @@
+{
+  "run_id": "fixture-run-001",
+  "commit": "fixture-commit",
+  "dataset_id": "fixture-dataset",
+  "model_profile_id": "legacy_yolov5_reference",
+  "model_profile_version": "legacy-reference-v1",
+  "pnp_profile": "test_only",
+  "source_label": "offline-fixture",
+  "run_command": "python3 auto_aim_offline --video <path>/fixture.avi"
+}

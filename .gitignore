@@ -1,0 +1,9 @@
+build/
+install/
+log/
+*.log
+MvSdkLog/
+src/ros2-hik-camera/hikSDK/lib/
+.vscode/
+__pycache__/
+*.pyc

@@ -1,4 +1,0 @@
-frame,stamp_ns,detection_count,valid_pnp_count,detection_index,class_id,armor_size,confidence,pnp_valid,pnp_failure,reprojection_error_px,camera_x_m,camera_y_m,camera_z_m,gimbal_x_m,gimbal_y_m,gimbal_z_m,relative_yaw_rad,relative_pitch_rad,track_id,tracking_state,consecutive_valid,selected,target_lock,absolute_command_valid,command_yaw_rad,command_pitch_rad,command_yaw_degree,command_pitch_degree,fire_command,test_only
-0,1000000,1,1,0,1,small,0.91,1,,0.8,0.1,0.0,3.0,,,,,,1,detecting,1,1,50,0,,,,,0,1
-1,2000000,1,1,0,1,small,0.93,1,,0.7,0.1,0.0,3.0,,,,,,1,tracking,2,1,49,0,,,,,0,1
-2,3000000,1,1,0,1,small,0.94,1,,0.6,0.1,0.0,3.0,,,,,,1,tracking,3,1,49,0,,,,,0,1

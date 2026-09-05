@@ -1,0 +1,37 @@
+# Calibrated 2026-09-02 with auto_aim_camera_calibrate (calib_dataset_3).
+# Board: 11x8 inner corners, 20 mm squares. 20 deliberate poses (0.7-2+ m,
+# full-frame coverage, large tilts) x 8 frames, best frame per pose:
+# accepted 20/20 views, global RMS 0.1195 px.  Operator miqi, serial DA4302286,
+# lens MV-CS016-10UC (10 mm).  Evidence:
+# config/calibration/camera_intrinsic_report_pose20_best20.yaml
+image_width: 1440
+image_height: 1080
+camera_name: narrow_stereo
+
+distortion_model: plumb_bob
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1812.1974402808708, 0.0, 721.32462766996332,
+         0.0, 1810.820105361712, 586.17129152316079,
+         0.0, 0.0, 1.0]
+
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.069715046432521605, 0.12162877271137144, -0.00084472511432598808, -0.00011012810436781773, 0.081216254878140895]
+
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1812.1974402808708, 0.0, 721.32462766996332, 0.0,
+         0.0, 1810.820105361712, 586.17129152316079, 0.0,
+         0.0, 0.0, 1.0, 0.0]

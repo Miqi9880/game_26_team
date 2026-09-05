@@ -1,9 +1,0 @@
-/hik_camera:
-  ros__parameters:
-    camera_name: narrow_stereo
-    camera_serial: ""
-    frame_id: camera_optical_frame
-    use_sensor_data_qos: true
-
-    exposure_time: 3000 #2000
-    gain: 15.0

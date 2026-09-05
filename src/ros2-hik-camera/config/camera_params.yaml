@@ -1,0 +1,10 @@
+/hik_camera:
+  ros__parameters:
+    camera_name: narrow_stereo
+
+    exposure_time: 4500 # raised for dim light-bar plate
+    gain: 15.0
+    acquisition_fps: 60.0
+    balance_ratio_r: 1314.0
+    balance_ratio_g: 1024.0
+    balance_ratio_b: 2800.0

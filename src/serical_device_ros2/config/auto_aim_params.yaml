@@ -1,0 +1,105 @@
+aim_mode: direct            # awakening | direct
+allow_fire: true           # SAFETY: keep false; enable via ros2 param set for firing
+require_mode33: true
+direct_gain: 1.4
+direct_pitch_gain: 1.0
+direct_ki: 0.05
+direct_yaw_bias: -0.6
+direct_pitch_bias: 6.1
+cmd_smooth_alpha: 0.3
+cmd_slew_deg_per_s: 50.0
+cmd_yaw_deadband_deg: 0.25
+cmd_pitch_deadband_deg: 0.3
+# ---- frame / gimbal feedback (B2) ----
+use_vision_feedback: true     # build camera-in-Z pose from /Vision_data yaw/pitch
+pitch_up_positive: true       # uplink pitch: positive = up
+yaw_left_positive: true       # uplink yaw: positive = left
+camera_offset_m: [0.0, 0.0, 0.0]  # camera pos in chassis frame at yaw=0 (x fwd, y left, z up); calibrate later
+enemy_color: red          # blue team -> enemy armor is RED
+bullet_speed: 11.0
+
+armor_detector:
+  backend: opencv         # traditional CV only (no network backend)
+  number_classifier:
+    enable: true
+    model_path: ${ROOT_DIR}/model/mlp.onnx
+  color_classifier:
+    enable: true
+    diff_threshold: 10.0
+  cv:
+    light:
+      bin_threshold: 120.0
+      net_ref_threshold_tol: 15.0
+      min_wh_ratio: 0.001
+      max_wh_ratio: 0.4
+      max_angle: 40.0
+      min_light_length_px: 8.0
+      min_light_area_px: 30.0
+    armor:
+      min_ratio: 0.8
+      max_ratio: 5.0
+      max_center_y_diff_ratio: 0.35
+      max_top_y_diff_ratio: 0.45
+      max_bottom_y_diff_ratio: 0.45
+      min_length_ratio: 0.6
+      max_angle_diff_deg: 12.0
+      min_endpoint_overlap_ratio: 0.3
+      duplicate_iou_threshold: 0.5
+      min_number_conf: 0.0
+
+armor_tracker:
+  esekf_iter_num: 5
+  lost_time_thres: 1.5
+  lost_time_thres_outpost: 2.0
+  tracking_thres: 3
+  armor_match_gate: 50.0
+  armor_match_gate_not_all_init: 100.0
+  armor_match_w_center_err: 1.0
+  armor_match_w_angle_err: 1.0
+  armor_match_w_side_length_err: 1.0
+  qyaw_common: 100.0
+  qyaw_output: 0.01
+  qxyz_common: [30.0, 30.0, 1.0]
+  qxyz_output: [1.0, 1.0, 0.5]
+  q_r: 0.0000001
+  q_h: 0.0000001
+  q_wpr: 0.0000001
+  q_outpost_dz: 0.01
+  r_sigma_px_by_length_ratio: 1.0
+  r_sigma_length_by_length_ratio: 0.05
+  r_sigma_angle: 0.1
+  r_sigma_armor_lights_depth_diff: 0.01
+  enable_lights_measure: true
+  light_match_length_ratio_gate: 0.2
+  light_match_angle_gate: 0.2
+  light_match_pos_gate_by_length_ratio: 5.0
+
+auto_aim_fsm:
+  single_whole_up: 0.5
+  single_whole_down: 0.3
+  whole_pair_up: 0.8
+  whole_pair_down: 0.4
+  pair_center_up: 1.0
+  pair_center_down: 0.5
+  transfer_time: 0.5
+
+very_aimer:
+  type: limit
+  base_yaw_offset: 0.0
+  base_pitch_offset: -0.2
+  sample_total_time: 1.0
+  sample_horizon: 200
+  fire_delay_min: 0.01
+  fire_delay_max: 0.05
+  max_yaw_acc: 40.0
+  max_pitch_acc: 50.0
+  prediction_delay: 0.0
+  aim_center_more_prediction_time: 0.0
+  shooting_range_h: 0.12
+  shooting_range_w_small: 0.12
+  shooting_range_w_large: 0.24
+  min_enable_yaw_deg: 0.25
+  min_enable_pitch_deg: 0.25
+  ballistic_trajectory:
+    gravity: 9.8
+    resistance: 0.001
